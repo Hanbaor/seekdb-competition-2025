@@ -45,7 +45,6 @@ async def process_dataset(
             file_path=str(pdf),
             output_dir=rag.working_dir,
             parse_method=parse_method or rag.config.parse_method,
-            force_reprocess=rebuild,
         )
 
         marker.touch()
