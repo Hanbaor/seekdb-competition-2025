@@ -391,4 +391,5 @@ LightRAG-main
 RAG-Anything-main
 rag/data/dataset
 rag_backup/data/dataset
-rag_backup/outputrag_backup/hf_cache/
+rag_backup/output
+rag_backup/hf_cache

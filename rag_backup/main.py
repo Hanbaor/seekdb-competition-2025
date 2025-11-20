@@ -44,7 +44,7 @@ def delete_global_docling_cache() -> None:
         shutil.rmtree(global_models_dir)
 
 
-configure_hf_cache()
+# configure_hf_cache()
 
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
