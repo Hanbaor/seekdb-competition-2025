@@ -33,6 +33,9 @@ def separate_content(
             text = item.get("text", "")
             if text.strip():
                 text_parts.append(text)
+        elif content_type == "discarded":
+            # Skip discarded content (headers, footers, page numbers, etc.)
+            continue
         else:
             # Multimodal content (image, table, equation, etc.)
             multimodal_items.append(item)

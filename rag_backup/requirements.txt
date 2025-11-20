@@ -14,3 +14,5 @@ tenacity>=8.2.0
 pypinyin>=0.55.0
 tiktoken
 nano-vectordb
+json_repair
+mineru[core]
