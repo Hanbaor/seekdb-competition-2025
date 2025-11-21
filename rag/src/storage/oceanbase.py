@@ -26,13 +26,11 @@ def get_or_create_client() -> HybridSearch:
         password=OCEANBASE_PASSWORD,
         db_name=OCEANBASE_DBNAME,
         # Increase connection pool for multi-threaded operations
-        engine_args={
-            "pool_size": 20,  # 增加连接池大小（默认5）
-            "max_overflow": 30,  # 允许超出pool_size的额外连接数
-            "pool_timeout": 30,  # 等待可用连接的超时时间（秒）
-            # "pool_recycle": 3600,  # 连接回收时间（秒），防止长时间连接失效
-            "pool_pre_ping": True,  # 使用前检查连接是否有效
-        },
+        pool_size=20,  # 增加连接池大小（默认5）
+        max_overflow=30,  # 允许超出pool_size的额外连接数
+        pool_timeout=30,  # 等待可用连接的超时时间（秒）
+        pool_recycle=3600,  # 连接回收时间（秒），防止长时间连接失效
+        pool_pre_ping=True,  # 使用前检查连接是否有效
     )
 
 

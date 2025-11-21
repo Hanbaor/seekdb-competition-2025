@@ -32,7 +32,8 @@ vlm_client = OpenAI(
 def generate_response(
     prompt: str,
     images: Optional[Union[str, List[str]]] = None,
-    model: str = "qwen3-vl-plus",
+    model: str = "qwen3-vl-flash",
+    # model: str = "qwen3-vl-plus",
     max_retries: int = 30,
     initial_backoff: float = 1.0,
 ) -> str:
