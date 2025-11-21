@@ -447,6 +447,10 @@ class Retriever:
 
     def query(self, query, **kwargs):
         # step 1: extract entities via jieba keywords with fuzzy matching against graph index
+        # [DEBUG EXPERIMENT] Force entities to empty to test Tree-only performance (no Graph)
+        entities = [] 
+        
+        """
         stopwords = {"什么", "如何", "哪些", "多少", "怎样", "为什么", "是", "的", "了", "在", "与", "和", "有", "吗", "？", "请", "告诉"}
         raw_text = query.split("\n")[0]
         raw_entities = jieba.analyse.extract_tags(raw_text, topK=8, withWeight=False)
@@ -478,6 +482,7 @@ class Retriever:
         if not entities:
             spa_entities = naive_extract_graph(raw_text, self.nlp)["nouns"]
             entities = spa_entities
+        """
 
         # step 2.0: set up the parameters.
         shortest_path_k = kwargs.get("shortest_path_k", 4)

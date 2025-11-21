@@ -27,13 +27,13 @@ class SimpleVectorRetriever:
     
     def _build_index(self):
         """构建FAISS向量索引"""
-        # 1. 为所有chunks生成embeddings
-        embeddings = []
-        for chunk in self.chunks:
-            emb = self.embedder.encode(chunk)
-            embeddings.append(emb)
+        # 1. 为所有chunks生成embeddings (批量调用以提高效率并获得正确的shape)
+        embeddings = self.embedder.encode(self.chunks)
         
+        # 确保是float32且shape正确
         embeddings = np.array(embeddings).astype('float32')
+        if len(embeddings.shape) == 3:  # 如果意外出现了三维 (N, 1, D)
+            embeddings = embeddings.squeeze(1)
         
         # 2. 创建FAISS索引
         dim = embeddings.shape[1]
@@ -47,20 +47,22 @@ class SimpleVectorRetriever:
         
         print(f"  Built FAISS index: {len(self.chunks)} chunks, dim={dim}")
     
-    def query(self, query: str, top_k: int = 6, **kwargs) -> Dict:
+    def query(self, query: str, top_k: int = 6, query_emb=None, **kwargs) -> Dict:
         """
         检索最相关的chunks
         
         Args:
             query: 查询文本
             top_k: 返回top k个最相关chunks
+            query_emb: 可选，预计算好的查询向量 (np.ndarray)
             
         Returns:
             包含chunks和debug信息的字典
         """
-        # 1. 生成query embedding
-        query_emb = self.embedder.encode(query).reshape(1, -1).astype('float32')
-        faiss.normalize_L2(query_emb)
+        # 1. 生成query embedding (如果未提供)
+        if query_emb is None:
+            query_emb = self.embedder.encode(query).reshape(1, -1).astype('float32')
+            faiss.normalize_L2(query_emb)
         
         # 2. FAISS检索
         scores, indices = self.index.search(query_emb, min(top_k, len(self.chunks)))

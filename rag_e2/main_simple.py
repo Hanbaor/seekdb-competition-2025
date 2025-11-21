@@ -159,6 +159,12 @@ async def main_async(args):
         
         logger.info(f"[{idx}/{len(questions)}] Processing: {question}")
         
+        # 预计算query embedding，避免重复调用API
+        import faiss
+        import numpy as np
+        query_emb = embedder.encode(question).reshape(1, -1).astype('float32')
+        faiss.normalize_L2(query_emb)
+        
         # 从所有文档检索
         all_retrievals = []
         best_score = -1
@@ -166,7 +172,8 @@ async def main_async(args):
         best_doc = ""
         
         for retriever in retrievers:
-            result = retriever.query(question, top_k=6)
+            # 传入预计算的embedding
+            result = retriever.query(question, top_k=6, query_emb=query_emb)
             
             # 记录检索信息
             retrieval_info = {

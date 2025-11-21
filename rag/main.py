@@ -1,6 +1,9 @@
 import argparse
 import logging
 import os
+# Configure no_proxy to bypass system proxy for local SSH tunnel
+os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "") + ",localhost,127.0.0.1"
+
 from datetime import datetime
 from typing import List
 

@@ -399,3 +399,9 @@ rag_e2/data/dataset
 rag_e2/cache
 rag_e2/data
 rag_e2/debug_output
+rag/etc
+rag/run
+rag/store
+rag_e2/simple_indexes
+run/observer
+run/observer.pid
