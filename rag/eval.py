@@ -2,9 +2,9 @@ import argparse
 import logging
 import re
 from typing import List, Optional
-
+import os
 import dotenv
-
+os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "") + ",localhost,127.0.0.1"
 from src.integrations.llm import generate_response
 from src.util import Answer, read_train_json
 
