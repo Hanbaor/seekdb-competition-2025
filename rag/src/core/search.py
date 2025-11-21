@@ -198,53 +198,88 @@ def search(question: str) -> Answer:
         # Save hypothetical answer to Answer object for later inspection
         answer.hypothetical_answer = hypothetical_answer
         
-        # Step 2: Combine original question with hypothetical answer for better retrieval
-        # This preserves question keywords while leveraging expanded context from hypothesis
-        retrieval_query = f"{question} {hypothetical_answer}"
-        logger.debug(f"Combined retrieval query: '{retrieval_query[:150]}...'")
-        
-        # Generate embedding for the combined query with 2048 dimensions
-        logger.debug("Generating embedding for combined query...")
-        question_embedding = generate_embedding(retrieval_query, dimensions=2048)
-
         # Initialize OceanBase client
         client = get_or_create_client()
-
-        # Build hybrid search query
-        # Aggressive recall optimization: prioritize vector search
-        fts_query = {
+        
+        # Step 2: Dual-path retrieval - retrieve separately with hypothetical answer and original question
+        # Then merge results to leverage both semantic expansion and keyword precision
+        logger.info("Starting dual-path retrieval...")
+        
+        # Path 1: Retrieve with hypothetical answer (semantic-focused)
+        logger.debug("Path 1: Retrieving with hypothetical answer...")
+        hypo_embedding = generate_embedding(hypothetical_answer, dimensions=2048)
+        
+        hypo_fts_query = {
             "bool": {
                 "should": [
                     {
                         "query_string": {
                             "fields": ["content"],
                             "type": "best_fields",
-                            "query": retrieval_query,  # Use hypothetical answer for FTS too
-                            # "minimum_should_match": "20%",
-                            # "boost": 0.5,  # Lower boost to let vector dominate
+                            "query": hypothetical_answer,
                         }
                     }
                 ],
             }
         }
-
-        # Build the hybrid search request
-        search_request = {
-            "query": fts_query,
+        
+        hypo_search_request = {
+            "query": hypo_fts_query,
             "knn": {
                 "field": "vector",
-                "k": TOP_K,  # Exact top-k results
-                "query_vector": question_embedding,
-                # "similarity": 0.5,  # High threshold for quality
-                # No num_candidates = exact/brute-force search
+                "k": TOP_K,
+                "query_vector": hypo_embedding,
             },
             "from": 0,
             "size": TOP_K,
         }
-
-        # Perform hybrid search
-        logger.debug(f"Performing hybrid search with TOP_K={TOP_K}...")
-        search_results = client.search(index=TABLE_NAME, body=search_request)
+        
+        hypo_results = client.search(index=TABLE_NAME, body=hypo_search_request)
+        logger.info(f"Hypothetical answer retrieval: found {len(hypo_results)} results")
+        
+        # Path 2: Retrieve with original question (keyword-focused)
+        logger.debug("Path 2: Retrieving with original question...")
+        question_embedding = generate_embedding(question, dimensions=2048)
+        
+        question_fts_query = {
+            "bool": {
+                "should": [
+                    {
+                        "query_string": {
+                            "fields": ["content"],
+                            "type": "best_fields",
+                            "query": question,
+                        }
+                    }
+                ],
+            }
+        }
+        
+        question_search_request = {
+            "query": question_fts_query,
+            "knn": {
+                "field": "vector",
+                "k": TOP_K,
+                "query_vector": question_embedding,
+            },
+            "from": 0,
+            "size": TOP_K,
+        }
+        
+        question_results = client.search(index=TABLE_NAME, body=question_search_request)
+        logger.info(f"Original question retrieval: found {len(question_results)} results")
+        
+        # Step 3: Tag each result with its source path before merging
+        for result in hypo_results:
+            result['_source'] = 'hypothetical'
+        for result in question_results:
+            result['_source'] = 'question'
+        
+        # Simply concatenate both result lists (no deduplication)
+        # Let LLM Rerank handle the larger candidate pool
+        search_results = hypo_results + question_results
+        
+        logger.info(f"Merged retrieval: {len(search_results)} total results (hypo: {len(hypo_results)}, question: {len(question_results)})")
 
         if not search_results or len(search_results) == 0:
             logger.warning(
@@ -253,7 +288,7 @@ def search(question: str) -> Answer:
             answer.answer = "抱歉，我没有找到相关的信息来回答这个问题。"
             return answer
 
-        logger.debug(f"Found {len(search_results)} search results")
+        logger.debug(f"Final merged results: {len(search_results)} documents")
         
         # RRF reranking disabled - using hybrid strategy instead
         # search_results = apply_rrf_reranking(search_results, k=60)
@@ -262,11 +297,13 @@ def search(question: str) -> Answer:
         contexts = []
         retrieval_results = []  # Store detailed retrieval info
 
+        # Use TOP_K for context extraction but save all merged results for analysis
         for idx, result in enumerate(search_results[:TOP_K]):
             content = result.get("content", "")
             filename = result.get("filename", "")
             page = result.get("page", 0)
             score = result.get("_score", 0.0)  # Hybrid search score
+            source = result.get("_source", "unknown")  # Track which retrieval path this came from
 
             if content:
                 contexts.append(content)
@@ -276,9 +313,29 @@ def search(question: str) -> Answer:
                     "filename": filename,
                     "page": page,
                     "score": score,
+                    "source": source,  # Track retrieval path (hypothetical/question)
                     "content_preview": content[:200] + "..." if len(content) > 200 else content,
-                    "content_length": len(content)
+                    "content_length": len(content),
+                    "used_for_context": True  # Mark as used in LLM context
                 })
+        
+        # Also save the remaining results (beyond TOP_K) for analysis purposes
+        for idx, result in enumerate(search_results[TOP_K:], start=TOP_K):
+            filename = result.get("filename", "")
+            page = result.get("page", 0)
+            score = result.get("_score", 0.0)
+            source = result.get("_source", "unknown")
+            
+            retrieval_results.append({
+                "rank": idx + 1,
+                "filename": filename,
+                "page": page,
+                "score": score,
+                "source": source,
+                "content_preview": "",  # Don't store content for analysis-only results
+                "content_length": 0,
+                "used_for_context": False  # Not used in LLM context
+            })
 
         if not contexts:
             logger.warning(
