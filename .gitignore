@@ -405,3 +405,4 @@ rag/store
 rag_e2/simple_indexes
 run/observer
 run/observer.pid
+rag/logs/

@@ -136,7 +136,7 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
 
     try:
         messages = [{"role": "user", "content": prompt}]
-        result_text = generate_llm_response(messages).strip()
+        result_text = generate_llm_response(messages, temperature=0.0).strip()  # Use 0.0 for deterministic reranking
         
         # Extract JSON
         import re
@@ -348,7 +348,7 @@ def search(question: str) -> Answer:
             {"role": "user", "content": prompt},
         ]
 
-        answer.answer = generate_llm_response(messages)
+        answer.answer = generate_llm_response(messages, temperature=0.3)  # Use 0.3 for natural answer generation
         logger.debug(
             f"Query completed: question='{question[:50]}...', filename='{answer.filename}', page={answer.page}"
         )
