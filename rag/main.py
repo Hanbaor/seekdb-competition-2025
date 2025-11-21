@@ -4,6 +4,7 @@ import os
 # Configure no_proxy to bypass system proxy for local SSH tunnel
 os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "") + ",localhost,127.0.0.1"
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List
 
@@ -87,20 +88,41 @@ if __name__ == "__main__":
     logger.info("Starting data preparation...")
     add(
         dataset_dir=args.dataset,
-        max_worker=4,
+        max_worker=10,
     )
     logger.info("Data preparation completed.")
-
-    answers: List[Answer] = []
 
     logger.info("Starting question answering...")
     questions: List[str] = read_questions_json(args.questions)
     logger.info(f"Loaded {len(questions)} questions from {args.questions}")
 
-    for idx, question in enumerate(questions, 1):
-        logger.debug(f"Processing question {idx}/{len(questions)}: {question[:50]}...")
-        answers.append(search(question))
-
+    # Process questions in parallel with max 10 workers
+    max_qa_workers = 10
+    answers_dict = {}  # Store answers with their original index
+    
+    with ThreadPoolExecutor(max_workers=max_qa_workers) as executor:
+        # Submit all question processing tasks
+        future_to_idx = {
+            executor.submit(search, question): idx
+            for idx, question in enumerate(questions)
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            question = questions[idx]
+            try:
+                answer = future.result()
+                answers_dict[idx] = answer
+                logger.info(f"Completed question {idx + 1}/{len(questions)}: {question[:50]}...")
+            except Exception as e:
+                logger.error(f"Error processing question {idx + 1}: {e}", exc_info=True)
+                # Create empty answer on error
+                answers_dict[idx] = Answer(question=question, answer="", contexts=[])
+    
+    # Sort answers by index to maintain original order
+    answers: List[Answer] = [answers_dict[i] for i in range(len(questions))]
+    
     logger.info(f"Completed processing {len(answers)} questions.")
     logger.info(f"Writing answers to {args.output}...")
     write_answers(answers, args.output)

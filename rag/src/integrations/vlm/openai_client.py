@@ -33,7 +33,7 @@ def generate_response(
     prompt: str,
     images: Optional[Union[str, List[str]]] = None,
     model: str = "qwen3-vl-flash",
-    max_retries: int = 3,
+    max_retries: int = 30,
     initial_backoff: float = 1.0,
 ) -> str:
     """

@@ -80,14 +80,20 @@ def create_table_if_not_exists(client: HybridSearch, vector_dim: int):
     """Create the documents table if it doesn't exist."""
     logger.info(f"Checking table '{TABLE_NAME}'...")
     
-    # Instead of dropping, we just try to create. 
-    # If it exists, client.create_table might raise an error or handle it.
-    # pyobvector's create_table usually executes CREATE TABLE directly.
-    # We rely on get_processed_files to verify existence effectively.
-    
+    # Check if table exists using SQLAlchemy
     try:
-        # We use a trick: check if we can query it. If not, create it.
-        # But we can also use the try-except block around create_table
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(f"SHOW TABLES LIKE '{TABLE_NAME}'"))
+            if result.fetchone():
+                logger.info(f"Table '{TABLE_NAME}' already exists. Skipping creation.")
+                return
+    except Exception as e:
+        logger.warning(f"Failed to check table existence: {e}")
+        # Continue to try creating it if check fails
+
+    try:
+        # Create table
         client.create_table(
             table_name=TABLE_NAME,
             columns=[

@@ -25,8 +25,8 @@ llm = OpenAI(
 
 def generate_response(
     messages: List[Dict[str, str]],
-    model="qwen-plus",
-    max_retries: int = 3,
+    model="kimi-k2-thinking",
+    max_retries: int = 30,
     initial_backoff: float = 1.0,
     timeout: float = 300.0,
 ) -> str:
@@ -35,7 +35,7 @@ def generate_response(
 
     Args:
         messages: List of message dictionaries with 'role' and 'content' keys
-        model: Model name to use for generation
+        model: Model name to use for generation (default: read from LLM_MODEL_NAME env var)
         max_retries: Maximum number of retry attempts
         initial_backoff: Initial backoff time in seconds (doubles on each retry)
         timeout: Request timeout in seconds (default: 300.0)

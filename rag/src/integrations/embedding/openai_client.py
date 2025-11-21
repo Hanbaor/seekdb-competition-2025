@@ -30,7 +30,7 @@ embedding_client = OpenAI(
 def generate_response(
     embedding_text: str,
     model: str = "text-embedding-v4",
-    max_retries: int = 3,
+    max_retries: int = 20,
     initial_backoff: float = 1.0,
 ) -> List[float]:
     """
