@@ -33,7 +33,7 @@ from raganything.query import QueryMixin
 from raganything.processor import ProcessorMixin
 from raganything.batch import BatchMixin
 from raganything.utils import get_processor_supports
-from raganything.parser import MineruParser, DoclingParser
+from raganything.parser import MineruParser, DoclingParser, VLMParser
 
 # Import specialized processors
 from raganything.modalprocessors import (
@@ -109,9 +109,13 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
         self.logger = logger
 
         # Set up document parser
-        self.doc_parser = (
-            DoclingParser() if self.config.parser == "docling" else MineruParser()
-        )
+        if self.config.parser == "docling":
+            self.doc_parser = DoclingParser()
+        elif self.config.parser == "vlm":
+            # VLM parser needs vision_model_func, will be set later
+            self.doc_parser = VLMParser(vision_model_func=self.vision_model_func)
+        else:
+            self.doc_parser = MineruParser()
 
         # Register close method for cleanup
         atexit.register(self.close)

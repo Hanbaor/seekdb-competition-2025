@@ -1708,6 +1708,354 @@ class DoclingParser(Parser):
             return False
 
 
+class VLMParser(Parser):
+    """
+    Vision Language Model (VLM) based document parser.
+    
+    Uses vision models to directly understand document pages without requiring
+    OCR, layout detection, or other preprocessing. This is especially useful
+    when running on servers without GPU support.
+    """
+
+    def __init__(self, vision_model_func=None) -> None:
+        """
+        Initialize VLMParser
+        
+        Args:
+            vision_model_func: Optional vision model function. If not provided,
+                             will be passed as kwargs during parsing.
+        """
+        super().__init__()
+        self.vision_model_func = vision_model_func
+        self.logger = logging.getLogger(__name__)
+
+    def _pdf_to_images(
+        self, pdf_path: Union[str, Path], output_dir: Union[str, Path]
+    ) -> List[Path]:
+        """
+        Convert PDF pages to images using pdf2image
+        
+        Args:
+            pdf_path: Path to PDF file
+            output_dir: Directory to save images
+            
+        Returns:
+            List of paths to saved images
+        """
+        try:
+            from pdf2image import convert_from_path
+        except ImportError:
+            raise RuntimeError(
+                "pdf2image is required for VLM parsing. "
+                "Install with: pip install pdf2image\n"
+                "Also requires poppler-utils: "
+                "Ubuntu/Debian: sudo apt-get install poppler-utils"
+            )
+        
+        pdf_path = Path(pdf_path)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.logger.info(f"Converting PDF to images: {pdf_path.name}")
+        
+        # Convert PDF to images
+        images = convert_from_path(pdf_path, dpi=150)
+        
+        # Save images
+        image_paths = []
+        for i, image in enumerate(images, start=1):
+            image_path = output_dir / f"page_{i:04d}.png"
+            image.save(image_path, "PNG")
+            image_paths.append(image_path)
+            
+        self.logger.info(f"Converted {len(image_paths)} pages to images")
+        return image_paths
+    
+    def _encode_image_to_base64(self, image_path: Union[str, Path]) -> str:
+        """
+        Encode image to base64 string
+        
+        Args:
+            image_path: Path to image file
+            
+        Returns:
+            Base64 encoded string
+        """
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    
+    async def _analyze_page_with_vlm(
+        self,
+        image_path: Path,
+        page_num: int,
+        vision_model_func: Callable,
+    ) -> Dict[str, Any]:
+        """
+        Analyze a single page using vision model
+        
+        Args:
+            image_path: Path to page image
+            page_num: Page number (1-indexed)
+            vision_model_func: Vision model function
+            
+        Returns:
+            Content dict for this page
+        """
+        # Encode image
+        image_base64 = self._encode_image_to_base64(image_path)
+        
+        # Construct prompt for VLM
+        system_prompt = """你是一个专业的文档分析助手。请仔细分析这个文档页面，并提取其中的所有内容。
+
+要求：
+1. 按照原文档的顺序和结构输出内容
+2. 保留标题、段落、列表等格式结构
+3. 对于表格，使用 Markdown 表格格式
+4. 对于公式，使用 LaTeX 格式（用 $ 或 $$ 包围）
+5. **对于图片/图表**：
+   - 使用格式：`[图片描述: 详细描述图片内容，包括图表类型、数据趋势、关键信息等]`
+   - 如果有图例或标注，也要包含在描述中
+   - 例如：`[图片描述: 折线图显示2024年1-12月销售额从100万增长到300万，呈持续上升趋势]`
+6. 整体输出为 Markdown 格式
+7. 不要添加任何额外的解释、评论或分析，只输出文档的原始内容
+8. 保持内容的完整性和准确性"""
+
+        user_prompt = f"请提取并还原第 {page_num} 页的所有内容（文本、表格、公式、图片等）："
+        
+        # Build messages for VLM
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        # Call VLM
+        self.logger.info(f"[VLM-START] Analyzing page {page_num}...")
+        result = await vision_model_func("", messages=messages)
+        self.logger.info(f"[VLM-DONE] Page {page_num} completed")
+        
+        # Create content entry
+        content_entry = {
+            "type": "text",
+            "text": result,
+            "page_idx": page_num - 1,  # 0-indexed
+            "page_num": page_num,  # 1-indexed
+        }
+        
+        return content_entry
+    
+    async def parse_pdf(
+        self,
+        pdf_path: Union[str, Path],
+        output_dir: Optional[str] = None,
+        method: str = "auto",
+        lang: Optional[str] = None,
+        vision_model_func: Optional[Callable] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse PDF document using VLM
+        
+        Args:
+            pdf_path: Path to the PDF file
+            output_dir: Output directory path
+            method: Parsing method (ignored for VLM)
+            lang: Document language (ignored for VLM)
+            vision_model_func: Vision model function (required if not set in __init__)
+            **kwargs: Additional parameters
+            
+        Returns:
+            List[Dict[str, Any]]: List of content blocks
+        """
+        try:
+            # Get vision model function
+            vlm_func = vision_model_func or self.vision_model_func
+            if vlm_func is None:
+                raise ValueError(
+                    "vision_model_func must be provided either during initialization "
+                    "or as a parameter to parse_pdf"
+                )
+            
+            # Convert to Path object
+            pdf_path = Path(pdf_path)
+            if not pdf_path.exists():
+                raise FileNotFoundError(f"PDF file does not exist: {pdf_path}")
+            
+            name_without_suff = pdf_path.stem
+            
+            # Prepare output directory
+            if output_dir:
+                base_output_dir = Path(output_dir)
+            else:
+                base_output_dir = pdf_path.parent / "vlm_output"
+            
+            base_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create subdirectory for this file
+            file_output_dir = base_output_dir / name_without_suff / "vlm"
+            file_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Convert PDF to images
+            images_dir = file_output_dir / "images"
+            image_paths = self._pdf_to_images(pdf_path, images_dir)
+            
+            # Analyze each page with VLM
+            self.logger.info(f"Analyzing {len(image_paths)} pages with VLM...")
+            content_list = []
+            
+            for i, image_path in enumerate(image_paths, start=1):
+                content_entry = await self._analyze_page_with_vlm(
+                    image_path, i, vlm_func
+                )
+                content_list.append(content_entry)
+            
+            # Generate markdown from content list
+            markdown_content = self._generate_markdown(content_list)
+            
+            # Save outputs
+            md_file = file_output_dir / f"{name_without_suff}.md"
+            json_file = file_output_dir / f"{name_without_suff}_content_list.json"
+            
+            with open(md_file, "w", encoding="utf-8") as f:
+                f.write(markdown_content)
+            
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(content_list, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info(f"VLM parsing completed for {pdf_path.name}")
+            self.logger.info(f"  - Markdown: {md_file}")
+            self.logger.info(f"  - JSON: {json_file}")
+            
+            return content_list
+            
+        except Exception as e:
+            self.logger.error(f"Error in VLM parse_pdf: {str(e)}")
+            raise
+    
+    def _generate_markdown(self, content_list: List[Dict[str, Any]]) -> str:
+        """
+        Generate markdown text from content list
+        
+        Args:
+            content_list: List of content entries
+            
+        Returns:
+            Markdown text
+        """
+        markdown_parts = []
+        
+        for item in content_list:
+            if isinstance(item, dict) and item.get("text"):
+                page_num = item.get("page_num", "?")
+                text = item.get("text", "")
+                
+                # Add page separator
+                markdown_parts.append(f"\n\n<!-- Page {page_num} -->\n")
+                markdown_parts.append(text)
+        
+        return "\n".join(markdown_parts)
+    
+    def parse_image(
+        self,
+        image_path: Union[str, Path],
+        output_dir: Optional[str] = None,
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse image document using VLM
+        
+        Args:
+            image_path: Path to the image file
+            output_dir: Output directory path
+            lang: Document language (ignored for VLM)
+            **kwargs: Additional parameters
+            
+        Returns:
+            List[Dict[str, Any]]: List of content blocks
+        """
+        # For images, we can use the same logic but treat it as a single-page document
+        raise NotImplementedError("VLM image parsing not yet implemented")
+    
+    def parse_document(
+        self,
+        file_path: Union[str, Path],
+        method: str = "auto",
+        output_dir: Optional[str] = None,
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse document using VLM based on file extension
+        
+        Args:
+            file_path: Path to the file to be parsed
+            method: Parsing method (ignored for VLM)
+            output_dir: Output directory path
+            lang: Document language (ignored for VLM)
+            **kwargs: Additional parameters including vision_model_func
+            
+        Returns:
+            List[Dict[str, Any]]: List of content blocks
+        """
+        # Convert to Path object
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File does not exist: {file_path}")
+        
+        # Get file extension
+        ext = file_path.suffix.lower()
+        
+        # Currently only support PDF
+        if ext == ".pdf":
+            # Need to run async function
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If already in async context, create task
+                raise RuntimeError(
+                    "VLMParser.parse_document cannot be called from async context. "
+                    "Use await parse_pdf() instead."
+                )
+            else:
+                # Run in new event loop
+                return asyncio.run(
+                    self.parse_pdf(file_path, output_dir, method, lang, **kwargs)
+                )
+        else:
+            raise ValueError(
+                f"VLM parser currently only supports PDF files. "
+                f"Got: {ext}"
+            )
+    
+    def check_installation(self) -> bool:
+        """
+        Check if required dependencies are installed
+        
+        Returns:
+            bool: True if installation is valid, False otherwise
+        """
+        try:
+            import pdf2image
+            return True
+        except ImportError:
+            self.logger.warning(
+                "pdf2image is not installed. "
+                "Install with: pip install pdf2image"
+            )
+            return False
+
+
 def main():
     """
     Main function to run the document parser from command line

@@ -317,9 +317,8 @@ class ProcessorMixin:
         ext = file_path.suffix.lower()
 
         try:
-            doc_parser = (
-                DoclingParser() if self.config.parser == "docling" else MineruParser()
-            )
+            # Use the doc_parser that was set up during initialization
+            doc_parser = self.doc_parser
 
             # Log parser and method information
             self.logger.info(
@@ -328,13 +327,24 @@ class ProcessorMixin:
 
             if ext in [".pdf"]:
                 self.logger.info("Detected PDF file, using parser for PDF...")
-                content_list = await asyncio.to_thread(
-                    doc_parser.parse_pdf,
-                    pdf_path=file_path,
-                    output_dir=output_dir,
-                    method=parse_method,
-                    **kwargs,
-                )
+                # VLMParser has async parse_pdf, others are sync
+                if self.config.parser == "vlm":
+                    # VLMParser needs vision_model_func
+                    content_list = await doc_parser.parse_pdf(
+                        pdf_path=file_path,
+                        output_dir=output_dir,
+                        method=parse_method,
+                        vision_model_func=self.vision_model_func,
+                        **kwargs,
+                    )
+                else:
+                    content_list = await asyncio.to_thread(
+                        doc_parser.parse_pdf,
+                        pdf_path=file_path,
+                        output_dir=output_dir,
+                        method=parse_method,
+                        **kwargs,
+                    )
             elif ext in [
                 ".jpg",
                 ".jpeg",

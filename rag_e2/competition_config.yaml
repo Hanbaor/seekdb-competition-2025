@@ -1,0 +1,38 @@
+dataset:
+  dataset_name: seekdb_competition
+  dataset_path: ./data/dataset/  # Path to the PDF directory
+  questions_path: ./data/questions.json
+  output_path: ./data/output.json
+
+llm:
+  llm_name: qwen-flash  # Using API model name as placeholder, logic will handle this
+  llm_path: qwen-flash  # For API calls, this might be the model name
+  llm_device: cpu       # Device for local models, or irrelevant for API
+
+paths:
+  log_path: ./log
+  answer_path: ./data/
+  cache_path: ./cache
+  processed_docs_path: ./processed_documents
+
+cluster:
+  length: 1200
+  overlap: 100
+  merge_num: 5
+
+retriever:
+  kwargs:
+    device: cpu
+    shortest_path_k: 4
+    debug: True
+    merge_num: 5
+    overlap: 100
+    tokenizer: qwen-flash # Placeholder
+    max_chunk_setting: 25
+
+vlm:
+  worker_count: 20
+  model_name: qwen3-vl-flash
+
+graph:
+  worker_count: 20

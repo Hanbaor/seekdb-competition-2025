@@ -16,3 +16,4 @@ tiktoken
 nano-vectordb
 json_repair
 mineru[core]
+poppler-utils
