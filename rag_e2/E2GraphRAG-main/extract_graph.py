@@ -8,20 +8,35 @@ from typing import List, Tuple
 import time
 
 def load_nlp(language:str="en"):
+    import os
+    
+    # 尝试从项目本地加载
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
     if language == "en":
-        try:
-            nlp = spacy.load("en_core_web_lg")
-        except:
-            print("Downloading spacy model...")
-            spacy.cli.download("en_core_web_lg")
-            nlp = spacy.load("en_core_web_lg")
+        local_model = os.path.join(project_root, "models", "en_core_web_lg")
+        if os.path.exists(local_model):
+            print(f"Loading local spaCy model: {local_model}")
+            nlp = spacy.load(local_model)
+        else:
+            try:
+                nlp = spacy.load("en_core_web_lg")
+            except:
+                print("Downloading spacy model...")
+                spacy.cli.download("en_core_web_lg")
+                nlp = spacy.load("en_core_web_lg")
     elif language == "zh":
-        try:
-            nlp = spacy.load("zh_core_web_lg")
-        except:
-            print("Downloading spacy model...")
-            spacy.cli.download("zh_core_web_lg")
-            nlp = spacy.load("zh_core_web_lg")
+        local_model = os.path.join(project_root, "models", "zh_core_web_sm")
+        if os.path.exists(local_model):
+            print(f"Loading local spaCy model: {local_model}")
+            nlp = spacy.load(local_model)
+        else:
+            try:
+                nlp = spacy.load("zh_core_web_sm")
+            except:
+                print("Downloading spacy model...")
+                spacy.cli.download("zh_core_web_sm")
+                nlp = spacy.load("zh_core_web_sm")
     return nlp
         
 def naive_extract_graph(text:str, nlp:spacy.Language):
@@ -139,6 +154,9 @@ def save_appearance_count(result, cache_path:str):
         json.dump(result, f, indent=4)
     
 def extract_graph(text:List[str], cache_folder:str, nlp:spacy.Language, use_cache=True, reextract=False):
+    import logging
+    logger = logging.getLogger(__name__)
+    
     extract_start_time = time.time()
     if use_cache and os.path.exists(os.path.join(cache_folder, "graph.json")) and os.path.exists(os.path.join(cache_folder, "index.json")) and os.path.exists(os.path.join(cache_folder, "appearance_count.json")):
         return load_cache(cache_folder), -1
@@ -150,8 +168,14 @@ def extract_graph(text:List[str], cache_folder:str, nlp:spacy.Language, use_cach
         index = {}
         appearance_count = {}
 
+        logger.info(f"[GraphExtract] Processing {len(text)} chunks")
         for i, chunk in enumerate(text):
+            chunk_len = len(chunk)
+            logger.info(f"[GraphExtract] Chunk {i+1}/{len(text)}: {chunk_len:,} characters, starting NER...")
+            chunk_start = time.time()
             naive_result = naive_extract_graph(chunk, nlp)
+            chunk_time = time.time() - chunk_start
+            logger.info(f"[GraphExtract] Chunk {i+1}/{len(text)}: completed in {chunk_time:.2f}s, found {len(naive_result['nouns'])} entities")
             # not merge the entities.
             appearance_count["leaf_{}".format(i)] = naive_result["appearance_count"]
 

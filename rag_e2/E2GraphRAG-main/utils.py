@@ -56,16 +56,29 @@ def load_tree_graph(cache_folder:str):
     G = build_graph(edges)
     return tree, G, index, appearance_count
 
-def sequential_split(text:str, tokenizer:AutoTokenizer,
+def sequential_split(text:str, tokenizer,  # tokenizer can be AutoTokenizer or tiktoken
                      length:int, overlap:int)->List[str]:
     '''
     Split the text into chunks of length length with overlap.
+    使用 tiktoken 避免中文 decode 加空格的问题
     '''
     chunks = []
-    text_ids = tokenizer(text, return_tensors="pt")["input_ids"][0]
-    for i in range(0, len(text_ids), length - overlap):
-        chunk = tokenizer.decode(text_ids[i:i+length])
-        chunks.append(chunk)
+    
+    # 检查是否是 tiktoken
+    if hasattr(tokenizer, 'encode') and not hasattr(tokenizer, '__call__'):
+        # tiktoken tokenizer
+        text_ids = tokenizer.encode(text)
+        for i in range(0, len(text_ids), length - overlap):
+            chunk = tokenizer.decode(text_ids[i:i+length])
+            chunks.append(chunk)
+    else:
+        # transformers tokenizer (兼容旧代码)
+        from transformers import AutoTokenizer
+        text_ids = tokenizer(text, return_tensors="pt", truncation=False, max_length=None)["input_ids"][0]
+        for i in range(0, len(text_ids), length - overlap):
+            chunk = tokenizer.decode(text_ids[i:i+length])
+            chunks.append(chunk)
+    
     return chunks
 
 import time

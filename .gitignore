@@ -395,3 +395,7 @@ rag_backup/output
 rag_backup/hf_cache
 rag_backup/temp_test_images
 rag_backup/vlm_test_output
+rag_e2/data/dataset
+rag_e2/cache
+rag_e2/data
+rag_e2/debug_output

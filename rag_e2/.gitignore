@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env.local
+
+# Cache
+cache/
+processed_documents/
+log/
+*.log
+
+# Data (optional - uncomment if not committing data)
+# data/dataset/
+# data/output.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Models - COMMENT OUT if you want to commit models to Git
+# models/

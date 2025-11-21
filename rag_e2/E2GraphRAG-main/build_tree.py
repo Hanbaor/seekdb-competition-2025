@@ -1,21 +1,39 @@
 from typing import List
 import json
 import os
+import logging
 from transformers import AutoTokenizer, pipeline
 from prompt_dict import Prompts
 from utils import sequential_split, Timer
 import time
 
+logger = logging.getLogger(__name__)
+
 def sequential_merge(chunks:List[str], 
-                     tokenizer:AutoTokenizer,
+                     tokenizer,  # Can be AutoTokenizer or tiktoken
                      overlap:int)->str:
     '''
     Merge the chunks into a single text.
+    支持 tiktoken 和 AutoTokenizer
     '''
+    if tokenizer is None:
+        # Fallback for API-based summarization: simple string concatenation.
+        return "\n".join(chunks)
+
     res = chunks[0]
-    for i in range(1, len(chunks)):
-        ids = tokenizer(chunks[i], return_tensors="pt")["input_ids"][0][overlap:]
-        res += tokenizer.decode(ids)
+    
+    # 检查是否是 tiktoken
+    if hasattr(tokenizer, 'encode') and not hasattr(tokenizer, '__call__'):
+        # tiktoken tokenizer
+        for i in range(1, len(chunks)):
+            ids = tokenizer.encode(chunks[i])[overlap:]
+            res += tokenizer.decode(ids)
+    else:
+        # transformers tokenizer (兼容旧代码)
+        for i in range(1, len(chunks)):
+            ids = tokenizer(chunks[i], return_tensors="pt")["input_ids"][0][overlap:]
+            res += tokenizer.decode(ids)
+    
     return res
 
 def load_cache_summary(cache_path:str)->List[str]:
@@ -63,6 +81,7 @@ def build_tree(text_chunks:List[str], llm:pipeline, cache_folder:str,
     if os.path.exists(os.path.join(cache_folder, "tree.json")):
         return load_cache_summary(os.path.join(cache_folder, "tree.json")), -1
 
+    logger.info("[TreeBuild] Received %d chunks (merge=%d, overlap=%d)", len(text_chunks), merge_num, overlap)
     cache = {}
     
     # leaf ids in the format of "leaf_{i}"
@@ -76,6 +95,7 @@ def build_tree(text_chunks:List[str], llm:pipeline, cache_folder:str,
 
     # do summarize for the first level.
     summary_id_count = 0
+    logger.info("[TreeBuild] Starting level-0 summaries: %d batches", max(1, (len(text_chunks)+merge_num-1)//merge_num))
     for i in range(0, len(text_chunks), merge_num):
         merged_chunks = sequential_merge(text_chunks[i:i+merge_num], tokenizer, overlap)
         summary = summarize_leaf(merged_chunks, llm, language)
@@ -93,6 +113,7 @@ def build_tree(text_chunks:List[str], llm:pipeline, cache_folder:str,
     level = 1
     # do summarize for the rest levels.
     while len(to_summarize) > 1.2 * merge_num:
+        logger.info("[TreeBuild] Level %d summarizing %d nodes", level, len(to_summarize))
         new_summary_id_count = 0
         for i in range(0, len(to_summarize), merge_num):
             # for summary, there is no overlap.
@@ -110,11 +131,13 @@ def build_tree(text_chunks:List[str], llm:pipeline, cache_folder:str,
                 cache["summary_{}_{}".format(level-1, j)]["parent"] = f"summary_{level}_{new_summary_id_count}"
         # update the to_summarize list.
         to_summarize = [f"summary_{level}_{i}" for i in range(new_summary_id_count)]
+        logger.info("[TreeBuild] Level %d produced %d nodes", level, new_summary_id_count)
         level += 1
     
     # save the cache.
     with open(os.path.join(cache_folder, "tree.json"), "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=4)
+    logger.info("[TreeBuild] Tree saved: %d nodes total", len(cache))
     build_end_time = time.time()
     return_time = build_end_time - build_start_time
     return cache, return_time

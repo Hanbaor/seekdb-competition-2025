@@ -13,6 +13,7 @@ import random
 random.seed(1)
 import copy
 import numpy as np
+import jieba.analyse
 
 class Retriever:
     def __init__(self, cache_tree, G:nx.Graph, index, appearance_count:Dict[str, int], nlp:spacy.Language, **kwargs) -> None:
@@ -29,16 +30,39 @@ class Retriever:
         # get the inverse index, i.e., chunk_id to noun index.
         self.inverse_index = self.get_inverse_index()
         self.nlp = nlp
+        # cache graph entities for jieba fuzzy matching
+        self.graph_entities = [key for key in self.index.keys() if key]
         # set up the parameters.
         self.device = kwargs.get("device", "cuda:0")
         self.merge_num = kwargs.get("merge_num", 5)
         self.min_count = kwargs.get("min_count", 2)
         self.overlap = kwargs.get("overlap", 100)
-        self.tokenizer = kwargs.get("tokenizer","/path/to/your/model")
-        print("Tokenizer set to:"+str(self.tokenizer)) ##KKR Debug Addition
-        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer)
-        if kwargs.get("embedder", "BAAI/bge-m3") is not None:
-            self.embedder = SentenceTransformer(kwargs.get("embedder", "BAAI/bge-m3"),device=self.device)
+        
+        # 使用 tiktoken 替代 bert-base-chinese
+        import tiktoken
+        self.tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
+        print("Tokenizer: tiktoken (gpt-4o-mini)")
+        
+        # Support API-based embedding
+        use_api_embedding = kwargs.get("use_api_embedding", False)
+        embedder_config = kwargs.get("embedder", "BAAI/bge-m3")
+        
+        if embedder_config is not None:
+            if use_api_embedding:
+                # Use API embedding
+                import sys
+                import os
+                sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                from api_embedding import APIEmbedding
+                
+                embedding_model = kwargs.get("embedding_model", "text-embedding-v4")
+                embedding_dim = kwargs.get("embedding_dim", 1024)
+                print(f"Using API embedding: model={embedding_model}, dim={embedding_dim}")
+                self.embedder = APIEmbedding(model_name=embedding_model, embedding_dim=embedding_dim)
+            else:
+                # Use local SentenceTransformer
+                self.embedder = SentenceTransformer(embedder_config, device=self.device)
+            
             self.faiss_index = self._build_faiss_index()
         else:
             print("Warning: the embedder is set to None, dense retrieval is not implemented.")
@@ -135,7 +159,7 @@ class Retriever:
             self.embedder = SentenceTransformer("BAAI/bge-m3",device=self.device)
             self.embedder.eval()
             print("the embedder is not set, using the default embedder BAAI/bge-m3.")
-        doc_embeds = self.embedder.encode(docs, batch_size=16, device=self.device)
+        doc_embeds = self.embedder.encode(docs, batch_size=10, device=self.device)  # API限制<=10，使用6更安全
         # print("doc_embeds examples", doc_embeds[0:5][0:5])
         # print("doc_embeds shape", doc_embeds.shape)
         vector_database = faiss.IndexFlatIP(doc_embeds.shape[1])
@@ -422,10 +446,38 @@ class Retriever:
         return filtered_res
 
     def query(self, query, **kwargs):
-        # step 1: extract the Entities from the query.
-        # reuse the naive_extract_graph function, which is used in the graph building process.
-        entities = naive_extract_graph(query.split("\n")[0], self.nlp)#
-        entities = entities["nouns"]
+        # step 1: extract entities via jieba keywords with fuzzy matching against graph index
+        stopwords = {"什么", "如何", "哪些", "多少", "怎样", "为什么", "是", "的", "了", "在", "与", "和", "有", "吗", "？", "请", "告诉"}
+        raw_text = query.split("\n")[0]
+        raw_entities = jieba.analyse.extract_tags(raw_text, topK=8, withWeight=False)
+        entities = []
+        for entity in raw_entities:
+            if entity in stopwords or len(entity) < 2:
+                continue
+            if entity in self.index:
+                entities.append(entity)
+                continue
+            matches = []
+            for graph_entity in self.graph_entities:
+                if len(graph_entity) < 2:
+                    continue
+                if entity in graph_entity or graph_entity in entity:
+                    if entity in graph_entity:
+                        score = len(entity) / len(graph_entity)
+                    else:
+                        score = len(graph_entity) / len(entity)
+                    matches.append((graph_entity, score))
+            if matches:
+                matches.sort(key=lambda x: x[1], reverse=True)
+                best_match, best_score = matches[0]
+                if best_score > 0.2:
+                    entities.append(best_match)
+        entities = list(dict.fromkeys(entities))
+
+        # fallback to naive spaCy extraction if jieba仍然为空
+        if not entities:
+            spa_entities = naive_extract_graph(raw_text, self.nlp)["nouns"]
+            entities = spa_entities
 
         # step 2.0: set up the parameters.
         shortest_path_k = kwargs.get("shortest_path_k", 4)

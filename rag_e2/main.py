@@ -7,6 +7,10 @@ import json
 import yaml
 from pathlib import Path
 import torch
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Add E2GraphRAG to path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -33,9 +37,40 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Reduce noise from dependency loggers (httpx/OpenAI clients)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+
 def load_config(config_path):
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
+
+import re
+
+def extract_source_info(context_text, doc_name):
+    """
+    Extract filename and page number from context text.
+    Assumes format: [PAGE_START:num] ... content ...
+    """
+    # Find all page markers
+    matches = re.findall(r"\[PAGE_START:(\d+)\]", context_text)
+    
+    page_num = 0
+    if matches:
+        # Use the most frequent page or the first one?
+        # Let's use the first one found in the top chunk
+        try:
+            page_num = int(matches[0])
+        except ValueError:
+            pass
+            
+    # Construct filename (assuming doc_name is stem)
+    # Competition often requires full filename.
+    # We only have the stem from cache dir name.
+    # If the original file was .pdf, we append it.
+    filename = f"{doc_name}.pdf"
+    
+    return filename, page_num
 
 async def main_async(args):
     config = load_config(args.config)
@@ -66,7 +101,9 @@ async def main_async(args):
         nlp = load_nlp()
         
         # Identify all processed docs
-        doc_dirs = sorted([d for d in (Path(config["paths"]["cache_path"]) / config["dataset"]["dataset_name"]).iterdir() if d.is_dir()])
+        cache_root = Path(config["paths"]["cache_path"]) / config["dataset"]["dataset_name"]
+        cache_root.mkdir(parents=True, exist_ok=True)
+        doc_dirs = sorted([d for d in cache_root.iterdir() if d.is_dir()])
         
         # We need to load the Graph/Tree for each doc to build retrievers
         # Since we can't keep 100 graphs in memory easily if they are huge, maybe we load one by one?
@@ -108,74 +145,155 @@ async def main_async(args):
             except Exception as e:
                 logger.error(f"Failed to load {doc_dir.name}: {e}")
 
-        answers = []
-        api_client = APIClient(config) # Reuse for QA generation
+        # 并行查询配置
+        max_concurrent = config.get("query", {}).get("max_concurrent_queries", 3)
+        semaphore = asyncio.Semaphore(max_concurrent)
+        api_client = APIClient(config)
         
-        for idx, question_item in enumerate(questions, 1):
-            # Handle both string and dict formats
-            if isinstance(question_item, dict):
-                question = question_item.get("question", "")
-            else:
-                question = str(question_item)
-                
-            logger.info(f"Querying {idx}/{len(questions)}: {question}")
-            
-            all_chunks = []
-            
-            # Retrieve from all docs
-            for i, retriever in enumerate(retrievers):
-                try:
-                    result = retriever.query(question, **config["retriever"]["kwargs"])
-                    # result['chunks'] is a string formatted with "key: content"
-                    # We need to parse it back or just append it
-                    # result also has 'chunk_ids' if debug=True
+        async def process_one_question(idx, question_item):
+            """处理单个问题（检索+生成答案）"""
+            async with semaphore:  # 控制并发数
+                # Handle both string and dict formats
+                if isinstance(question_item, dict):
+                    question = question_item.get("question", "")
+                else:
+                    question = str(question_item)
                     
-                    # Let's store the raw chunks and the source doc
-                    if "chunks" in result and result["chunks"].strip():
-                        all_chunks.append(f"Source: {doc_names[i]}\n{result['chunks']}")
-                except Exception as e:
-                    logger.error(f"Query failed for {doc_names[i]}: {e}")
-
-            # Aggregate context
-            # If too long, truncate?
-            # Simple concatenation for now
-            combined_context = "\n\n".join(all_chunks)
-            
-            # Generate Answer
-            # We need a prompt. Let's use a simple one or borrow from backup.
-            prompt = f"""Based on the following context, answer the question.
+                logger.info(f"[{idx}/{len(questions)}] Processing: {question}")
+                
+                all_chunks = []
+                scored_results = []
+                debug_info = {"retrievals": []}
+                
+                # Retrieve from all docs
+                for i, retriever in enumerate(retrievers):
+                    try:
+                        result = retriever.query(question, **config["retriever"]["kwargs"])
+                        
+                        # 计算检索得分（基于返回的chunk数量）
+                        chunk_ids = result.get("chunk_ids", {})
+                        total_chunks = sum(len(ids) for ids in chunk_ids.values())
+                        retrieval_score = total_chunks if total_chunks > 0 else 0
+                        
+                        chunks_text = result.get("chunks", "").strip()
+                        
+                        # 记录检索详情
+                        retrieval_detail = {
+                            "doc_name": doc_names[i],
+                            "doc_index": i,
+                            "retrieval_type": result.get("retrieval_type", "unknown"),
+                            "entities": result.get("entities", []),
+                            "chunk_ids": result.get("chunk_ids", {}),
+                            "chunks_text": chunks_text,
+                            "chunks_length": len(chunks_text),
+                            "has_result": bool(chunks_text),
+                            "retrieval_score": retrieval_score
+                        }
+                        debug_info["retrievals"].append(retrieval_detail)
+                        
+                        if chunks_text:
+                            all_chunks.append(f"Source: {doc_names[i]}\n{chunks_text}")
+                            scored_results.append({
+                                "doc_name": doc_names[i],
+                                "doc_index": i,
+                                "chunks": chunks_text,
+                                "score": retrieval_score,
+                                "chunks_length": len(chunks_text)
+                            })
+                    except Exception as e:
+                        logger.error(f"Query failed for {doc_names[i]}: {e}")
+                        debug_info["retrievals"].append({
+                            "doc_name": doc_names[i],
+                            "doc_index": i,
+                            "error": str(e)
+                        })
+                
+                # 生成答案 - 使用得分最高的文档
+                best_context = ""
+                if scored_results:
+                    # 按得分排序，使用得分最高的文档
+                    scored_results.sort(key=lambda x: (x["score"], x["chunks_length"]), reverse=True)
+                    best_context = f"Source: {scored_results[0]['doc_name']}\n{scored_results[0]['chunks']}"
+                elif all_chunks:
+                    best_context = all_chunks[0]
+                
+                prompt = f"""Based on the following context, answer the question.
 If the answer is not in the context, say "I don't know".
 
 Context:
-{combined_context}
+{best_context}
 
 Question: {question}
 Answer:"""
 
-            messages = [{"role": "user", "content": prompt}]
-            answer_text = await api_client.call_vlm(messages)
-            
-            # Format for output
-            # backup expects: { "question": ..., "answer": ..., "filename": ..., "page": ... }
-            # Our current logic doesn't easily track "best filename/page" yet without parsing chunks.
-            # E2GraphRAG chunks text is just text. 
-            # But we embedded metadata in document_loader: [SOURCE:x|PAGE:y]
-            # If E2GraphRAG preserved that text, we can regex it from the answer context.
-            
-            # Basic extraction of filename/page from the *context* used? 
-            # For now, leave filename/page empty or try to guess from the most relevant chunk.
-            
-            answers.append({
-                "question": question,
-                "answer": answer_text,
-                "filename": "", # TODO: Extract from context
-                "page": 0       # TODO: Extract from context
-            })
+                messages = [{"role": "user", "content": prompt}]
+                answer_text = await api_client.call_vlm(messages)
+                
+                # Format for output - 使用得分最高的文档
+                best_filename = ""
+                best_page = 0
+                
+                # 选择得分最高的文档作为来源（已经排序过了）
+                if scored_results:
+                    best_result = scored_results[0]
+                    
+                    try:
+                        doc_name = best_result["doc_name"]
+                        chunks_text = best_result["chunks"]
+                        best_filename, best_page = extract_source_info(chunks_text, doc_name)
+                        
+                        # 记录选择的依据
+                        debug_info["best_source_selection"] = {
+                            "selected_doc": doc_name,
+                            "score": best_result["score"],
+                            "rank": 1,
+                            "total_candidates": len(scored_results)
+                        }
+                    except Exception as e:
+                        logger.error(f"Failed to extract source info: {e}")
+                
+                debug_info["source"] = {"filename": best_filename, "page": best_page}
+                debug_info["question"] = question
+
+                logger.info(f"[{idx}/{len(questions)}] Completed: {question[:50]}...")
+                
+                # 保存debug信息
+                debug_file = f"debug_output/question_{idx:02d}.json"
+                with open(debug_file, 'w', encoding='utf-8') as f:
+                    json.dump(debug_info, f, indent=2, ensure_ascii=False)
+                logger.info(f"  (debug saved to {debug_file})")
+                
+                return {
+                    "question": question,
+                    "answer": answer_text,
+                    "filename": best_filename,
+                    "page": best_page
+                }
+        
+        # 并行执行所有问题
+        logger.info(f"Starting parallel query with max_concurrent={max_concurrent}")
+        tasks = [process_one_question(i+1, q) for i, q in enumerate(questions)]
+        answers = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 过滤掉异常结果
+        valid_answers = []
+        for i, result in enumerate(answers):
+            if isinstance(result, Exception):
+                logger.error(f"Question {i+1} failed: {result}")
+                # 添加错误占位
+                valid_answers.append({
+                    "question": questions[i].get("question", str(questions[i])) if isinstance(questions[i], dict) else str(questions[i]),
+                    "answer": "Error processing question",
+                    "filename": "",
+                    "page": 0
+                })
+            else:
+                valid_answers.append(result)
+        
+        answers = valid_answers
 
         # Save output
-        output_path = config.get("dataset", {}).get("output_path", args.output) # args.output doesn't exist in parser yet
-        # Fix: args.output wasn't added to parser in previous edit
-        output_path = "./data/output.json" # Fallback
+        output_path = config.get("dataset", {}).get("output_path") or "./data/output.json"
         
         with open(output_path, "w") as f:
             json.dump(answers, f, indent=4, ensure_ascii=False)

@@ -16,9 +16,9 @@ paths:
   processed_docs_path: ./processed_documents
 
 cluster:
-  length: 1200
-  overlap: 100
-  merge_num: 5
+  chunk_length: 2000  # tiktoken 切分，无空格膨胀问题，可以更大
+  overlap: 200  # chunk 之间的重叠 tokens
+  merge_num: 3  # build_tree 合并节点数（3×2500=7500 tokens，安全）
 
 retriever:
   kwargs:
@@ -27,12 +27,19 @@ retriever:
     debug: True
     merge_num: 5
     overlap: 100
-    tokenizer: qwen-flash # Placeholder
-    max_chunk_setting: 25
+    # tokenizer 已改用 tiktoken，不再需要本地 bert-base-chinese
+    max_chunk_setting: 3  # 每个文档最多返回1个chunk（20 PDFs × 1 chunk = 安全）
+    use_api_embedding: true  # 使用 API 嵌入而非本地模型
+    embedding_model: text-embedding-v4  # 阿里云通义千问嵌入模型
+    embedding_dim: 1024  # 嵌入维度
+    embedder: text-embedding-v4  # 保持兼容性
 
 vlm:
-  worker_count: 20
+  worker_count: 100
   model_name: qwen3-vl-flash
 
 graph:
-  worker_count: 20
+  worker_count: 20  # 降低并发，避免过多 API 调用被限流（build_tree是API密集型）
+
+query:
+  max_concurrent_queries: 14  # 最多并行查询3个问题，避免触发速率限制
