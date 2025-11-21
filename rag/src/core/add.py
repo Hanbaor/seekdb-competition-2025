@@ -294,6 +294,14 @@ def process_pdf_file(
                 if not chunk_text.strip():
                     continue
 
+                # Truncate if too long before calling embedding API
+                if len(chunk_text) > 8190:
+                    logger.warning(
+                        f"Chunk from {filename} page {page_num} is too long ({len(chunk_text)} chars), "
+                        f"truncating to 8190 chars before embedding"
+                    )
+                    chunk_text = chunk_text[:8190]
+
                 # Generate embedding
                 try:
                     embedding = generate_embedding(chunk_text)

@@ -108,7 +108,17 @@ def _split_long_paragraph(text: str, max_chunk_size: int, overlap_size: int) -> 
                 # Start new chunk with overlap from previous
                 if overlap_size > 0:
                     overlap_text = current_chunk[-overlap_size:]
-                    current_chunk = overlap_text + " " + sentence
+                    # Ensure overlap + sentence doesn't exceed max_chunk_size
+                    if len(overlap_text) + 1 + len(sentence) <= max_chunk_size:
+                        current_chunk = overlap_text + " " + sentence
+                    else:
+                        # If overlap + sentence is too long, reduce overlap or skip it
+                        max_overlap = max(0, max_chunk_size - len(sentence) - 1)
+                        if max_overlap > 0:
+                            overlap_text = current_chunk[-max_overlap:]
+                            current_chunk = overlap_text + " " + sentence
+                        else:
+                            current_chunk = sentence
                 else:
                     current_chunk = sentence
         else:
