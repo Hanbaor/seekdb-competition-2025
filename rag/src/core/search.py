@@ -182,9 +182,30 @@ def search(question: str) -> Answer:
     logger.debug(f"Processing query: '{question[:100]}...'")
 
     try:
-        # Generate embedding for the question with 2048 dimensions
-        logger.debug("Generating embedding for question...")
-        question_embedding = generate_embedding(question, dimensions=2048)
+        # Step 1: Generate hypothetical answer first (HyDE approach)
+        logger.debug("Generating hypothetical answer for better retrieval...")
+        hypothetical_prompt = f"""请基于你的知识，对以下问题给出一个简短的假设性答案（1-2句话即可）。
+不需要完全准确，只需要包含可能相关的关键词和概念。
+
+问题：{question}
+
+假设答案："""
+        
+        hypothetical_messages = [{"role": "user", "content": hypothetical_prompt}]
+        hypothetical_answer = generate_llm_response(hypothetical_messages, temperature=0.3).strip()
+        logger.info(f"Hypothetical answer: {hypothetical_answer[:100]}...")
+        
+        # Save hypothetical answer to Answer object for later inspection
+        answer.hypothetical_answer = hypothetical_answer
+        
+        # Step 2: Combine original question with hypothetical answer for better retrieval
+        # This preserves question keywords while leveraging expanded context from hypothesis
+        retrieval_query = f"{question} {hypothetical_answer}"
+        logger.debug(f"Combined retrieval query: '{retrieval_query[:150]}...'")
+        
+        # Generate embedding for the combined query with 2048 dimensions
+        logger.debug("Generating embedding for combined query...")
+        question_embedding = generate_embedding(retrieval_query, dimensions=2048)
 
         # Initialize OceanBase client
         client = get_or_create_client()
@@ -198,7 +219,7 @@ def search(question: str) -> Answer:
                         "query_string": {
                             "fields": ["content"],
                             "type": "best_fields",
-                            "query": question,
+                            "query": retrieval_query,  # Use hypothetical answer for FTS too
                             # "minimum_should_match": "20%",
                             # "boost": 0.5,  # Lower boost to let vector dominate
                         }

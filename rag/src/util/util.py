@@ -8,15 +8,17 @@ class Answer(object):
     filename: str = ""
     page: int = 0
     retrieval_results: List[dict] = None  # Store detailed retrieval results
+    hypothetical_answer: str = ""  # Store hypothetical answer for HyDE retrieval
 
     def __init__(
-        self, question: str = "", answer: str = "", filename: str = "", page: int = 0, retrieval_results: List[dict] = None
+        self, question: str = "", answer: str = "", filename: str = "", page: int = 0, retrieval_results: List[dict] = None, hypothetical_answer: str = ""
     ):
         self.question = question
         self.answer = answer
         self.filename = filename
         self.page = page
         self.retrieval_results = retrieval_results or []
+        self.hypothetical_answer = hypothetical_answer
 
 
 def read_train_json(filepath: str) -> List[Answer]:
@@ -68,8 +70,11 @@ def write_answers(answers: List[Answer], filename: str, include_retrieval: bool 
             "filename": answer.filename,
             "page": answer.page,
         }
-        if include_retrieval and answer.retrieval_results:
-            item["retrieval_results"] = answer.retrieval_results
+        if include_retrieval:
+            if answer.retrieval_results:
+                item["retrieval_results"] = answer.retrieval_results
+            if answer.hypothetical_answer:
+                item["hypothetical_answer"] = answer.hypothetical_answer
         data.append(item)
 
     # Write to JSON file
