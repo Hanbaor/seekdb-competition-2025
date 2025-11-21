@@ -101,6 +101,8 @@ def _split_long_paragraph(text: str, max_chunk_size: int, overlap_size: int) -> 
                 # Split the long sentence
                 stride = max_chunk_size - overlap_size
                 sub_chunks = [sentence[k : k + max_chunk_size] for k in range(0, len(sentence), stride)]
+                # The last part of sub_chunks becomes the new current_chunk to maintain overlap if possible
+                # But simpler to just extend all and start empty, or keep last part
                 chunks.extend(sub_chunks)
             else:
                 # Save current chunk
@@ -112,7 +114,7 @@ def _split_long_paragraph(text: str, max_chunk_size: int, overlap_size: int) -> 
                     if len(overlap_text) + 1 + len(sentence) <= max_chunk_size:
                         current_chunk = overlap_text + " " + sentence
                     else:
-                        # If overlap + sentence is too long, reduce overlap or skip it
+                        # If overlap + sentence is too long, try to reduce overlap
                         max_overlap = max(0, max_chunk_size - len(sentence) - 1)
                         if max_overlap > 0:
                             overlap_text = current_chunk[-max_overlap:]
@@ -121,6 +123,21 @@ def _split_long_paragraph(text: str, max_chunk_size: int, overlap_size: int) -> 
                             current_chunk = sentence
                 else:
                     current_chunk = sentence
+        elif len(sentence) > max_chunk_size:
+            # Handle case where current_chunk is empty (or small) but the single sentence is huge
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            
+            # [Modified] Allow huge single sentence (like a big table) up to 6000 chars
+            # to preserve semantic integrity (e.g. table headers)
+            if len(sentence) < 6000:
+                chunks.append(sentence)
+            else:
+                # Force split the huge sentence only if it exceeds safe limit (6000)
+                stride = max_chunk_size - overlap_size
+                sub_chunks = [sentence[k : k + max_chunk_size] for k in range(0, len(sentence), stride)]
+                chunks.extend(sub_chunks)
         else:
             if current_chunk:
                 current_chunk += " " + sentence

@@ -150,12 +150,17 @@ def add(dataset_dir: str, max_worker: int):
 
     # Filter PDF files
     files_to_process = []
+    skipped_count = 0
     for pdf_file in pdf_files:
         filename = os.path.basename(pdf_file)
         if filename not in processed_files:
             files_to_process.append(pdf_file)
         else:
-            logger.debug(f"Skipping {filename} (already processed)")
+            skipped_count += 1
+            logger.info(f"✓ Skipping {filename} (already processed)")
+    
+    if skipped_count > 0:
+        logger.info(f"Skipped {skipped_count} already processed files.")
 
     if not files_to_process:
         logger.info("All files already processed. Skipping data preparation.")
