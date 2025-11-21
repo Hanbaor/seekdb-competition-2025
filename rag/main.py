@@ -87,7 +87,7 @@ if __name__ == "__main__":
     logger.info("Starting data preparation...")
     add(
         dataset_dir=args.dataset,
-        max_worker=20,
+        max_worker=40,
     )
     logger.info("Data preparation completed.")
 
