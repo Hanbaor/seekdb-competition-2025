@@ -5,7 +5,7 @@ from typing import List
 def split_text(
     text: str,
     max_chunk_size: int = 2000,
-    overlap_size: int = 200,
+    overlap_size: int = 100,
 ) -> List[str]:
     """
     Split text into chunks by paragraphs. Only split long paragraphs if they exceed max_chunk_size.

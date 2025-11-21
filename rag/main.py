@@ -1,15 +1,14 @@
 import argparse
 import logging
 import os
-# Configure no_proxy to bypass system proxy for local SSH tunnel
-os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "") + ",localhost,127.0.0.1"
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
-from src.core import add, search
-from src.util import Answer, read_questions_json, write_answers
+from src.core.add import add
+from src.core.search import search
+from src.util import read_questions_json, write_answers
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +95,13 @@ if __name__ == "__main__":
     questions: List[str] = read_questions_json(args.questions)
     logger.info(f"Loaded {len(questions)} questions from {args.questions}")
 
-    # Process questions in parallel with max 10 workers
+    # Create timestamped log directory for detailed results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join("logs", timestamp)
+    os.makedirs(log_dir, exist_ok=True)
+    logger.info(f"Created log directory: {log_dir}")
+
+    # Process questions in parallel with max workers
     max_qa_workers = 20
     answers_dict = {}  # Store answers with their original index
     
@@ -117,13 +122,33 @@ if __name__ == "__main__":
                 logger.info(f"Completed question {idx + 1}/{len(questions)}: {question[:50]}...")
             except Exception as e:
                 logger.error(f"Error processing question {idx + 1}: {e}", exc_info=True)
-                # Create empty answer on error
-                answers_dict[idx] = Answer(question=question, answer="", contexts=[])
     
-    # Sort answers by index to maintain original order
-    answers: List[Answer] = [answers_dict[i] for i in range(len(questions))]
+    logger.info(f"Completed processing {len(questions)} questions.")
     
-    logger.info(f"Completed processing {len(answers)} questions.")
+    # Sort answers by original index to maintain question order
+    answers: List = [answers_dict[i] for i in sorted(answers_dict.keys())]
+    
+    # Write standard output (without retrieval details)
     logger.info(f"Writing answers to {args.output}...")
-    write_answers(answers, args.output)
-    logger.info("All tasks completed successfully.")
+    write_answers(answers, args.output, include_retrieval=False)
+    
+    # Write detailed output with retrieval results to log directory
+    detailed_output = os.path.join(log_dir, "detailed_results.json")
+    logger.info(f"Writing detailed results to {detailed_output}...")
+    write_answers(answers, detailed_output, include_retrieval=True)
+    
+    # Save metadata
+    metadata = {
+        "timestamp": timestamp,
+        "total_questions": len(questions),
+        "log_directory": log_dir,
+        "output_file": args.output,
+        "dataset_dir": args.dataset
+    }
+    metadata_file = os.path.join(log_dir, "metadata.json")
+    with open(metadata_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    
+    logger.info(f"All tasks completed successfully. Detailed logs saved to: {log_dir}")
+    logger.info(f"Standard output saved to: {args.output}")
+    logger.info(f"Detailed results saved to: {detailed_output}")

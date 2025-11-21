@@ -7,14 +7,16 @@ class Answer(object):
     answer: str = ""
     filename: str = ""
     page: int = 0
+    retrieval_results: List[dict] = None  # Store detailed retrieval results
 
     def __init__(
-        self, question: str = "", answer: str = "", filename: str = "", page: int = 0
+        self, question: str = "", answer: str = "", filename: str = "", page: int = 0, retrieval_results: List[dict] = None
     ):
         self.question = question
         self.answer = answer
         self.filename = filename
         self.page = page
+        self.retrieval_results = retrieval_results or []
 
 
 def read_train_json(filepath: str) -> List[Answer]:
@@ -45,27 +47,30 @@ def read_train_json(filepath: str) -> List[Answer]:
         )
 
 
-def write_answers(answers: List[Answer], filename: str) -> None:
+def write_answers(answers: List[Answer], filename: str, include_retrieval: bool = False) -> None:
     """
     Write answers to JSON file.
 
     Args:
         answers: List of Answer objects to write
         filename: Path to the output JSON file
+        include_retrieval: Whether to include retrieval results in output
 
     Raises:
         IOError: If the file cannot be written
     """
     # Convert Answer objects to dictionaries
-    data = [
-        {
+    data = []
+    for answer in answers:
+        item = {
             "question": answer.question,
             "answer": answer.answer,
             "filename": answer.filename,
             "page": answer.page,
         }
-        for answer in answers
-    ]
+        if include_retrieval and answer.retrieval_results:
+            item["retrieval_results"] = answer.retrieval_results
+        data.append(item)
 
     # Write to JSON file
     with open(filename, "w", encoding="utf-8") as f:
