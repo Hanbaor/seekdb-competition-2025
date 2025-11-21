@@ -134,7 +134,6 @@ def _split_long_paragraph(text: str, max_chunk_size: int, overlap_size: int) -> 
             if len(sentence) < 6000:
                 chunks.append(sentence)
             else:
-                print(f"[DEBUG] Force splitting huge sentence: {len(sentence)} chars")
                 # Force split the huge sentence only if it exceeds safe limit (6000)
                 stride = max_chunk_size - overlap_size
                 sub_chunks = [sentence[k : k + max_chunk_size] for k in range(0, len(sentence), stride)]

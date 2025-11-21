@@ -2,8 +2,9 @@ import glob
 import logging
 import os
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List
+from typing import List, Dict, Tuple
 
 import dotenv
 from pyobvector import VECTOR, FtsIndexParam, FtsParser, VectorIndex
@@ -133,7 +134,21 @@ def create_table_if_not_exists(client: HybridSearch, vector_dim: int):
 # ... process_pdf_file ...
 
 def add(dataset_dir: str, max_worker: int):
-    # ...
+    """
+    Prepare RAG data by parsing PDFs with page-level concurrency.
+    
+    Args:
+        dataset_dir: Directory containing PDF files
+        max_worker: Number of parallel workers for page-level processing
+    """
+    # Find all PDF files
+    pdf_files: List[str] = glob.glob(os.path.join(dataset_dir, "*.pdf"))
+    
+    if not pdf_files:
+        logger.warning(f"No PDF files found in {dataset_dir}")
+        return
+    
+    logger.info(f"Found {len(pdf_files)} PDF files")
     
     # Initialize OceanBase client
     client = get_or_create_client()
@@ -168,16 +183,213 @@ def add(dataset_dir: str, max_worker: int):
 
     logger.info(f"Processing {len(files_to_process)} new PDF files...")
     
-    # Process PDF files in parallel
+    # [Modified] Create page-level task queue for finer-grained parallelism
+    page_tasks = []  # List of (pdf_path, page_num, total_pages)
+    pdf_total_pages = {}  # {pdf_path: total_pages}
+    
+    for pdf_file in files_to_process:
+        try:
+            if PdfReader is None:
+                raise ImportError("PdfReader not available")
+            reader = PdfReader(pdf_file)
+            total_pages = len(reader.pages)
+            pdf_total_pages[pdf_file] = total_pages
+            
+            for page_num in range(1, total_pages + 1):
+                page_tasks.append((pdf_file, page_num, total_pages))
+        except Exception as e:
+            logger.error(f"Failed to read PDF {os.path.basename(pdf_file)}: {e}")
+            continue
+    
+    logger.info(f"Created {len(page_tasks)} page-level tasks from {len(files_to_process)} PDFs")
+    
+    # Track chunks for each PDF (for batch insertion)
+    pdf_chunks = defaultdict(list)  # {pdf_path: [chunk1, chunk2, ...]}
+    pdf_completed_pages = defaultdict(int)  # {pdf_path: completed_page_count}
+    
     total_chunks = 0
+    completed_pdfs = 0
+    
+    # Process pages in parallel (page-level concurrency)
     with ThreadPoolExecutor(max_workers=max_worker) as executor:
-        # Submit ONLY new PDF processing tasks
-        future_to_pdf = {
-            executor.submit(process_pdf_file, pdf_file, client): pdf_file
-            for pdf_file in files_to_process
+        # Submit all page tasks
+        future_to_task = {
+            executor.submit(process_single_page, pdf_path, page_num, client): (pdf_path, page_num, total_pages)
+            for pdf_path, page_num, total_pages in page_tasks
         }
-        # ... rest of the loop ...
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_task):
+            pdf_path, page_num, total_pages = future_to_task[future]
+            filename = os.path.basename(pdf_path)
+            
+            try:
+                page_chunks = future.result()
+                
+                # Add to PDF's chunk collection
+                pdf_chunks[pdf_path].extend(page_chunks)
+                pdf_completed_pages[pdf_path] += 1
+                
+                logger.debug(f"{filename} page {page_num}/{total_pages} completed, {len(page_chunks)} chunks")
+                
+                # Check if this PDF is fully processed
+                if pdf_completed_pages[pdf_path] >= total_pages:
+                    # All pages of this PDF completed, batch insert
+                    chunks_to_insert = pdf_chunks[pdf_path]
+                    
+                    if chunks_to_insert:
+                        # Insert in batches
+                        batch_size = 100
+                        inserted = 0
+                        for i in range(0, len(chunks_to_insert), batch_size):
+                            batch = chunks_to_insert[i : i + batch_size]
+                            client.insert(table_name=TABLE_NAME, data=batch)
+                            inserted += len(batch)
+                        
+                        total_chunks += inserted
+                        completed_pdfs += 1
+                        logger.info(
+                            f"✓ Completed {filename}: {inserted} chunks inserted "
+                            f"({completed_pdfs}/{len(files_to_process)} PDFs done)"
+                        )
+                    
+                    # Free memory
+                    del pdf_chunks[pdf_path]
+                    del pdf_completed_pages[pdf_path]
+                    
+            except Exception as e:
+                logger.error(f"Failed to process {filename} page {page_num}: {e}", exc_info=True)
+                continue
+    
+    logger.info(f"Data preparation completed. Total chunks inserted: {total_chunks}")
 
+
+
+def process_single_page(
+    pdf_file: str,
+    page_num: int,
+    client: HybridSearch,
+) -> List[Dict]:
+    """
+    Process a single PDF page with workflow: PDF to image -> VLM extraction -> Split -> Embed
+    
+    Args:
+        pdf_file: Path to the PDF file
+        page_num: Page number to process (1-indexed)
+        client: OceanBase client (not used but kept for compatibility)
+    
+    Returns:
+        List of chunk dictionaries ready for insertion
+    """
+    filename = os.path.basename(pdf_file)
+    page_image_path = None
+    compressed_image_path = None
+    page_text = ""
+    chunks_list = []
+    
+    try:
+        # Step 1: Convert PDF page to image
+        page_image_path = pdf_page_to_image(pdf_file, page_num, dpi=100)
+        logger.debug(f"{filename} page {page_num}: converted to image")
+        
+        # Step 2: Extract information using VLM
+        try:
+            page_text = generate_vlm_response(
+                VLM_IMAGE_EXTRACTION_PROMPT, images=page_image_path
+            )
+            if page_text.strip():
+                logger.debug(f"{filename} page {page_num}: extracted text via VLM")
+        except Exception as e:
+            # Check if it's a 502 error (likely due to large image)
+            error_str = str(e).lower()
+            is_502_error = (
+                "502" in error_str
+                or "bad gateway" in error_str
+                or (hasattr(e, "status_code") and e.status_code == 502)
+            )
+            
+            if is_502_error:
+                logger.warning(
+                    f"{filename} page {page_num}: 502 error, attempting compression..."
+                )
+                try:
+                    # Compress the image and retry
+                    compressed_image_path = compress_image(
+                        page_image_path,
+                        max_size_mb=5.0,
+                        max_dimension=2048,
+                    )
+                    page_text = generate_vlm_response(
+                        VLM_IMAGE_EXTRACTION_PROMPT,
+                        images=compressed_image_path,
+                    )
+                    if page_text.strip():
+                        logger.info(f"{filename} page {page_num}: extracted via compressed image")
+                except Exception as retry_e:
+                    logger.warning(
+                        f"{filename} page {page_num}: failed after compression: {retry_e}"
+                    )
+            else:
+                logger.warning(f"{filename} page {page_num}: VLM extraction failed: {e}")
+    except Exception as e:
+        logger.warning(f"{filename} page {page_num}: processing failed: {e}")
+    finally:
+        # Clean up temporary image files
+        if compressed_image_path and os.path.exists(compressed_image_path):
+            try:
+                os.unlink(compressed_image_path)
+            except Exception as e:
+                logger.debug(f"Failed to delete compressed image: {e}")
+        if page_image_path and os.path.exists(page_image_path):
+            try:
+                os.unlink(page_image_path)
+            except Exception as e:
+                logger.debug(f"Failed to delete page image: {e}")
+    
+    # Skip if no content extracted
+    if not page_text.strip():
+        logger.debug(f"{filename} page {page_num}: no content, skipping")
+        return chunks_list
+    
+    # Step 3: Split text
+    text_chunks = split_text(page_text)
+    
+    # Step 4 & 5: Embed -> Prepare for storage
+    for chunk_text in text_chunks:
+        if not chunk_text.strip():
+            continue
+        
+        # Truncate if too long before calling embedding API
+        if len(chunk_text) > 8190:
+            logger.warning(
+                f"Chunk from {filename} page {page_num} is too long ({len(chunk_text)} chars), "
+                f"truncating to 8190 chars before embedding"
+            )
+            chunk_text = chunk_text[:8190]
+        
+        # Generate embedding
+        try:
+            embedding = generate_embedding(chunk_text)
+        except Exception as e:
+            logger.warning(
+                f"Failed to generate embedding for chunk in {filename} page {page_num}: {e}"
+            )
+            continue
+        
+        # Create unique source_id
+        source_id = str(uuid.uuid4())
+        
+        chunks_list.append(
+            {
+                "source_id": source_id,
+                "filename": filename,
+                "page": page_num,
+                "content": chunk_text[:8190],  # Truncate if too long
+                "vector": embedding,
+            }
+        )
+    
+    return chunks_list
 
 
 def process_pdf_file(
@@ -185,6 +397,9 @@ def process_pdf_file(
     client: HybridSearch,
 ) -> int:
     """
+    [DEPRECATED] Legacy function kept for backward compatibility.
+    Use page-level processing in add() instead.
+    
     Process a single PDF file with fixed workflow for each page:
     PDF to image -> VLM extraction -> Split -> Embed -> Store
 
@@ -352,51 +567,4 @@ def process_pdf_file(
         return 0
 
 
-def add(dataset_dir: str, max_worker: int):
-    """
-    Prepare RAG data by parsing PDFs, generating embeddings, and storing in OceanBase.
-
-    Args:
-        dataset_dir: Directory containing PDF files
-        max_worker: Number of parallel workers for processing PDF files (default: 2)
-    """
-    pdf_files: List[str] = glob.glob(os.path.join(dataset_dir, "*.pdf"))
-
-    if not pdf_files:
-        logger.warning(f"No PDF files found in {dataset_dir}")
-        return
-
-    logger.info(f"Found {len(pdf_files)} PDF files")
-
-    # Initialize OceanBase client
-    client = get_or_create_client()
-
-    # Use embedding dimension from environment variable
-    vector_dim = EMBEDDING_DIM
-    logger.info(f"Using embedding vector dimension: {vector_dim}")
-
-    create_table_if_not_exists(client, vector_dim)
-
-    # Process PDF files in parallel
-    total_chunks = 0
-    with ThreadPoolExecutor(max_workers=max_worker) as executor:
-        # Submit all PDF processing tasks
-        future_to_pdf = {
-            executor.submit(process_pdf_file, pdf_file, client): pdf_file
-            for pdf_file in pdf_files
-        }
-
-        # Collect results as they complete
-        for future in as_completed(future_to_pdf):
-            pdf_file = future_to_pdf[future]
-            try:
-                chunks_inserted = future.result()
-                total_chunks += chunks_inserted
-            except Exception as e:
-                filename = os.path.basename(pdf_file)
-                logger.error(
-                    f"Exception occurred while processing {filename}: {e}",
-                    exc_info=True,
-                )
-
-    logger.info(f"Preparation complete! Total chunks inserted: {total_chunks}")
+# Old add() function removed - using new page-level concurrent version above
