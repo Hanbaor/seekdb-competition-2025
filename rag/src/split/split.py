@@ -5,6 +5,7 @@ from typing import List
 def split_text(
     text: str,
     max_chunk_size: int = 2000,
+    overlap_size: int = 200,
 ) -> List[str]:
     """
     Split text into chunks by paragraphs. Only split long paragraphs if they exceed max_chunk_size.
@@ -12,10 +13,10 @@ def split_text(
     Args:
         text: Input text to split
         max_chunk_size: Maximum size for a chunk (in characters).
-                        Only paragraphs longer than this will be split further.
+        overlap_size: Number of characters to overlap between chunks.
 
     Returns:
-        List of text chunks, each chunk is typically a paragraph or part of a very long paragraph
+        List of text chunks
     """
     if not text or not text.strip():
         return []
@@ -37,7 +38,7 @@ def split_text(
         # If paragraph is too long, split it at sentence boundaries
         if len(paragraph) > max_chunk_size:
             # Split long paragraph by sentences
-            long_chunks = _split_long_paragraph(paragraph, max_chunk_size)
+            long_chunks = _split_long_paragraph(paragraph, max_chunk_size, overlap_size)
             chunks.extend(long_chunks)
         else:
             # Keep paragraph as is
@@ -47,11 +48,14 @@ def split_text(
     return [chunk for chunk in chunks if chunk.strip()]
 
 
-def _split_long_paragraph(text: str, max_chunk_size: int) -> List[str]:
+def _split_long_paragraph(text: str, max_chunk_size: int, overlap_size: int) -> List[str]:
     """
-    Split a long paragraph into smaller chunks at sentence boundaries.
-    Only used when a single paragraph exceeds max_chunk_size.
+    Split a long paragraph into smaller chunks at sentence boundaries with overlap.
     """
+    # Ensure overlap is valid
+    if overlap_size >= max_chunk_size:
+        overlap_size = max_chunk_size // 2
+
     # Find sentence boundaries (Chinese and English punctuation)
     sentence_endings = r"[。！？.!?]"
 
@@ -77,19 +81,36 @@ def _split_long_paragraph(text: str, max_chunk_size: int) -> List[str]:
     if current_sentence.strip():
         sentences.append(current_sentence.strip())
 
-    # If no sentence endings found, return the whole paragraph as one chunk
+    # If no sentence endings found, or text is still too long, force split by length
     if not sentences:
-        return [text]
+        stride = max_chunk_size - overlap_size
+        return [text[i : i + max_chunk_size] for i in range(0, len(text), stride)]
 
     # Group sentences into chunks
     chunks = []
     current_chunk = ""
 
-    for sentence in sentences:
-        # If adding this sentence would exceed max_chunk_size, save current chunk
+    for i, sentence in enumerate(sentences):
+        # Check if adding sentence exceeds limit
         if current_chunk and len(current_chunk) + len(sentence) + 1 > max_chunk_size:
-            chunks.append(current_chunk)
-            current_chunk = sentence
+            # If the sentence itself is longer than max_chunk_size, we need to split it too
+            if len(sentence) > max_chunk_size:
+                # Save current chunk first
+                chunks.append(current_chunk)
+                current_chunk = ""
+                # Split the long sentence
+                stride = max_chunk_size - overlap_size
+                sub_chunks = [sentence[k : k + max_chunk_size] for k in range(0, len(sentence), stride)]
+                chunks.extend(sub_chunks)
+            else:
+                # Save current chunk
+                chunks.append(current_chunk)
+                # Start new chunk with overlap from previous
+                if overlap_size > 0:
+                    overlap_text = current_chunk[-overlap_size:]
+                    current_chunk = overlap_text + " " + sentence
+                else:
+                    current_chunk = sentence
         else:
             if current_chunk:
                 current_chunk += " " + sentence
