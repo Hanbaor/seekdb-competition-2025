@@ -24,7 +24,7 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 30  # Optimal value for LLM Rerank - 65.29 best score
+TOP_K = 50  # Optimal value for LLM Rerank - 65.29 best score
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
@@ -83,7 +83,7 @@ def apply_rrf_reranking(search_results, k=60, score_weight=0.5):
     return rrf_results
 
 
-def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 30) -> tuple:
+def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -> tuple:
     """
     Use LLM to rerank top results and select the most relevant file and page.
     
@@ -117,19 +117,20 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 30) -
     candidates_text = "\n\n".join(candidates)
     
     # Build LLM prompt
-    prompt = f"""你是一个专业的金融文档检索评估专家。现在有一个关于千味央厨公司的问题和{len(top_results)}个候选文档片段（已按相关性排序）。
+    prompt = f"""你是一个专业的金融文档检索评估专家。现在有一个关于千味央厨公司的问题和{len(top_results)}个通过混合检索筛选出的候选文档片段。
 
 问题：{question}
 
-候选文档片段：
+候选文档片段（共{len(top_results)}个）：
 {candidates_text}
 
-请仔细分析每个候选片段的内容，判断哪个最能回答问题。
+请仔细分析每个候选片段的内容，判断哪一个最能准确、完整地回答这个问题。或者和问题最相关
 
 要求：
-1. 只返回一个JSON对象，包含最相关的文件名和页码
-2. 格式：{{"filename": "完整文件名", "page": 页码数字, "reason": "选择理由（简短）"}}
-3. 不要有其他解释文字
+1. 必须从上述候选中选择一个
+2. 只返回一个JSON对象：{{"filename": "完整文件名.pdf", "page": 页码数字, "reason": "选择理由（一句话）"}}
+3. filename必须与候选中的文件名完全一致，页码也一致并且是对应的
+4. 不要有任何其他解释文字
 
 返回："""
 
@@ -152,9 +153,9 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 30) -
                     logger.info(f"LLM Rerank selected: {filename} page {page}")
                     return r.get('filename', ''), page
             
-            # If not found, try to match by page in first result
-            logger.warning(f"LLM Rerank: filename not found in results, using first result")
-            return top_results[0].get('filename', ''), page
+            # If not found, fall back to hybrid strategy
+            logger.warning(f"LLM Rerank: filename '{filename}' not found in results, triggering fallback")
+            return "", 0
         else:
             logger.warning(f"LLM Rerank: invalid response format, falling back to hybrid strategy")
             return "", 0
@@ -181,9 +182,9 @@ def search(question: str) -> Answer:
     logger.debug(f"Processing query: '{question[:100]}...'")
 
     try:
-        # Generate embedding for the question
+        # Generate embedding for the question with 2048 dimensions
         logger.debug("Generating embedding for question...")
-        question_embedding = generate_embedding(question)
+        question_embedding = generate_embedding(question, dimensions=2048)
 
         # Initialize OceanBase client
         client = get_or_create_client()
@@ -198,7 +199,8 @@ def search(question: str) -> Answer:
                             "fields": ["content"],
                             "type": "best_fields",
                             "query": question,
-                            "minimum_should_match": "20%",  # Lowered from 30% to 20%
+                            # "minimum_should_match": "20%",
+                            # "boost": 0.5,  # Lower boost to let vector dominate
                         }
                     }
                 ],
@@ -210,12 +212,10 @@ def search(question: str) -> Answer:
             "query": fts_query,
             "knn": {
                 "field": "vector",
-                "k": TOP_K * 3,  # 150 candidates (50 * 3)
-                "num_candidates": 300,  # Increased to 300 for better recall
+                "k": TOP_K,  # Exact top-k results
                 "query_vector": question_embedding,
-                # Removed 'filter' to allow vector search to find semantically similar content
-                # even if FTS match is weak
-                "similarity": 0.3,  # Lowered to 0.2 for aggressive recall
+                # "similarity": 0.5,  # High threshold for quality
+                # No num_candidates = exact/brute-force search
             },
             "from": 0,
             "size": TOP_K,
@@ -282,7 +282,7 @@ def search(question: str) -> Answer:
             if USE_LLM_RERANK:
                 # Strategy: LLM Rerank - Let LLM select the most relevant file and page
                 logger.info("Using LLM Rerank to select file and page")
-                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=30)
+                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=50)
                 
                 if llm_filename:
                     answer.filename = llm_filename

@@ -30,8 +30,8 @@ from src.storage.oceanbase import get_or_create_client
 
 dotenv.load_dotenv()
 
-# Embedding dimension from environment variable
-EMBEDDING_DIM = 1024
+# Embedding dimension - must match the model in embedding/openai_client.py
+EMBEDDING_DIM = 2048
 
 # Table name for storing document chunks
 TABLE_NAME = "rag_documents"
@@ -367,9 +367,9 @@ def process_single_page(
             )
             chunk_text = chunk_text[:8190]
         
-        # Generate embedding
+        # Generate embedding with 2048 dimensions
         try:
-            embedding = generate_embedding(chunk_text)
+            embedding = generate_embedding(chunk_text, dimensions=2048)
         except Exception as e:
             logger.warning(
                 f"Failed to generate embedding for chunk in {filename} page {page_num}: {e}"
@@ -522,9 +522,9 @@ def process_pdf_file(
                     )
                     chunk_text = chunk_text[:8190]
 
-                # Generate embedding
+                # Generate embedding with 2048 dimensions
                 try:
-                    embedding = generate_embedding(chunk_text)
+                    embedding = generate_embedding(chunk_text, dimensions=2048)
                 except Exception as e:
                     logger.warning(
                         f"Failed to generate embedding for chunk in {filename} page {page_num}: {e}"

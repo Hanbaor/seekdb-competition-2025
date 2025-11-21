@@ -30,6 +30,7 @@ embedding_client = OpenAI(
 def generate_response(
     embedding_text: str,
     model: str = "text-embedding-v4",
+    dimensions: int = 2048,  # Default 2048 for highest precision
     max_retries: int = 20,
     initial_backoff: float = 1.0,
 ) -> List[float]:
@@ -38,7 +39,8 @@ def generate_response(
 
     Args:
         embedding_text: Text to generate embeddings for
-        model: Model name to use for embedding generation (default: "text-embedding-3-small")
+        model: Model name to use for embedding generation (default: "text-embedding-v4")
+        dimensions: Output dimension size (default: 2048, supports 512/768/1024/1536/2048)
         max_retries: Maximum number of retry attempts
         initial_backoff: Initial backoff time in seconds (doubles on each retry)
 
@@ -56,6 +58,7 @@ def generate_response(
             response = embedding_client.embeddings.create(
                 model=model,
                 input=embedding_text,
+                dimensions=dimensions,
             )
 
             if not response or not response.data or len(response.data) == 0:
