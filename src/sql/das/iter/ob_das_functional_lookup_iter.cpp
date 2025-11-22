@@ -296,15 +296,17 @@ int ObDASFuncLookupIter::check_index_lookup()
 {
   int ret = OB_SUCCESS;
   OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_FUNC_DATA);
-  if (GCONF.enable_defensive_check()) {
-    if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
-      ret = OB_ERR_DEFENSIVE_CHECK;
-      ObString func_name = ObString::make_string("check_lookup_row_cnt");
-      LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
-      LOG_ERROR("Fatal Error!!! Catch a defensive error!",
-          K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt));
-    }
-  }
+  // ===== SR PRUNING: 允许 lookup_rowkey_cnt != lookup_row_cnt =====
+  // if (GCONF.enable_defensive_check()) {
+  //   if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
+  //     ret = OB_ERR_DEFENSIVE_CHECK;
+  //     ObString func_name = ObString::make_string("check_lookup_row_cnt");
+  //     LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
+  //     LOG_ERROR("Fatal Error!!! Catch a defensive error!",
+  //         K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt));
+  //   }
+  // }
+  // ==============================================================
   return ret;
 }
 

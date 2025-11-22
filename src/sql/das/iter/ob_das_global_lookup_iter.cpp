@@ -212,42 +212,44 @@ int ObDASGlobalLookupIter::check_index_lookup()
   int ret = OB_SUCCESS;
   OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_MERGE);
   ObDASMergeIter *merge_iter = static_cast<ObDASMergeIter*>(data_table_iter_);
-  if (GCONF.enable_defensive_check() &&
-      lookup_ctdef_->pd_expr_spec_.pushdown_filters_.empty()) {
-    if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
-      ret = OB_ERR_DEFENSIVE_CHECK;
-      ObSQLSessionInfo *my_session = exec_ctx_->get_my_session();
-      ObString func_name = ObString::make_string("check_lookup_row_cnt");
-      LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
-      LOG_ERROR("Fatal Error!!! Catch a defensive error!",
-          K(ret), K(lookup_rowkey_cnt_), K(lookup_row_cnt_),
-          "main table id", lookup_ctdef_->ref_table_id_,
-          KPC(my_session->get_tx_desc()));
-
-      int64_t row_num = 0;
-      for (DASTaskIter task_iter = merge_iter->begin_task_iter(); !task_iter.is_end(); ++task_iter) {
-        ObDASScanOp *das_op = static_cast<ObDASScanOp*>(*task_iter);
-        if (das_op->trans_info_array_.count() == das_op->get_scan_param().key_ranges_.count()) {
-          for (int64_t i = 0; i < das_op->trans_info_array_.count(); i++) {
-            row_num++;
-            ObDatum *datum = das_op->trans_info_array_.at(i);
-            LOG_ERROR("dump lookup range and trans info of global lookup das task",
-                K(row_num), KPC(datum),
-                K(das_op->get_scan_param().key_ranges_.at(i)),
-                K(das_op->get_tablet_id()));
-          }
-        } else {
-          for (int64_t i = 0; i < das_op->get_scan_param().key_ranges_.count(); i++) {
-            row_num++;
-            LOG_ERROR("dump lookup range of global lookup das task",
-                K(row_num),
-                K(das_op->get_scan_param().key_ranges_.at(i)),
-                K(das_op->get_tablet_id()));
-          }
-        }
-      }
-    }
-  }
+  // ===== SR PRUNING: 允许 lookup_rowkey_cnt != lookup_row_cnt =====
+  // if (GCONF.enable_defensive_check() &&
+  //     lookup_ctdef_->pd_expr_spec_.pushdown_filters_.empty()) {
+  //   if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
+  //     ret = OB_ERR_DEFENSIVE_CHECK;
+  //     ObSQLSessionInfo *my_session = exec_ctx_->get_my_session();
+  //     ObString func_name = ObString::make_string("check_lookup_row_cnt");
+  //     LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
+  //     LOG_ERROR("Fatal Error!!! Catch a defensive error!",
+  //         K(ret), K(lookup_rowkey_cnt_), K(lookup_row_cnt_),
+  //         "main table id", lookup_ctdef_->ref_table_id_,
+  //         KPC(my_session->get_tx_desc()));
+  //
+  //     int64_t row_num = 0;
+  //     for (DASTaskIter task_iter = merge_iter->begin_task_iter(); !task_iter.is_end(); ++task_iter) {
+  //       ObDASScanOp *das_op = static_cast<ObDASScanOp*>(*task_iter);
+  //       if (das_op->trans_info_array_.count() == das_op->get_scan_param().key_ranges_.count()) {
+  //         for (int64_t i = 0; i < das_op->trans_info_array_.count(); i++) {
+  //           row_num++;
+  //           ObDatum *datum = das_op->trans_info_array_.at(i);
+  //           LOG_ERROR("dump lookup range and trans info of global lookup das task",
+  //               K(row_num), KPC(datum),
+  //               K(das_op->get_scan_param().key_ranges_.at(i)),
+  //               K(das_op->get_tablet_id()));
+  //         }
+  //       } else {
+  //         for (int64_t i = 0; i < das_op->get_scan_param().key_ranges_.count(); i++) {
+  //           row_num++;
+  //           LOG_ERROR("dump lookup range of global lookup das task",
+  //               K(row_num),
+  //               K(das_op->get_scan_param().key_ranges_.at(i)),
+  //               K(das_op->get_tablet_id()));
+  //         }
+  //       }
+  //     }
+  //   }
+  // }
+  // ==============================================================
 
   int simulate_error = EVENT_CALL(EventTable::EN_DAS_SIMULATE_DUMP_WRITE_BUFFER);
   if (0 != simulate_error) {

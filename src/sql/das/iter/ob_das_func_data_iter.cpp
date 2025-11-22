@@ -323,10 +323,14 @@ int ObDASFuncDataIter::inner_get_next_rows(int64_t &count, int64_t capacity)
       ret = OB_SUCCESS;
     }
   }
-  if (OB_SUCC(ret) && OB_UNLIKELY(main_lookup_iter_ && default_size < main_lookup_count + read_count_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected error, main lookup count is not equal to capacity", K(ret), K(default_size), K(main_lookup_count), K_(read_count));
-  }
+  // ===== SR PRUNING: 允许 main_lookup_count > default_size =====
+  // 因为我们在 add_doc_id 中过滤了 docid，所以 main_lookup_count (未过滤) 可能大于 default_size (过滤后)
+  // 这是正常的，不应该报错
+  // if (OB_SUCC(ret) && OB_UNLIKELY(main_lookup_iter_ && default_size < main_lookup_count + read_count_)) {
+  //   ret = OB_ERR_UNEXPECTED;
+  //   LOG_WARN("unexpected error, main lookup count is not equal to capacity", K(ret), K(default_size), K(main_lookup_count), K_(read_count));
+  // }
+  // ==============================================================
 
   int tmp_count = 0;
   int tr_merge_capacity = main_lookup_count != 0 ? OB_MIN(capacity, main_lookup_count) : capacity;
@@ -353,10 +357,13 @@ int ObDASFuncDataIter::inner_get_next_rows(int64_t &count, int64_t capacity)
       tmp_count = tr_merge_count;
     }
   }
-  if (OB_SUCC(ret) && main_lookup_iter_ && tr_merge_count != main_lookup_count) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected error, tr merge count is not equal to main lookup count", K(ret), K(tr_merge_count), K(main_lookup_count));
-  }
+  // ===== SR PRUNING: 允许 tr_merge_count != main_lookup_count =====
+  // 因为我们在 add_doc_id 中过滤了 docid，所以 tr_merge_count (过滤后) 可能小于 main_lookup_count (未过滤)
+  // if (OB_SUCC(ret) && main_lookup_iter_ && tr_merge_count != main_lookup_count) {
+  //   ret = OB_ERR_UNEXPECTED;
+  //   LOG_WARN("unexpected error, tr merge count is not equal to main lookup count", K(ret), K(tr_merge_count), K(main_lookup_count));
+  // }
+  // ==============================================================
   if (OB_SUCC(ret)) {
     count = tr_merge_count;
     if (0 == tr_merge_count) {

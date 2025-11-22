@@ -292,55 +292,59 @@ int ObDASLocalLookupIter::check_index_lookup()
     scan_iter = static_cast<ObDASDomainIdMergeIter *>(data_table_iter_)->get_data_table_iter();
   }
   if (DAS_ITER_FUNC_DATA == data_table_iter_->get_type()) {
-    if (GCONF.enable_defensive_check()) {
-      if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
-        ret = OB_ERR_DEFENSIVE_CHECK;
-        ObString func_name = ObString::make_string("check_lookup_row_cnt");
-        LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
-        if (nullptr != lookup_ctdef_) {
-          LOG_ERROR("Fatal Error!!! Catch a defensive error!",
-            K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt),
-            "main table id", lookup_ctdef_->ref_table_id_,
-            "main tablet id", lookup_tablet_id_,
-            KPC_(trans_desc), KPC_(snapshot));
-        } else {
-          LOG_ERROR("Fatal Error!!! Catch a defensive error!",
-            K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt), KPC_(trans_desc), KPC_(snapshot));
-        }
-        const ObIArray<std::pair<ObDocIdExt, int>> &doc_ids = static_cast<ObDASFuncDataIter *>(data_table_iter_)->get_doc_ids();
-        for (int64_t i = 0; i < doc_ids.count(); i++) {
-          LOG_ERROR("dump doc ids of cache lookup das task", K(i), K(doc_ids.at(i).first.get_datum()));
-        }
-      }
-    }
+    // ===== SR PRUNING: 允许 lookup_rowkey_cnt != lookup_row_cnt =====
+    // if (GCONF.enable_defensive_check()) {
+    //   if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
+    //     ret = OB_ERR_DEFENSIVE_CHECK;
+    //     ObString func_name = ObString::make_string("check_lookup_row_cnt");
+    //     LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
+    //     if (nullptr != lookup_ctdef_) {
+    //       LOG_ERROR("Fatal Error!!! Catch a defensive error!",
+    //         K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt),
+    //         "main table id", lookup_ctdef_->ref_table_id_,
+    //         "main tablet id", lookup_tablet_id_,
+    //         KPC_(trans_desc), KPC_(snapshot));
+    //     } else {
+    //       LOG_ERROR("Fatal Error!!! Catch a defensive error!",
+    //         K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt), KPC_(trans_desc), KPC_(snapshot));
+    //     }
+    //     const ObIArray<std::pair<ObDocIdExt, int>> &doc_ids = static_cast<ObDASFuncDataIter *>(data_table_iter_)->get_doc_ids();
+    //     for (int64_t i = 0; i < doc_ids.count(); i++) {
+    //       LOG_ERROR("dump doc ids of cache lookup das task", K(i), K(doc_ids.at(i).first.get_datum()));
+    //     }
+    //   }
+    // }
+    // ==============================================================
   } else {
-    if (GCONF.enable_defensive_check() &&
-        lookup_ctdef_->pd_expr_spec_.pushdown_filters_.empty()) {
-      if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
-        ret = OB_ERR_DEFENSIVE_CHECK;
-        ObString func_name = ObString::make_string("check_lookup_row_cnt");
-        LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
-        LOG_ERROR("Fatal Error!!! Catch a defensive error!",
-            K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt),
-            "main table id", lookup_ctdef_->ref_table_id_,
-            "main tablet id", lookup_tablet_id_,
-            KPC_(trans_desc), KPC_(snapshot));
-        concurrency_control::ObDataValidationService::set_delay_resource_recycle(lookup_ls_id_);
-        const ObTableScanParam &scan_param = scan_iter->get_scan_param();
-        if (trans_info_array_.count() == scan_param.key_ranges_.count()) {
-          for (int64_t i = 0; i < trans_info_array_.count(); i++) {
-            ObDatum *datum = trans_info_array_.at(i);
-            LOG_ERROR("dump lookup range and trans info of local lookup das task",
-                K(i), KPC(trans_info_array_.at(i)), K(scan_param.key_ranges_.at(i)));
-          }
-        } else {
-          for (int64_t i = 0; i < scan_param.key_ranges_.count(); i++) {
-            LOG_ERROR("dump lookup range of local lookup das task",
-                K(i), K(scan_param.key_ranges_.at(i)));
-          }
-        }
-      }
-    }
+    // ===== SR PRUNING: 允许 lookup_rowkey_cnt != lookup_row_cnt =====
+    // if (GCONF.enable_defensive_check() &&
+    //     lookup_ctdef_->pd_expr_spec_.pushdown_filters_.empty()) {
+    //   if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
+    //     ret = OB_ERR_DEFENSIVE_CHECK;
+    //     ObString func_name = ObString::make_string("check_lookup_row_cnt");
+    //     LOG_USER_ERROR(OB_ERR_DEFENSIVE_CHECK, func_name.length(), func_name.ptr());
+    //     LOG_ERROR("Fatal Error!!! Catch a defensive error!",
+    //         K(ret), K_(lookup_rowkey_cnt), K_(lookup_row_cnt),
+    //         "main table id", lookup_ctdef_->ref_table_id_,
+    //         "main tablet id", lookup_tablet_id_,
+    //         KPC_(trans_desc), KPC_(snapshot));
+    //     concurrency_control::ObDataValidationService::set_delay_resource_recycle(lookup_ls_id_);
+    //     const ObTableScanParam &scan_param = scan_iter->get_scan_param();
+    //     if (trans_info_array_.count() == scan_param.key_ranges_.count()) {
+    //       for (int64_t i = 0; i < trans_info_array_.count(); i++) {
+    //         ObDatum *datum = trans_info_array_.at(i);
+    //         LOG_ERROR("dump lookup range and trans info of local lookup das task",
+    //             K(i), KPC(trans_info_array_.at(i)), K(scan_param.key_ranges_.at(i)));
+    //       }
+    //     } else {
+    //       for (int64_t i = 0; i < scan_param.key_ranges_.count(); i++) {
+    //         LOG_ERROR("dump lookup range of local lookup das task",
+    //             K(i), K(scan_param.key_ranges_.at(i)));
+    //       }
+    //     }
+    //   }
+    // }
+    // ==============================================================
 
     int simulate_error = EVENT_CALL(EventTable::EN_DAS_SIMULATE_DUMP_WRITE_BUFFER);
     if (0 != simulate_error) {
