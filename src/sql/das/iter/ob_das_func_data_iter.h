@@ -83,10 +83,10 @@ public:
   {
     int ret = OB_SUCCESS;
     // ===== SR PRUNING: 只添加 docid <= 1000 的 =====
-    // if (doc_id.get_datum().get_uint64() <= 1000) {
+    if (doc_id.get_datum().get_uint64() <= 1000) {
       int64_t idx = doc_ids_.count();
       ret = doc_ids_.push_back(std::make_pair(doc_id, idx));
-    // }
+    }
     // ==============================================
     return ret;
   }
