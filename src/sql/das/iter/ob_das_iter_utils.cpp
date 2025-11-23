@@ -2260,6 +2260,12 @@ int ObDASIterUtils::create_function_lookup_tree(ObTableScanParam &scan_param,
     } else if (FALSE_IT(scan_iter->set_scan_param(scan_param))) {
       LOG_WARN("failed to init default scan param", K(ret));
     } else {
+      // ===== SR PRUNING DEBUG: 检查 scan_param 的过滤条件 =====
+      LOG_WARN("SR PRUNING: rowkey scan_param", 
+               "has_op_filters", (scan_param.op_filters_ != nullptr),
+               "op_filters_count", (scan_param.op_filters_ ? scan_param.op_filters_->count() : 0),
+               "key_ranges_count", scan_param.key_ranges_.count());
+      // ========================================================
       rowkey_scan_iter = scan_iter;
       rowkey_scan_output_exprs = &static_cast<const ObDASScanCtDef *>(rowkey_scan_ctdef)->pd_expr_spec_.access_exprs_;
     }
