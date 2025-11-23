@@ -87,7 +87,7 @@ if __name__ == "__main__":
     logger.info("Starting data preparation...")
     add(
         dataset_dir=args.dataset,
-        max_worker=20,
+        max_worker=10,
     )
     logger.info("Data preparation completed.")
 
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     logger.info(f"Created log directory: {log_dir}")
 
     # Process questions in parallel with max workers
-    max_qa_workers = 20
+    max_qa_workers = 10
     answers_dict = {}  # Store answers with their original index
     
     with ThreadPoolExecutor(max_workers=max_qa_workers) as executor:

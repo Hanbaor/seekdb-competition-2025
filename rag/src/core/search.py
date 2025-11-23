@@ -1,6 +1,8 @@
 import logging
 import os
 import time
+import json
+import re
 
 import dotenv
 
@@ -25,13 +27,13 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 50  # Optimal value for LLM Rerank - 65.29 best score
+TOP_K = 15  # Optimal value for LLM Rerank - 65.29 best score
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
 
 
-def _search_with_retry(client, index: str, body: dict, max_retries: int = 3, backoff_base: float = 0.5):
+def _search_with_retry(client, index: str, body: dict, max_retries: int = 30, backoff_base: float = 0.5):
     last_exception = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -212,31 +214,76 @@ def search(question: str) -> Answer:
     try:
         # Step 1: Generate hypothetical answer first (HyDE approach)
         logger.debug("Generating hypothetical answer for better retrieval...")
-        hypothetical_prompt = f"""请基于你的知识，对以下问题给出一个简短的假设性答案（1-2句话即可）。
-不需要完全准确，只需要包含可能相关的关键词和概念。
+        hypothetical_prompt = (
+            "你是一个检索增强生成（RAG）系统的检索提示生成器。"
+            "请针对下面的问题，先给出一个尽量准确且详细的假设性回答 answer，"
+            "然后抽取出与检索最相关的实体 entities 和关键词 keywords。尽量精确而且全面,具体的实体数量和回答长度以问题的复杂度来定\n\n"
+            "严格按照下面 JSON 模板输出（不要包含任何多余文字）：\n"
+            "{\n"
+            "  \"answer\": \"完整的假设性回答，包含关键数字和实体\",\n"
+            "  \"entities\": [\"实体1\", \"实体2\", \"实体3\", \"实体4\", \"实体5\"],\n"  
+            "  \"keywords\": [\"关键词1\", \"关键词2\", \"关键词3\", \"关键词4\", \"关键词5\"]\n"
+            "}\n\n"
+            f"问题：{question}\n"
+        )
 
-问题：{question}
-
-假设答案："""
-        
         hypothetical_messages = [{"role": "user", "content": hypothetical_prompt}]
-        hypothetical_answer = generate_llm_response(hypothetical_messages, temperature=0.3).strip()
-        logger.info(f"Hypothetical answer: {hypothetical_answer[:100]}...")
-        
+        hypothetical_raw = generate_llm_response(hypothetical_messages, temperature=0).strip()
+        logger.info(f"Hypothetical raw response: {hypothetical_raw[:1000]}...")
+
+        # Default fallback: use raw text for both embedding and FTS if parsing fails
+        hypothetical_answer = hypothetical_raw
+        hypothetical_terms = hypothetical_raw
+
+        try:
+            # Try to extract JSON object from the response
+            json_match = re.search(r"\{.*\}", hypothetical_raw, re.S)
+            json_text = json_match.group(0) if json_match else hypothetical_raw
+            data = json.loads(json_text)
+
+            # Extract answer text
+            answer_text = str(data.get("answer", "")).strip()
+            if answer_text:
+                hypothetical_answer = answer_text
+
+            # Extract entities and keywords as flat list of strings
+            entities = data.get("entities") or []
+            keywords = data.get("keywords") or []
+
+            if not isinstance(entities, list):
+                entities = [entities]
+            if not isinstance(keywords, list):
+                keywords = [keywords]
+
+            term_list = [str(t).strip() for t in entities + keywords if str(t).strip()]
+            if term_list:
+                hypothetical_terms = " ".join(term_list)
+
+            logger.info(
+                "Parsed HyDE JSON successfully: answer_len=%d, terms=%s",
+                len(hypothetical_answer),
+                ", ".join(term_list[:10]),
+            )
+        except Exception as parse_err:
+            logger.warning(
+                "Failed to parse HyDE JSON, falling back to raw text. Error: %s",
+                parse_err,
+            )
+
         # Save hypothetical answer to Answer object for later inspection
         answer.hypothetical_answer = hypothetical_answer
-        
+
         # Initialize OceanBase client
         client = get_or_create_client()
-        
+
         # Step 2: Dual-path retrieval - retrieve separately with hypothetical answer and original question
         # Then merge results to leverage both semantic expansion and keyword precision
         logger.info("Starting dual-path retrieval...")
-        
+
         # Path 1: Retrieve with hypothetical answer (semantic-focused)
         logger.debug("Path 1: Retrieving with hypothetical answer...")
         hypo_embedding = generate_embedding(hypothetical_answer, dimensions=2048)
-        
+
         hypo_fts_query = {
             "bool": {
                 "should": [
@@ -244,7 +291,7 @@ def search(question: str) -> Answer:
                         "query_string": {
                             "fields": ["content"],
                             "type": "best_fields",
-                            "query": hypothetical_answer,
+                            "query": hypothetical_terms,
                         }
                     }
                 ],
@@ -297,17 +344,17 @@ def search(question: str) -> Answer:
         question_results = _search_with_retry(client, index=TABLE_NAME, body=question_search_request)
         logger.info(f"Original question retrieval: found {len(question_results)} results")
         
-        # Step 3: Tag each result with its source path before merging
+        # Step 3: Tag each result with its source path
         for result in hypo_results:
             result['_source'] = 'hypothetical'
         for result in question_results:
             result['_source'] = 'question'
-        
-        # Simply concatenate both result lists (no deduplication)
-        # Let LLM Rerank handle the larger candidate pool
+
+        # For logging and sanity checks, still build merged list
         search_results = hypo_results + question_results
-        
-        logger.info(f"Merged retrieval: {len(search_results)} total results (hypo: {len(hypo_results)}, question: {len(question_results)})")
+        logger.info(
+            f"Merged retrieval: {len(search_results)} total results (hypo: {len(hypo_results)}, question: {len(question_results)})"
+        )
 
         if not search_results or len(search_results) == 0:
             logger.error(
@@ -324,45 +371,89 @@ def search(question: str) -> Answer:
         contexts = []
         retrieval_results = []  # Store detailed retrieval info
 
-        # Use TOP_K for context extraction but save all merged results for analysis
-        for idx, result in enumerate(search_results[:TOP_K]):
+        # Use TOP_K from each path for context extraction (HyDE TOP_K + question TOP_K)
+        rank_counter = 1
+
+        # Path 1 contexts: hypothetical results
+        for result in hypo_results[:TOP_K]:
             content = result.get("content", "")
             filename = result.get("filename", "")
             page = result.get("page", 0)
-            score = result.get("_score", 0.0)  # Hybrid search score
-            source = result.get("_source", "unknown")  # Track which retrieval path this came from
+            score = result.get("_score", 0.0)
+            source = result.get("_source", "hypothetical")
 
             if content:
                 contexts.append(content)
-                # Save detailed retrieval result
                 retrieval_results.append({
-                    "rank": idx + 1,
+                    "rank": rank_counter,
                     "filename": filename,
                     "page": page,
                     "score": score,
-                    "source": source,  # Track retrieval path (hypothetical/question)
-                    "content_preview": content[:200] + "..." if len(content) > 200 else content,
+                    "source": source,
+                    "content_preview": content[:100] + "..." if len(content) > 100 else content,
                     "content_length": len(content),
-                    "used_for_context": True  # Mark as used in LLM context
+                    "used_for_context": True,
                 })
-        
-        # Also save the remaining results (beyond TOP_K) for analysis purposes
-        for idx, result in enumerate(search_results[TOP_K:], start=TOP_K):
+                rank_counter += 1
+
+        # Path 2 contexts: original question results
+        for result in question_results[:TOP_K]:
+            content = result.get("content", "")
             filename = result.get("filename", "")
             page = result.get("page", 0)
             score = result.get("_score", 0.0)
-            source = result.get("_source", "unknown")
-            
+            source = result.get("_source", "question")
+
+            if content:
+                contexts.append(content)
+                retrieval_results.append({
+                    "rank": rank_counter,
+                    "filename": filename,
+                    "page": page,
+                    "score": score,
+                    "source": source,
+                    "content_preview": content[:100] + "..." if len(content) > 100 else content,
+                    "content_length": len(content),
+                    "used_for_context": True,
+                })
+                rank_counter += 1
+
+        # Also save the remaining results (beyond TOP_K of each path) for analysis purposes
+        for result in hypo_results[TOP_K:]:
+            filename = result.get("filename", "")
+            page = result.get("page", 0)
+            score = result.get("_score", 0.0)
+            source = result.get("_source", "hypothetical")
+
             retrieval_results.append({
-                "rank": idx + 1,
+                "rank": rank_counter,
                 "filename": filename,
                 "page": page,
                 "score": score,
                 "source": source,
-                "content_preview": "",  # Don't store content for analysis-only results
+                "content_preview": "",
                 "content_length": 0,
-                "used_for_context": False  # Not used in LLM context
+                "used_for_context": False,
             })
+            rank_counter += 1
+
+        for result in question_results[TOP_K:]:
+            filename = result.get("filename", "")
+            page = result.get("page", 0)
+            score = result.get("_score", 0.0)
+            source = result.get("_source", "question")
+
+            retrieval_results.append({
+                "rank": rank_counter,
+                "filename": filename,
+                "page": page,
+                "score": score,
+                "source": source,
+                "content_preview": "",
+                "content_length": 0,
+                "used_for_context": False,
+            })
+            rank_counter += 1
 
         if not contexts:
             logger.error(
@@ -386,7 +477,7 @@ def search(question: str) -> Answer:
             if USE_LLM_RERANK:
                 # Strategy: LLM Rerank - Let LLM select the most relevant file and page
                 logger.info("Using LLM Rerank to select file and page")
-                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=50)
+                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=TOP_K * 2)
                 
                 if llm_filename:
                     answer.filename = llm_filename
