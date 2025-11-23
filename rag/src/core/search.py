@@ -27,7 +27,7 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 15  # Optimal value for LLM Rerank - 65.29 best score
+TOP_K = 25  # Optimal value for LLM Rerank - 65.29 best score
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
