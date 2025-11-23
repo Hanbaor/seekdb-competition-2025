@@ -26,7 +26,7 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 50  # Optimal value for LLM Rerank - 65.29 best score
+TOP_K = 30  # Optimal value for LLM Rerank - 65.29 best score
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
@@ -287,8 +287,7 @@ def search(question: str) -> Answer:
         # Step 1: Generate hypothetical answer first (HyDE approach)
         logger.debug("Generating hypothetical answer for better retrieval...")
         hypothetical_prompt = f"""请基于你的知识，对以下问题给出一个简短的假设性答案（1-2句话即可）。
-不需要完全准确，只需要包含可能相关的关键词和概念。
-
+不需要完全准确，但要足够相关且详细并有代表性,尽量包含可能存在的内容和实体
 问题：{question}
 
 假设答案："""
@@ -416,7 +415,7 @@ def search(question: str) -> Answer:
                     "page": page,
                     "score": score,
                     "source": source,  # Track retrieval path (hypothetical/question)
-                    "content_preview": content[:1000] + "..." if len(content) > 2000 else content,
+                    "content_preview": content[:1000] + "..." if len(content) > 1000 else content,
                     # "content_preview": content,
                     "content_length": len(content),
                     "used_for_context": True  # Mark as used in LLM context
