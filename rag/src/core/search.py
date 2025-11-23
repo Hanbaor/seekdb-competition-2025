@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import dotenv
 
@@ -28,6 +29,33 @@ TOP_K = 50  # Optimal value for LLM Rerank - 65.29 best score
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
+
+
+def _search_with_retry(client, index: str, body: dict, max_retries: int = 3, backoff_base: float = 0.5):
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.search(index=index, body=body)
+        except Exception as e:
+            last_exception = e
+            if attempt >= max_retries:
+                logger.error(
+                    "Hybrid search failed after %d attempts: %s", attempt, e, exc_info=True
+                )
+                raise
+
+            sleep_time = backoff_base * (2 ** (attempt - 1))
+            logger.warning(
+                "Hybrid search error on attempt %d/%d: %s, retrying in %.1fs",
+                attempt,
+                max_retries,
+                e,
+                sleep_time,
+            )
+            time.sleep(sleep_time)
+
+    if last_exception is not None:
+        raise last_exception
 
 
 def apply_rrf_reranking(search_results, k=60, score_weight=0.5):
@@ -234,7 +262,7 @@ def search(question: str) -> Answer:
             "size": TOP_K,
         }
         
-        hypo_results = client.search(index=TABLE_NAME, body=hypo_search_request)
+        hypo_results = _search_with_retry(client, index=TABLE_NAME, body=hypo_search_request)
         logger.info(f"Hypothetical answer retrieval: found {len(hypo_results)} results")
         
         # Path 2: Retrieve with original question (keyword-focused)
@@ -266,7 +294,7 @@ def search(question: str) -> Answer:
             "size": TOP_K,
         }
         
-        question_results = client.search(index=TABLE_NAME, body=question_search_request)
+        question_results = _search_with_retry(client, index=TABLE_NAME, body=question_search_request)
         logger.info(f"Original question retrieval: found {len(question_results)} results")
         
         # Step 3: Tag each result with its source path before merging
@@ -282,11 +310,10 @@ def search(question: str) -> Answer:
         logger.info(f"Merged retrieval: {len(search_results)} total results (hypo: {len(hypo_results)}, question: {len(question_results)})")
 
         if not search_results or len(search_results) == 0:
-            logger.warning(
+            logger.error(
                 f"No search results found for question: '{question[:50]}...'"
             )
-            answer.answer = "抱歉，我没有找到相关的信息来回答这个问题。"
-            return answer
+            raise RuntimeError("No search results found for the given question")
 
         logger.debug(f"Final merged results: {len(search_results)} documents")
         
@@ -338,11 +365,10 @@ def search(question: str) -> Answer:
             })
 
         if not contexts:
-            logger.warning(
+            logger.error(
                 f"No valid contexts extracted from search results for question: '{question[:50]}...'"
             )
-            answer.answer = "抱歉，我没有找到相关的信息来回答这个问题。"
-            return answer
+            raise RuntimeError("No valid contexts extracted from search results")
 
         logger.debug(
             f"Extracted {len(contexts)} valid contexts, total length: {sum(len(c) for c in contexts)} chars"
@@ -433,6 +459,6 @@ def search(question: str) -> Answer:
 
     except Exception as e:
         logger.error(f"Error in query: {e}", exc_info=True)
-        answer.answer = f"查询过程中发生错误：{str(e)}"
+        raise
 
     return answer
