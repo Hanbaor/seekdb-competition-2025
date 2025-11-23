@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from collections import defaultdict
 
 import dotenv
 
@@ -127,37 +128,107 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
     """
     if not retrieval_results:
         return "", 0
-    
-    # Only use top K results
-    top_results = retrieval_results[:min(top_k, len(retrieval_results))]
-#    相似度分数: {score:.3f} 
-    # Build candidate list
+
+    # Group results by (filename, page), merging hypothetical/question sources
+    groups = defaultdict(
+        lambda: {
+            "filename": "",
+            "page": 0,
+            "hypo": [],
+            "question": [],
+            "other": [],
+            "max_score": 0.0,
+        }
+    )
+
+    for r in retrieval_results:
+        filename = r.get("filename", "")
+        page = r.get("page", 0)
+        key = (filename, page)
+        source = r.get("source", "unknown")
+        score = r.get("score", 0.0)
+        content = r.get("content_preview", "")
+
+        g = groups[key]
+        if not g["filename"]:
+            g["filename"] = filename
+            g["page"] = page
+
+        entry = {"score": score, "content": content}
+        if source == "hypothetical":
+            g["hypo"].append(entry)
+        elif source == "question":
+            g["question"].append(entry)
+        else:
+            g["other"].append(entry)
+
+        if score > g["max_score"]:
+            g["max_score"] = score
+
+    # Sort groups by their best score and keep top_k groups
+    group_list = list(groups.values())
+    if not group_list:
+        return "", 0
+
+    group_list.sort(key=lambda g: g["max_score"], reverse=True)
+    top_groups = group_list[: min(top_k, len(group_list))]
+
+    # Build candidate list (per unique file+page), listing all snippets from each source
     candidates = []
-    for idx, r in enumerate(top_results, 1):
-        filename = r.get('filename', '').split('/')[-1]  # Only filename
-        page = r.get('page', 0)
-        content = r.get('content_preview', '')
-        score = r.get('score', 0)
-        
-        candidates.append(f"""【候选{idx}】
-文件: {filename}
-页码: 第{page}页
-内容摘要: {content}""")
-    
+    for idx, g in enumerate(top_groups, 1):
+        filename_only = g["filename"].split("/")[-1]
+        page = g["page"]
+
+        parts = [
+            f"【候选{idx}】",
+            f"文件: {filename_only}",
+            f"页码: 第{page}页",
+            # f"综合最高相似度: {g['max_score']:.3f}",
+        ]
+
+        # All snippets from hypothetical-answer retrieval path (if any)
+        if g["hypo"]:
+            hypo_sorted = sorted(g["hypo"], key=lambda e: e["score"], reverse=True)
+            parts.append("\n[假设答案检索路径片段列表]:")
+            for i, entry in enumerate(hypo_sorted, 1):
+                parts.append(
+                    # f"- 片段#{i} 相似度: {entry['score']:.3f}\n  内容: {entry['content']}"
+                    f"- 片段#{i}\n  内容: {entry['content']}"
+                )
+
+        # All snippets from original-question retrieval path (if any)
+        if g["question"]:
+            question_sorted = sorted(g["question"], key=lambda e: e["score"], reverse=True)
+            parts.append("\n[原问题检索路径片段列表]:")
+            for i, entry in enumerate(question_sorted, 1):
+                parts.append(
+                    f"- 片段#{i} \n  内容: {entry['content']}"
+                )
+
+        # If neither path is available, still keep the candidate but mark as unknown source
+        if not g["hypo"] and not g["question"]:
+            parts.append("\n[来源未知]")
+
+        candidates.append("\n".join(parts))
+
     candidates_text = "\n\n".join(candidates)
-    
+
     # Build LLM prompt
-    prompt = f"""你是一个专业的金融文档检索评估专家。现在有一个关于千味央厨公司的问题和{len(top_results)}个通过混合检索筛选出的候选文档片段。
+    prompt = f"""你是一个专业的金融文档检索评估专家。现在有一个关于千味央厨公司的问题，以及若干通过混合检索得到的候选页。
+
+每个候选页可能包含以下两种检索路径中的片段：
+- [假设答案检索路径]：使用基于假设答案的查询得到的片段
+- [原问题检索路径]：使用原始问题文本得到的片段
 
 问题：{question}
 
-候选文档片段（共{len(top_results)}个）：
+候选文档片段（共{len(top_groups)}个不同的“文件+页”组合）：
 {candidates_text}
 
-请仔细分析每个候选片段的内容，判断哪一个最能准确、完整地回答这个问题。或者和问题最相关
+请仔细分析每个候选页中的内容，判断哪一个最能准确、完整地回答这个问题，或者与问题最相关。
 
 要求：
-1. 必须从上述候选中选择一个
+1. 必须从上述候选中选择一个“文件+页”组合
 2. 只返回一个JSON对象：{{"filename": "完整文件名.pdf", "page": 页码数字, "reason": "选择理由（一句话）"}}
 3. filename必须与候选中的文件名完全一致，页码也一致并且是对应的
 4. 不要有任何其他解释文字
@@ -176,12 +247,13 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
             result = json.loads(json_match.group())
             filename = result.get('filename', '')
             page = result.get('page', 0)
-            
-            # Find full file path
-            for r in top_results:
-                if filename in r.get('filename', ''):
+
+            # Find full file path in original retrieval results
+            for r in retrieval_results:
+                full_name = r.get('filename', '')
+                if filename and filename in full_name and r.get('page', 0) == page:
                     logger.info(f"LLM Rerank selected: {filename} page {page}")
-                    return r.get('filename', ''), page
+                    return full_name, page
             
             # If not found, fall back to hybrid strategy
             logger.warning(f"LLM Rerank: filename '{filename}' not found in results, triggering fallback")
@@ -328,7 +400,7 @@ def search(question: str) -> Answer:
         retrieval_results = []  # Store detailed retrieval info
 
         # Use TOP_K for context extraction but save all merged results for analysis
-        for idx, result in enumerate(search_results[:TOP_K]):
+        for idx, result in enumerate(search_results):
             content = result.get("content", "")
             filename = result.get("filename", "")
             page = result.get("page", 0)
@@ -344,7 +416,8 @@ def search(question: str) -> Answer:
                     "page": page,
                     "score": score,
                     "source": source,  # Track retrieval path (hypothetical/question)
-                    "content_preview": content[:200] + "..." if len(content) > 200 else content,
+                    "content_preview": content[:1000] + "..." if len(content) > 2000 else content,
+                    # "content_preview": content,
                     "content_length": len(content),
                     "used_for_context": True  # Mark as used in LLM context
                 })
