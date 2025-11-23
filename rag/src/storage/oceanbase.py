@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Optional
 
 import dotenv
 from pyobvector import VECTOR, FtsIndexParam, FtsParser, VectorIndex
@@ -18,20 +19,28 @@ OCEANBASE_PASSWORD = os.getenv("OCEANBASE_PASSWORD")
 OCEANBASE_DBNAME = os.getenv("OCEANBASE_DBNAME")
 
 
+_client: Optional[HybridSearch] = None
+
+
 def get_or_create_client() -> HybridSearch:
-    """Get or create OceanBase HybridSearch client with increased pool size."""
-    return HybridSearch(
-        uri=OCEANBASE_URI,
-        user=OCEANBASE_USER,
-        password=OCEANBASE_PASSWORD,
-        db_name=OCEANBASE_DBNAME,
-        # Increase connection pool for multi-threaded operations
-        pool_size=1000,  # 增加连接池大小（默认5）
-        max_overflow=1000,  # 允许超出pool_size的额外连接数
-        pool_timeout=60,  # 等待可用连接的超时时间（秒）
-        pool_recycle=3600,  # 连接回收时间（秒），防止长时间连接失效
-        pool_pre_ping=True,  # 使用前检查连接是否有效
-    )
+    """Get or create a singleton OceanBase HybridSearch client with a safe pool size."""
+    global _client
+
+    if _client is None:
+        _client = HybridSearch(
+            uri=OCEANBASE_URI,
+            user=OCEANBASE_USER,
+            password=OCEANBASE_PASSWORD,
+            db_name=OCEANBASE_DBNAME,
+            # Connection pool config tuned for this workload
+            pool_size=100,      # base pool size, enough for current thread pools
+            max_overflow=100,   # extra connections allowed above pool_size
+            pool_timeout=30,   # wait time for a free connection (seconds)
+            pool_recycle=3600, # recycle connections periodically
+            pool_pre_ping=True,
+        )
+
+    return _client
 
 
 if __name__ == "__main__":

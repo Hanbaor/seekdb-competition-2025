@@ -318,6 +318,7 @@ def search(question: str) -> Answer:
                             "fields": ["content"],
                             "type": "best_fields",
                             "query": hypothetical_answer,
+                            "minimum_should_match": "20%",
                         }
                     }
                 ],
@@ -350,6 +351,7 @@ def search(question: str) -> Answer:
                             "fields": ["content"],
                             "type": "best_fields",
                             "query": question,
+                            "minimum_should_match": "20%",
                         }
                     }
                 ],
@@ -360,7 +362,7 @@ def search(question: str) -> Answer:
             "query": question_fts_query,
             "knn": {
                 "field": "vector",
-                "k": TOP_K,
+                "k": TOP_K*10,
                 "query_vector": question_embedding,
             },
             "from": 0,
@@ -382,12 +384,12 @@ def search(question: str) -> Answer:
         
         logger.info(f"Merged retrieval: {len(search_results)} total results (hypo: {len(hypo_results)}, question: {len(question_results)})")
 
-        if not search_results or len(search_results) == 0:
-            logger.warning(
-                f"No search results found for question: '{question[:50]}...'"
-            )
-            answer.answer = "抱歉，我没有找到相关的信息来回答这个问题。"
-            return answer
+        # if not search_results or len(search_results) == 0:
+        #     logger.warning(
+        #         f"No search results found for question: '{question[:50]}...'"
+        #     )
+        #     answer.answer = "抱歉，我没有找到相关的信息来回答这个问题。"
+        #     return answer
 
         logger.debug(f"Final merged results: {len(search_results)} documents")
         
@@ -439,12 +441,12 @@ def search(question: str) -> Answer:
                 "used_for_context": False  # Not used in LLM context
             })
 
-        if not contexts:
-            logger.warning(
-                f"No valid contexts extracted from search results for question: '{question[:50]}...'"
-            )
-            answer.answer = "抱歉，我没有找到相关的信息来回答这个问题。"
-            return answer
+        # if not contexts:
+        #     logger.warning(
+        #         f"No valid contexts extracted from search results for question: '{question[:50]}...'"
+        #     )
+        #     answer.answer = "抱歉，我没有找到相关的信息来回答这个问题。"
+        #     return answer
 
         logger.debug(
             f"Extracted {len(contexts)} valid contexts, total length: {sum(len(c) for c in contexts)} chars"
