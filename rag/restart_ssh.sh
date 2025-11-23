@@ -6,13 +6,13 @@ echo "🔄 重启SSH隧道..."
 # 杀掉所有dev229-api的SSH连接
 pkill -f "ssh -fN dev229-api"
 sleep 2
-unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+
 # 重新建立SSH隧道
 ssh -fN dev229-api
 
 # 等待1秒
 sleep 1
-
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
 # 检查是否成功
 if pgrep -f "ssh -fN dev229-api" > /dev/null; then
     echo "✅ SSH隧道已重启"
