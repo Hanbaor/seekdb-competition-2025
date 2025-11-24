@@ -83,10 +83,15 @@ public:
   {
     int ret = OB_SUCCESS;
     // ===== SR PRUNING: 只添加 docid <= 1000 的 =====
-    if (doc_id.get_datum().get_uint64() <= 1000) {
-      int64_t idx = doc_ids_.count();
-      ret = doc_ids_.push_back(std::make_pair(doc_id, idx));
+    const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
+    if (doc_id_val > 1000) {
+      // 如果前面的过滤完全生效，这里永远不会执行到
+      LOG_WARN("SR PRUNING: id > 1000 leaked through!", K(doc_id_val));
+      // 双保险：仍然过滤掉
+      return ret;
     }
+    int64_t idx = doc_ids_.count();
+    ret = doc_ids_.push_back(std::make_pair(doc_id, idx));
     // ==============================================
     return ret;
   }

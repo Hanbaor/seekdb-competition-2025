@@ -407,3 +407,6 @@ run/observer
 run/observer.pid
 rag/logs/
 决赛脚本/bm25s-main
+store/
+etc
+etc
