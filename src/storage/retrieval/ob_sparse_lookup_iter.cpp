@@ -235,6 +235,13 @@ int ObSRSortedLookupIter::project_results(const int64_t capacity, int64_t &count
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
   sql::ObBitVector &id_evaluated_flags = id_proj_expr->get_evaluated_flags(*eval_ctx);
   sql::ObBitVector &relevance_evaluated_flags = relevance_proj_expr->get_evaluated_flags(*eval_ctx);
+  
+  // ===== 调试日志: 已注释 =====
+  // uint64_t min_output_doc_id = UINT64_MAX;
+  // uint64_t max_output_doc_id = 0;
+  // int64_t over_1000_count = 0;
+  // ==============================================
+  
   while (count < capacity && output_row_cnt_ < rangekey_size_) {
     guard.set_batch_idx(count);
     ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
@@ -246,6 +253,7 @@ int ObSRSortedLookupIter::project_results(const int64_t capacity, int64_t &count
     ++count;
     ++output_row_cnt_;
   }
+  
   if (output_row_cnt_ == rangekey_size_) {
     ret = OB_ITER_END;
   }
@@ -257,6 +265,17 @@ int ObSRSortedLookupIter::project_results(const int64_t capacity, int64_t &count
 int ObSRSortedLookupIter::set_hints(const common::ObIArray<std::pair<ObDocIdExt, int>> &virtual_rangekeys, const int64_t size)
 {
   int ret = OB_SUCCESS;
+  // ===== LAYER 3A: 已注释，测试纯净模式 =====
+  // int64_t valid_size = 0;
+  // for (int64_t i = 0; i < size; ++i) {
+  //   const uint64_t doc_id_val = virtual_rangekeys.at(i).first.get_datum().get_uint64();
+  //   if (doc_id_val <= 1000) {
+  //     valid_size++;
+  //   }
+  // }
+  // rangekey_size_ = valid_size;
+  // ==============================================
+  
   rangekey_size_ = size;
   if (OB_UNLIKELY(rangekey_size_ > cache_capacity_)) {
     ret = OB_ERR_UNDEFINED;
@@ -381,6 +400,17 @@ int ObSRHashLookupIter::project_results(const int64_t capacity, int64_t &count)
 int ObSRHashLookupIter::set_hints(const common::ObIArray<std::pair<ObDocIdExt, int>> &virtual_rangekeys, const int64_t size)
 {
   int ret = OB_SUCCESS;
+  // ===== LAYER 3B: 已注释，测试纯净模式 =====
+  // int64_t valid_size = 0;
+  // for (int64_t i = 0; i < size; ++i) {
+  //   const uint64_t doc_id_val = virtual_rangekeys.at(i).first.get_datum().get_uint64();
+  //   if (doc_id_val <= 1000) {
+  //     valid_size++;
+  //   }
+  // }
+  // rangekey_size_ = valid_size;
+  // ==============================================
+  
   rangekey_size_ = size;
   if (OB_UNLIKELY(rangekey_size_ > cache_capacity_)) {
     ret = OB_ERR_UNDEFINED;

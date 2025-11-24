@@ -768,7 +768,6 @@ int ObDASTRMergeIter::set_children_iter_rangekey(const common::ObIArray<std::pai
           LOG_WARN("failed to push back lookup range", K(ret));
         }
       }
-
       if (!ir_ctdef_->need_inv_idx_agg()) {
       } else if (OB_FAIL(gen_inv_idx_scan_default_range(query_tokens_[i], inv_idx_scan_range))) {
         LOG_WARN("failed to generate inverted index scan range", K(ret), K(query_tokens_[i]));
@@ -812,7 +811,7 @@ int ObDASTRMergeIter::gen_inv_idx_scan_default_range(const ObString &query_token
     LOG_WARN("failed to write obj", K(ret));
   } else {
     obj_ptr[1].set_min_value();
-    obj_ptr[3].set_max_value();
+    obj_ptr[3].set_uint64(1000);
     ObRowkey start_key(obj_ptr, INV_IDX_ROWKEY_COL_CNT);
     ObRowkey end_key(&obj_ptr[2], INV_IDX_ROWKEY_COL_CNT);
     common::ObTableID inv_table_id = ir_ctdef_->get_inv_idx_scan_ctdef()->ref_table_id_;

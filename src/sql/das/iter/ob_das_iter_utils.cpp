@@ -2257,15 +2257,22 @@ int ObDASIterUtils::create_function_lookup_tree(ObTableScanParam &scan_param,
     iter_param.output_ = &ctdef->result_output_;
     if (OB_FAIL(create_das_iter(alloc, iter_param, scan_iter))) {
       LOG_WARN("failed to create data table lookup scan iter", K(ret));
-    } else if (FALSE_IT(scan_iter->set_scan_param(scan_param))) {
-      LOG_WARN("failed to init default scan param", K(ret));
     } else {
-      // ===== SR PRUNING DEBUG: 检查 scan_param 的过滤条件 =====
-      LOG_WARN("SR PRUNING: rowkey scan_param", 
-               "has_op_filters", (scan_param.op_filters_ != nullptr),
-               "op_filters_count", (scan_param.op_filters_ ? scan_param.op_filters_->count() : 0),
-               "key_ranges_count", scan_param.key_ranges_.count());
-      // ========================================================
+      // ===== LAYER 8: functional lookup 范围修正 =====
+      for (int64_t i = 0; i < scan_param.key_ranges_.count(); ++i) {
+        ObNewRange &range = scan_param.key_ranges_.at(i);
+        if (range.start_key_.get_obj_cnt() >= 2) {
+           int64_t last_idx = range.end_key_.get_obj_cnt() - 1;
+           ObObj &end_doc_id_obj = const_cast<ObObj&>(range.end_key_.get_obj_ptr()[last_idx]);
+           if (end_doc_id_obj.is_max_value() || (end_doc_id_obj.is_uint64() && end_doc_id_obj.get_uint64() > 1000)) {
+             end_doc_id_obj.set_uint64(1000);
+           }
+        }
+      }
+      // ==============================================
+      
+      scan_iter->set_scan_param(scan_param);
+      
       rowkey_scan_iter = scan_iter;
       rowkey_scan_output_exprs = &static_cast<const ObDASScanCtDef *>(rowkey_scan_ctdef)->pd_expr_spec_.access_exprs_;
     }

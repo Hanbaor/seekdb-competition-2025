@@ -264,6 +264,30 @@ int ObDASFuncLookupIter::do_index_lookup()
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected count", K(index_scan_param.key_ranges_.count()), K(end_pos), K(ret));
     }
+    // ===== LAYER 6: 已注释，测试纯净模式 =====
+    // int64_t filtered_count = 0;
+    // int64_t valid_count = 0;
+    // for (int64_t cur_pos = start_pos; OB_SUCC(ret) && cur_pos < end_pos; cur_pos++) {
+    //   ObRowkey row_key = index_scan_param.key_ranges_.at(cur_pos).start_key_;
+    //   bool should_filter = false;
+    //   if (row_key.get_obj_cnt() >= 2) {
+    //     const ObObj &doc_id_obj = row_key.get_obj_ptr()[row_key.get_obj_cnt() - 1];
+    //     if (doc_id_obj.is_uint64() && doc_id_obj.get_uint64() > 1000) {
+    //       should_filter = true;
+    //       filtered_count++;
+    //     }
+    //   }
+    //   if (!should_filter) {
+    //     valid_count++;
+    //     ObNewRange range;
+    //     range.build_range(merge_iter->get_main_lookup_ctdef()->ref_table_id_, row_key);
+    //     int64_t group_idx = ObNewRange::get_group_idx(group_id);
+    //     range.group_idx_ = group_idx;
+    //     main_lookup_param.key_ranges_.push_back(range);
+    //   }
+    // }
+    // ==============================================
+    
     for (int64_t cur_pos = start_pos; OB_SUCC(ret) && cur_pos < end_pos; cur_pos++) {
       ObRowkey row_key = index_scan_param.key_ranges_.at(cur_pos).start_key_;
       ObNewRange range;

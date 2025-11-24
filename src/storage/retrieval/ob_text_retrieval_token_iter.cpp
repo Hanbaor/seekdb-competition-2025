@@ -420,25 +420,27 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
     LOG_WARN("retrieval token iterator not inited", K(ret));
   } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
     LOG_WARN("failed to estimate token doc cnt", K(ret));
-  } else if (OB_FAIL(inv_idx_scan_iter_->get_next_rows(count, OB_MIN(max_batch_size_, capacity)))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
-    } else if (count != 0) {
-      ret = OB_SUCCESS;
-    }
-  }
-
-  // ===== SR PRUNING: 标记 id >= 1000 的行 =====
-  if (OB_SUCC(ret) && count > 0) {
-    const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
-    for (int64_t i = 0; i < count; ++i) {
-      const uint64_t doc_id_val = doc_id_datum.at(i)->get_uint64();
-      if (doc_id_val >= 1000) {
-        // 标记需要跳过的行
-        skip_->set(i);
+  } else {
+    const int64_t requested = OB_MIN(max_batch_size_, capacity);
+    if (OB_FAIL(inv_idx_scan_iter_->get_next_rows(count, requested))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
+      } else if (count != 0) {
+        ret = OB_SUCCESS;
       }
     }
   }
+
+  // ===== LAYER 4: 已注释，测试纯净模式 =====
+  // if (OB_SUCC(ret) && count > 0) {
+  //   const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+  //   for (int64_t i = 0; i < count; ++i) {
+  //     const uint64_t doc_id_val = doc_id_datum.at(i)->get_uint64();
+  //     if (doc_id_val > 1000) {
+  //       skip_->set(i);
+  //     }
+  //   }
+  // }
   // ==============================================
 
   if (OB_FAIL(ret)) {
@@ -769,22 +771,14 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
     cur_idx_ = 0;
     const ObDatumVector &relevance_datum = relevance_expr_->locate_expr_datumvector(*eval_ctx_);
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
-    // ===== SR PRUNING: skip 向量已包含 id >= 1000 的标记，直接压缩数组 =====
-    int64_t valid_count = 0;
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        // skip 已经标记了 id >= 1000 的行，这里只保存未被 skip 的行
-        relevance_[valid_count] = relevance_datum.at(i)->get_double();
-        if (OB_FAIL(doc_id_[valid_count].from_datum(*doc_id_datum.at(i)))) {
+        relevance_[i] = relevance_datum.at(i)->get_double();
+        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
           LOG_WARN("failed to get doc id", K(ret), K(doc_id_datum.at(i)));
-        } else {
-          valid_count++;
         }
       }
     }
-    // 更新 count_ 为有效行数
-    count_ = valid_count;
-    // ==============================================
   }
   return ret;
 }
@@ -798,21 +792,13 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
   } else {
     cur_idx_ = 0;
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
-    // ===== SR PRUNING: skip 向量已包含 id >= 1000 的标记，直接压缩数组 =====
-    int64_t valid_count = 0;
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        // skip 已经标记了 id >= 1000 的行，这里只保存未被 skip 的行
-        if (OB_FAIL(doc_id_[valid_count].from_datum(*doc_id_datum.at(i)))) {
+        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
           LOG_WARN("failed to get doc id", K(ret));
-        } else {
-          valid_count++;
         }
       }
     }
-    // 更新 count_ 为有效行数
-    count_ = valid_count;
-    // ==============================================
   }
   return ret;
 }

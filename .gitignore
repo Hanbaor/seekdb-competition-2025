@@ -410,3 +410,9 @@ rag/logs/
 store/
 etc
 etc
+out.folded
+flamegraph-manual.svg
+out.perf
+perf-analysis.txt
+perf-manual.data
+perf-manual.data.old
