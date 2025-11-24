@@ -143,6 +143,12 @@ protected:
   int add_agg_rang_key(const ObNewRange &range);
   int check_inv_idx_scan_and_agg_param();
 
+  // Optimization for scalar filter pushdown
+  int extract_range_pruning_from_filter();
+
+  // Batch prefetch
+  int prefetch_next_batch();
+
   // tools method
   // In ivector2.0, need use the size which is created by precision to alloc the memeory.
   int set_decimal_int_by_precision(ObDatum &result_datum, const uint64_t decint, const ObPrecision precision) const
@@ -195,6 +201,18 @@ protected:
   bool need_inv_idx_agg_reset_;
   bool not_first_fwd_agg_;
   bool is_inited_;
+
+  // range pruning members
+  bool enable_range_pruning_;
+  uint64_t max_doc_id_value_;
+  uint64_t min_doc_id_value_;
+
+  // prefetch members
+  static const int64_t DEFAULT_PREFETCH_BATCH_SIZE = 256;
+  int64_t prefetch_idx_;
+  int64_t prefetch_cnt_;
+  ObFixedArray<double, ObIAllocator> prefetch_relevance_;
+  ObFixedArray<ObDocIdExt, ObIAllocator> prefetch_doc_id_;
 };
 
 class ObDASTRCacheIter : public ObDASTextRetrievalIter

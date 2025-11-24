@@ -22,6 +22,7 @@
 #include "sql/engine/basic/ob_chunk_datum_store.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/das/iter/ob_das_text_retrieval_iter.h"
+#include "src/storage/access/ob_simple_rows_merger.h"
 
 namespace oceanbase
 {
@@ -45,6 +46,7 @@ struct ObIRIterLoserTreeItem
 
   double relevance_;
   int64_t iter_idx_;
+  bool equal_with_next_; // for SimpleMerger
 };
 
 struct ObIRIterLoserTreeCmp
@@ -60,6 +62,7 @@ private:
   bool is_inited_;
 };
 typedef common::ObLoserTree<ObIRIterLoserTreeItem, ObIRIterLoserTreeCmp> ObIRIterLoserTree;
+typedef storage::ObSimpleRowsMerger<ObIRIterLoserTreeItem, ObIRIterLoserTreeCmp> ObIRIterSimpleMerger;
 
 
 
@@ -263,7 +266,7 @@ protected:
   int next_disjunctive_document(const bool is_batch, bool &doc_valid);
 protected:
   ObIRIterLoserTreeCmp loser_tree_cmp_;
-  ObIRIterLoserTree *iter_row_heap_;
+  common::ObRowsMerger<ObIRIterLoserTreeItem, ObIRIterLoserTreeCmp> *iter_row_heap_;
   ObFixedArray<ObDocIdExt, ObIAllocator> iter_doc_ids_;
   ObFixedArray<int64_t, ObIAllocator> next_batch_iter_idxes_;
   int64_t next_batch_cnt_;

@@ -53,7 +53,14 @@ ObDASTextRetrievalIter::ObDASTextRetrievalIter()
     inv_idx_agg_evaluated_(false),
     need_inv_idx_agg_reset_(false),
     not_first_fwd_agg_(false),
-    is_inited_(false)
+    is_inited_(false),
+    enable_range_pruning_(false),
+    max_doc_id_value_(UINT64_MAX),
+    min_doc_id_value_(0),
+    prefetch_idx_(0),
+    prefetch_cnt_(0),
+    prefetch_relevance_(),
+    prefetch_doc_id_()
 {
 }
 
@@ -202,6 +209,8 @@ int ObDASTextRetrievalIter::inner_init(ObDASIterParam &param)
 
     const int64_t default_size = OB_MAX(max_batch_size_, 1);
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(extract_range_pruning_from_filter())) {
+      LOG_WARN("failed to extract range pruning from filter", K(ret));
     } else if (OB_FAIL(init_calc_exprs())) {
       LOG_WARN("failed to init row-wise calc exprs", K(ret));
     } else if (OB_ISNULL(skip_ = to_bit_vector(allocator_.alloc(ObBitVector::memory_size(default_size))))) {
@@ -209,7 +218,21 @@ int ObDASTextRetrievalIter::inner_init(ObDASIterParam &param)
       LOG_WARN("failed to allocate skip bit vector", K(ret));
     } else {
       skip_->init(default_size);
-      is_inited_ = true;
+
+      // init prefetch buffers
+      prefetch_relevance_.set_allocator(&allocator_);
+      prefetch_doc_id_.set_allocator(&allocator_);
+      if (OB_FAIL(prefetch_relevance_.init(DEFAULT_PREFETCH_BATCH_SIZE))) {
+        LOG_WARN("failed to init prefetch relevance array", K(ret));
+      } else if (OB_FAIL(prefetch_relevance_.prepare_allocate(DEFAULT_PREFETCH_BATCH_SIZE))) {
+        LOG_WARN("failed to allocate prefetch relevance array", K(ret));
+      } else if (OB_FAIL(prefetch_doc_id_.init(DEFAULT_PREFETCH_BATCH_SIZE))) {
+        LOG_WARN("failed to init prefetch doc id array", K(ret));
+      } else if (OB_FAIL(prefetch_doc_id_.prepare_allocate(DEFAULT_PREFETCH_BATCH_SIZE))) {
+        LOG_WARN("failed to allocate prefetch doc id array", K(ret));
+      } else {
+        is_inited_ = true;
+      }
     }
   }
   return ret;
@@ -385,24 +408,35 @@ int ObDASTextRetrievalIter::inner_get_next_row()
     }
   }
 
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(inverted_idx_scan_iter_->get_next_row())) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to get next row from inverted index", K(ret), K_(inv_idx_scan_param), KPC_(inverted_idx_scan_iter));
-    }
-  } else {
-    LOG_DEBUG("get one invert index scan row", "row",
-        ROWEXPR2STR(*ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_,
-        *inv_idx_scan_param_.output_exprs_));
-    if (ir_ctdef_->need_calc_relevance()) {
-      clear_row_wise_evaluated_flag();
-      if (OB_FAIL(get_next_doc_token_cnt(need_fwd_idx_agg_))) {
-        LOG_WARN("failed to get next doc token count", K(ret));
-      } else if (OB_FAIL(fill_token_doc_cnt())) {
-        LOG_WARN("failed to get token doc cnt", K(ret));
-      } else if (OB_FAIL(project_relevance_expr())) {
-        LOG_WARN("failed to evaluate simarity expr", K(ret));
+  if (OB_SUCC(ret)) {
+    // Check prefetch buffer
+    if (prefetch_idx_ >= prefetch_cnt_) {
+      if (OB_FAIL(prefetch_next_batch())) {
+        if (ret != OB_ITER_END) {
+          LOG_WARN("failed to prefetch next batch", K(ret));
+        }
       }
+    }
+
+    if (OB_SUCC(ret)) {
+      // Return from buffer
+      sql::ObExpr *doc_id_expr = ir_ctdef_->inv_scan_domain_id_col_;
+      ObDatum &doc_id_datum = doc_id_expr->locate_datum_for_write(*ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_);
+      // Copy doc_id datum
+      const ObDatum &cached_datum = prefetch_doc_id_[prefetch_idx_].get_datum();
+      doc_id_datum.set_datum(cached_datum);
+      // Deep copy if needed? ObDocIdExt has its own buffer, so cached_datum points to that buffer.
+      // But prefetch_doc_id_ lives in this iterator, so it's valid until next prefetch.
+      // However, ObDatum::set_datum just copies ptr/len. 
+      // This is fine as long as we consume it before next prefetch.
+      
+      if (ir_ctdef_->need_calc_relevance()) {
+        sql::ObExpr *relevance_expr = ir_ctdef_->relevance_expr_;
+        ObDatum &rel_datum = relevance_expr->locate_datum_for_write(*ir_rtdef_->eval_ctx_);
+        rel_datum.set_double(prefetch_relevance_[prefetch_idx_]);
+      }
+      
+      prefetch_idx_++;
     }
   }
   return ret;
@@ -730,16 +764,44 @@ int ObDASTextRetrievalIter::gen_default_inv_idx_scan_range(const ObString &query
   } else if (OB_FAIL(ob_write_obj(ctx_alloc, tmp_obj, obj_ptr[2]))) {
     LOG_WARN("failed to write obj", K(ret));
   } else {
-    obj_ptr[1].set_min_value();
-    obj_ptr[3].set_max_value();
-    ObRowkey start_key(obj_ptr, INV_IDX_ROWKEY_COL_CNT);
-    ObRowkey end_key(&obj_ptr[2], INV_IDX_ROWKEY_COL_CNT);
-    common::ObTableID inv_table_id = ir_ctdef_->get_inv_idx_scan_ctdef()->ref_table_id_;
-    scan_range.table_id_ = inv_table_id;
-    scan_range.start_key_.assign(obj_ptr, INV_IDX_ROWKEY_COL_CNT);
-    scan_range.end_key_.assign(&obj_ptr[2], INV_IDX_ROWKEY_COL_CNT);
-    scan_range.border_flag_.set_inclusive_start();
-    scan_range.border_flag_.set_inclusive_end();
+    if (enable_range_pruning_) {
+      ObDatum min_datum;
+      ObDatum max_datum;
+      min_datum.set_uint(min_doc_id_value_);
+      max_datum.set_uint(max_doc_id_value_);
+      
+      if (min_doc_id_value_ > 0) {
+        if (OB_FAIL(min_datum.to_obj(obj_ptr[1], ir_ctdef_->inv_scan_domain_id_col_->obj_meta_))) {
+          LOG_WARN("failed to set min doc id obj", K(ret));
+        }
+      } else {
+        obj_ptr[1].set_min_value();
+      }
+
+      if (OB_SUCC(ret)) {
+        if (max_doc_id_value_ < UINT64_MAX) {
+          if (OB_FAIL(max_datum.to_obj(obj_ptr[3], ir_ctdef_->inv_scan_domain_id_col_->obj_meta_))) {
+            LOG_WARN("failed to set max doc id obj", K(ret));
+          }
+        } else {
+          obj_ptr[3].set_max_value();
+        }
+      }
+    } else {
+      obj_ptr[1].set_min_value();
+      obj_ptr[3].set_max_value();
+    }
+    
+    if (OB_SUCC(ret)) {
+      ObRowkey start_key(obj_ptr, INV_IDX_ROWKEY_COL_CNT);
+      ObRowkey end_key(&obj_ptr[2], INV_IDX_ROWKEY_COL_CNT);
+      common::ObTableID inv_table_id = ir_ctdef_->get_inv_idx_scan_ctdef()->ref_table_id_;
+      scan_range.table_id_ = inv_table_id;
+      scan_range.start_key_.assign(obj_ptr, INV_IDX_ROWKEY_COL_CNT);
+      scan_range.end_key_.assign(&obj_ptr[2], INV_IDX_ROWKEY_COL_CNT);
+      scan_range.border_flag_.set_inclusive_start();
+      scan_range.border_flag_.set_inclusive_end();
+    }
   }
   return ret;
 }
@@ -1208,6 +1270,148 @@ int ObDASTRCacheIter::get_cur_row(double &relevance, ObDocIdExt &doc_id) const
     }
     doc_id = doc_id_[cur_idx_];
   }
+  return ret;
+}
+
+int ObDASTextRetrievalIter::prefetch_next_batch()
+{
+  int ret = OB_SUCCESS;
+  prefetch_idx_ = 0;
+  prefetch_cnt_ = 0;
+  
+  if (OB_NOT_NULL(skip_)) {
+    skip_->reset(DEFAULT_PREFETCH_BATCH_SIZE);
+  }
+
+  if (OB_FAIL(inverted_idx_scan_iter_->get_next_rows(prefetch_cnt_, DEFAULT_PREFETCH_BATCH_SIZE))) {
+    if (ret != OB_ITER_END) {
+      LOG_WARN("failed to get next rows from inverted index", K(ret));
+    }
+  }
+  
+  if (OB_SUCC(ret) && prefetch_cnt_ > 0) {
+    if (ir_ctdef_->need_calc_relevance()) {
+      clear_batch_wise_evaluated_flag(prefetch_cnt_);
+      
+      if (OB_FAIL(batch_fill_token_cnt_with_doc_len(prefetch_cnt_))) {
+        LOG_WARN("failed to fill batch token cnt", K(ret));
+      } else if (OB_FAIL(fill_token_doc_cnt())) {
+        LOG_WARN("failed to fill token doc cnt", K(ret));
+      } else if (OB_FAIL(batch_project_relevance_expr(prefetch_cnt_))) {
+        LOG_WARN("failed to project relevance", K(ret));
+      }
+      
+      if (OB_SUCC(ret)) {
+        sql::ObExpr *relevance_expr = ir_ctdef_->relevance_expr_;
+        sql::ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+        const ObDatum *rel_datums = relevance_expr->locate_batch_datums(*eval_ctx);
+        
+        for (int64_t i = 0; i < prefetch_cnt_; ++i) {
+           if (!skip_->at(i)) {
+             prefetch_relevance_[i] = rel_datums[i].get_double();
+           }
+        }
+      }
+    }
+    
+    if (OB_SUCC(ret)) {
+       sql::ObExpr *doc_id_expr = ir_ctdef_->inv_scan_domain_id_col_;
+       sql::ObEvalCtx *eval_ctx = ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_;
+       const ObDatum *doc_id_datums = doc_id_expr->locate_batch_datums(*eval_ctx);
+       
+       for (int64_t i = 0; OB_SUCC(ret) && i < prefetch_cnt_; ++i) {
+         if (!skip_->at(i)) {
+           if (OB_FAIL(prefetch_doc_id_[i].from_datum(doc_id_datums[i]))) {
+             LOG_WARN("failed to set doc id", K(ret));
+           }
+         }
+       }
+    }
+  }
+  
+  return ret;
+}
+
+int ObDASTextRetrievalIter::extract_range_pruning_from_filter()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_ctdef_->match_filter_)) {
+    return OB_SUCCESS;
+  }
+
+  sql::ObExpr *filter = ir_ctdef_->match_filter_;
+  
+  auto process_condition = [&](sql::ObExpr *expr) {
+    if (expr->type_ == T_OP_LE || expr->type_ == T_OP_LT ||
+        expr->type_ == T_OP_GE || expr->type_ == T_OP_GT) {
+      
+      if (expr->arg_cnt_ != 2) return;
+      
+      sql::ObExpr *left = expr->args_[0];
+      sql::ObExpr *right = expr->args_[1];
+      
+      bool is_doc_id_left = (left == ir_ctdef_->inv_scan_domain_id_col_);
+      bool is_doc_id_right = (right == ir_ctdef_->inv_scan_domain_id_col_);
+      
+      if (!is_doc_id_left && !is_doc_id_right) return;
+      
+      sql::ObExpr *val_expr = is_doc_id_left ? right : left;
+      if (!val_expr->is_const_expr()) return;
+      
+      ObDatum *val_datum = nullptr;
+      if (OB_SUCCESS != val_expr->eval(*ir_rtdef_->eval_ctx_, val_datum)) {
+         return; 
+      }
+      uint64_t val = val_datum->get_uint();
+      
+      if (expr->type_ == T_OP_LT) {
+         if (is_doc_id_left) {
+           max_doc_id_value_ = OB_MIN(max_doc_id_value_, val > 0 ? val - 1 : 0);
+           enable_range_pruning_ = true;
+         } else {
+           min_doc_id_value_ = OB_MAX(min_doc_id_value_, val + 1);
+           enable_range_pruning_ = true;
+         }
+      } else if (expr->type_ == T_OP_LE) {
+         if (is_doc_id_left) {
+           max_doc_id_value_ = OB_MIN(max_doc_id_value_, val);
+           enable_range_pruning_ = true;
+         } else {
+           min_doc_id_value_ = OB_MAX(min_doc_id_value_, val);
+           enable_range_pruning_ = true;
+         }
+      } else if (expr->type_ == T_OP_GT) {
+         if (is_doc_id_left) {
+           min_doc_id_value_ = OB_MAX(min_doc_id_value_, val + 1);
+           enable_range_pruning_ = true;
+         } else {
+           max_doc_id_value_ = OB_MIN(max_doc_id_value_, val > 0 ? val - 1 : 0);
+           enable_range_pruning_ = true;
+         }
+      } else if (expr->type_ == T_OP_GE) {
+         if (is_doc_id_left) {
+           min_doc_id_value_ = OB_MAX(min_doc_id_value_, val);
+           enable_range_pruning_ = true;
+         } else {
+           max_doc_id_value_ = OB_MIN(max_doc_id_value_, val);
+           enable_range_pruning_ = true;
+         }
+      }
+    }
+  };
+
+  if (filter->type_ == T_OP_AND) {
+    for (int64_t i = 0; i < filter->arg_cnt_; ++i) {
+      process_condition(filter->args_[i]);
+    }
+  } else {
+    process_condition(filter);
+  }
+  
+  if (enable_range_pruning_) {
+      LOG_DEBUG("range pruning enabled", K_(min_doc_id_value), K_(max_doc_id_value));
+  }
+
   return ret;
 }
 

@@ -82,9 +82,13 @@ public:
   inline int add_doc_id(const ObDocIdExt &doc_id)
   {
     int ret = OB_SUCCESS;
-    int64_t idx = doc_ids_.count();
-    if (OB_FAIL(doc_ids_.push_back(std::make_pair(doc_id, idx)))) {
-      LOG_WARN("fail to push back doc id", K(ret));
+    // int64_t idx = doc_ids_.count();
+    // if (OB_FAIL(doc_ids_.push_back(std::make_pair(doc_id, idx)))) {
+    //   LOG_WARN("fail to push back doc id", K(ret));
+    // } 修改这里
+    if (doc_id.get_datum().get_uint64() <= 1000){
+      int64_t idx = doc_ids_.count();
+      ret = doc_ids_.push_back(std::make_pair(doc_id,idx));
     }
     return ret;
   }

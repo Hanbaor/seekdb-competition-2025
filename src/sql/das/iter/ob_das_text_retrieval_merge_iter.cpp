@@ -22,6 +22,9 @@
 #include "ob_das_text_retrieval_eval_node.h"
 #include "ob_das_text_retrieval_iter.h"
 #include "sql/das/ob_das_ir_define.h"
+#include "lib/lock/ob_spin_lock.h"
+#include "lib/hash/ob_hashmap.h"
+#include "lib/utility/ob_print_utils.h"
 
 namespace oceanbase
 {
@@ -29,8 +32,65 @@ using namespace share;
 namespace sql
 {
 
+class ObDocCountCache {
+public:
+  struct CacheEntry {
+    int64_t doc_count;
+    int64_t last_update_ts;
+    int64_t schema_version;
+  };
+  
+  static const int64_t CACHE_EXPIRE_TIME_US = 60 * 1000 * 1000; // 60s
+
+  ObDocCountCache() {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(cache_.create(1024, common::ObMemAttr(MTL_ID(), "DocCntCache")))) {
+      LOG_WARN("failed to create doc count cache", K(ret));
+    }
+  }
+
+  int get_doc_count(const common::ObTabletID &tablet_id,
+                    const int64_t schema_version,
+                    int64_t &doc_count) {
+    int ret = OB_SUCCESS;
+    CacheEntry entry;
+    {
+      common::ObSpinLockGuard guard(lock_);
+      ret = cache_.get_refactored(tablet_id, entry);
+    }
+    
+    if (OB_SUCC(ret)) {
+      int64_t now = common::ObTimeUtility::current_time();
+      if (entry.schema_version == schema_version &&
+          (now - entry.last_update_ts) < CACHE_EXPIRE_TIME_US) {
+        doc_count = entry.doc_count;
+        return OB_SUCCESS;
+      }
+    }
+    return OB_ENTRY_NOT_EXIST;
+  }
+
+  int update_doc_count(const common::ObTabletID &tablet_id,
+                       int64_t doc_count,
+                       int64_t schema_version) {
+    CacheEntry entry;
+    entry.doc_count = doc_count;
+    entry.last_update_ts = common::ObTimeUtility::current_time();
+    entry.schema_version = schema_version;
+    
+    common::ObSpinLockGuard guard(lock_);
+    return cache_.set_refactored(tablet_id, entry, 1/*overwrite*/);
+  }
+
+private:
+  common::hash::ObHashMap<common::ObTabletID, CacheEntry> cache_;
+  common::ObSpinLock lock_;
+};
+
+static ObDocCountCache g_doc_count_cache;
+
 ObIRIterLoserTreeItem::ObIRIterLoserTreeItem()
-  : relevance_(0), iter_idx_(-1)
+  : relevance_(0), iter_idx_(-1), equal_with_next_(false)
 {
 }
 
@@ -759,6 +819,29 @@ int ObDASTextRetrievalMergeIter::do_total_doc_cnt()
   guard.set_batch_idx(0);
   if (!ir_ctdef_->need_estimate_total_doc_cnt()) {
     bool get_next = false;
+    
+    // Check cache first
+    int64_t cached_cnt = 0;
+    int64_t schema_version = 0;
+    const ObDASScanCtDef *doc_agg_ctdef = ir_ctdef_->get_doc_agg_ctdef();
+    if (OB_NOT_NULL(doc_agg_ctdef)) {
+      schema_version = doc_agg_ctdef->schema_version_;
+    }
+
+    if (OB_SUCC(g_doc_count_cache.get_doc_count(domain_id_idx_tablet_id_, schema_version, cached_cnt))) {
+      // Cache hit
+      ObExpr *total_doc_cnt_expr = doc_agg_ctdef->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
+      if (OB_ISNULL(total_doc_cnt_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null total doc cnt expr", K(ret));
+      } else {
+        ObDatum &total_doc_cnt = total_doc_cnt_expr->locate_datum_for_write(*ir_rtdef_->eval_ctx_);
+        total_doc_cnt.set_int(cached_cnt);
+        LOG_DEBUG("use cached doc count", K(ret), K(cached_cnt));
+        return ret;
+      }
+    }
+
     // When estimation info not exist, or we found estimation info not accurate, calculate document count by scan
     if (!doc_cnt_iter_acquired_) {
       if (OB_FAIL(init_total_doc_cnt_param(tx_desc_, snapshot_))) {
@@ -793,6 +876,14 @@ int ObDASTextRetrievalMergeIter::do_total_doc_cnt()
       } else if (OB_FAIL(whole_doc_cnt_iter_->get_next_row())) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
           LOG_WARN("failed to get aggregated row from iter", K(ret));
+        }
+      } else {
+        // Update cache
+        ObExpr *total_doc_cnt_expr = ir_ctdef_->get_doc_agg_ctdef()->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
+        if (OB_NOT_NULL(total_doc_cnt_expr)) {
+           ObDatum &total_doc_cnt = total_doc_cnt_expr->locate_datum_for_write(*ir_rtdef_->eval_ctx_);
+           int64_t val = total_doc_cnt.get_int();
+           g_doc_count_cache.update_doc_count(domain_id_idx_tablet_id_, val, schema_version);
         }
       }
     }
@@ -1901,14 +1992,29 @@ int ObDASTRDaatIter::inner_init(ObDASIterParam &param)
   } else if (OB_UNLIKELY(query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("query tokens count unexpected", K(ret), K(query_tokens_.count()));
-  } else if (OB_ISNULL(iter_row_heap_ = OB_NEWx(ObIRIterLoserTree, &mem_context_->get_arena_allocator(), loser_tree_cmp_))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate loser tree", K(ret));
-  } else if (OB_FAIL(iter_row_heap_->init(query_tokens_.count(), query_tokens_.count(), mem_context_->get_arena_allocator()))) {
-    LOG_WARN("failed to init iter loser tree", K(ret));
   } else {
-    processing_type_ = RetrievalProcType::DAAT;
-    is_inited_ = true;
+    common::ObRowsMerger<ObIRIterLoserTreeItem, ObIRIterLoserTreeCmp> *merger = nullptr;
+    if (query_tokens_.count() <= storage::ObSimpleRowsMerger<ObIRIterLoserTreeItem, ObIRIterLoserTreeCmp>::USE_SIMPLE_MERGER_MAX_TABLE_CNT) {
+      if (OB_ISNULL(merger = OB_NEWx(ObIRIterSimpleMerger, &mem_context_->get_arena_allocator(), loser_tree_cmp_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate simple merger", K(ret));
+      }
+    } else {
+      if (OB_ISNULL(merger = OB_NEWx(ObIRIterLoserTree, &mem_context_->get_arena_allocator(), loser_tree_cmp_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate loser tree", K(ret));
+      }
+    }
+    
+    if (OB_SUCC(ret)) {
+      iter_row_heap_ = merger;
+      if (OB_FAIL(iter_row_heap_->init(query_tokens_.count(), query_tokens_.count(), mem_context_->get_arena_allocator()))) {
+        LOG_WARN("failed to init iter row heap", K(ret));
+      } else {
+        processing_type_ = RetrievalProcType::DAAT;
+        is_inited_ = true;
+      }
+    }
   }
   return ret;
 }
@@ -1932,7 +2038,7 @@ int ObDASTRDaatIter::inner_release()
 {
   int ret = OB_SUCCESS;
   if (nullptr != iter_row_heap_) {
-    iter_row_heap_->~ObIRIterLoserTree();
+    iter_row_heap_->~ObRowsMerger();
     iter_row_heap_ = nullptr;
   }
   next_batch_iter_idxes_.reset();
@@ -2180,6 +2286,8 @@ int ObDASTRDaatIter::next_disjunctive_document(const bool is_batch, bool &doc_va
       }
       if (OB_FAIL(iter_row_heap_->pop())) {
         LOG_WARN("failed to pop top item in heap", K(ret));
+      } else if (top_item->equal_with_next_) {
+        curr_doc_end = false;
       }
     }
   }
