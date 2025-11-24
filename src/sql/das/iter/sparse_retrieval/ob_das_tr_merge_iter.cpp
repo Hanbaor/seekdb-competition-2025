@@ -811,7 +811,9 @@ int ObDASTRMergeIter::gen_inv_idx_scan_default_range(const ObString &query_token
     LOG_WARN("failed to write obj", K(ret));
   } else {
     obj_ptr[1].set_min_value();
-    obj_ptr[3].set_uint64(1000);
+    // ===== LAYER 1: 已禁用，恢复默认 MAX 上限 =====
+    // obj_ptr[3].set_uint64(1000);
+    obj_ptr[3].set_max_value();
     ObRowkey start_key(obj_ptr, INV_IDX_ROWKEY_COL_CNT);
     ObRowkey end_key(&obj_ptr[2], INV_IDX_ROWKEY_COL_CNT);
     common::ObTableID inv_table_id = ir_ctdef_->get_inv_idx_scan_ctdef()->ref_table_id_;

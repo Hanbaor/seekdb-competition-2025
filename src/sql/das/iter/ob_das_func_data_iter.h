@@ -82,12 +82,10 @@ public:
   inline int add_doc_id(const ObDocIdExt &doc_id)
   {
     int ret = OB_SUCCESS;
-    // ===== LAYER 5: 已注释，测试 LAYER 1+8 是否足够 =====
-    // const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
-    // if (doc_id_val > 1000) {
-    //   return ret;
-    // }
-    // ==============================================
+    const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
+    if (doc_id_val > 1000) {
+      return ret;
+    }
     int64_t idx = doc_ids_.count();
     ret = doc_ids_.push_back(std::make_pair(doc_id, idx));
     return ret;
