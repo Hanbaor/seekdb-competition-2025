@@ -19,6 +19,7 @@
 #include "ob_das_scan_iter.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
+#include "sql/das/ob_fts_scalar_cache.h"  // ← 新增：HashMap支持
 
 namespace oceanbase
 {
