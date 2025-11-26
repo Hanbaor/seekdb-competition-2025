@@ -1105,6 +1105,11 @@ public:
                                             const share::schema::ObTableSchema &source_table_schema,
                                             ObArray<ObColumnNameInfo> &column_names,
                                             ObArray<int64_t> &select_column_ids);
+  // FTS Scalar Cache: 添加主表标量字段到 SELECT 子句（用于 HashMap 缓存）
+  static int append_fts_scalar_columns(const share::schema::ObTableSchema &dest_table_schema,
+                                       const share::schema::ObTableSchema &source_table_schema,
+                                       ObArray<ObColumnNameInfo> &column_names,
+                                       ObArray<int64_t> &select_column_ids);
   static int generate_build_replica_sql(
       const uint64_t tenant_id,
       const int64_t data_table_id,
