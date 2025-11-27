@@ -4149,17 +4149,23 @@
         // 添加到 HashMap：用 doc_id_val 作为 key
         if (doc_id_val > 0 && id_found) {
           int cache_ret = g_fts_scalar_cache.add_mapping(doc_id_val, id_val, base_id_val, docid_col_val);
-          if (OB_SUCCESS == cache_ret) {
-            ++fts_cache_fill_count;
-            // 每 1000 条输出一次日志，减少日志量
-            if (fts_cache_fill_count % 1000 == 0 || fts_cache_fill_count <= 5) {
-              // 打印 doc_id_val 和 id_val 来验证它们是否相等
-              LOG_ERROR("FTS Scalar Cache: Filling progress",
+          LOG_ERROR("FTS Scalar Cache: Filling progress",
                        K(fts_cache_fill_count),
                        "cache_size", g_fts_scalar_cache.size(),
                        K(doc_id_val), K(id_val), 
                        "doc_id_equals_id", (doc_id_val == id_val),
                        K(base_id_val), K(docid_col_val));
+          if (OB_SUCCESS == cache_ret) {
+            ++fts_cache_fill_count;
+            // 每 1000 条输出一次日志，减少日志量
+            if (fts_cache_fill_count % 1000 == 0 || fts_cache_fill_count <= 5) {
+              // 打印 doc_id_val 和 id_val 来验证它们是否相等
+              //LOG_ERROR("FTS Scalar Cache: Filling progress",
+                       //K(fts_cache_fill_count),
+                       //"cache_size", g_fts_scalar_cache.size(),
+                       //K(doc_id_val), K(id_val), 
+                       //"doc_id_equals_id", (doc_id_val == id_val),
+                       //K(base_id_val), K(docid_col_val));
             }
           } else if (OB_HASH_EXIST == cache_ret) {
             // doc_id 已存在，跳过（同一文档会被多次处理，因为每个分词生成一行）
