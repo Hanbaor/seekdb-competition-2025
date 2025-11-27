@@ -19,6 +19,8 @@
 
 #include "sql/das/iter/ob_das_local_lookup_iter.h"
 #include "src/sql/engine/basic/ob_chunk_datum_store.h"
+#include "sql/das/ob_fts_scalar_cache.h"
+#include "lib/container/ob_fixed_array.h"
 
 namespace oceanbase
 {
@@ -90,7 +92,9 @@ public:
   ObDASCacheLookupIter(const ObDASIterType type = ObDASIterType::DAS_ITER_LOCAL_LOOKUP)
     : ObDASLocalLookupIter(type),
       store_allocator_("SqlCacheLookup", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID),
-      index_proj_rows_()
+      index_proj_rows_(),
+      cached_doc_ids_(store_allocator_),
+      cached_results_(store_allocator_)
   {}
   virtual ~ObDASCacheLookupIter() {}
 
@@ -107,6 +111,8 @@ private:
   // for store rows
   common::ObArenaAllocator store_allocator_;
   IndexProjRowStore index_proj_rows_;
+  common::ObFixedArray<uint64_t, common::ObIAllocator> cached_doc_ids_;
+  common::ObFixedArray<ScalarFields, common::ObIAllocator> cached_results_;
 };
 
 }  // namespace sql

@@ -20,6 +20,8 @@
 #include "sql/das/ob_das_ir_define.h"
 #include "storage/concurrency_control/ob_data_validation_service.h"
 
+#include "sql/das/ob_fts_scalar_cache.h"
+
 namespace oceanbase
 {
 using namespace common;
@@ -152,6 +154,23 @@ int ObDASCacheLookupIter::inner_init(ObDASIterParam &param)
                                            lookup_param.eval_ctx_,
                                            lookup_param.default_batch_row_count_))) {
     LOG_WARN("failed to init index proj rows", K(ret));
+  } else {
+    cached_doc_ids_.set_allocator(&store_allocator_);
+    cached_results_.set_allocator(&store_allocator_);
+    if (OB_FAIL(cached_doc_ids_.init(lookup_param.default_batch_row_count_))) {
+      LOG_WARN("failed to init cached doc ids", K(ret));
+    } else {
+      LOG_INFO("FTS_CACHE_TRACE", "event", "cached_doc_ids_inited",
+               "capacity", lookup_param.default_batch_row_count_);
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(cached_results_.init(lookup_param.default_batch_row_count_))) {
+        LOG_WARN("failed to init cached results", K(ret));
+      } else {
+        LOG_INFO("FTS_CACHE_TRACE", "event", "cached_results_inited",
+                 "capacity", lookup_param.default_batch_row_count_);
+      }
+    }
   }
 
   return ret;
@@ -175,7 +194,8 @@ int ObDASCacheLookupIter::inner_release()
     LOG_WARN("failed to release das lookup iter", K(ret));
   } else {
     index_proj_rows_.reset();
-    store_allocator_.reset();
+    cached_doc_ids_.clear();
+    cached_results_.clear();
   }
   return ret;
 }
@@ -184,6 +204,16 @@ void ObDASCacheLookupIter::reset_lookup_state()
 {
   ObDASLookupIter::reset_lookup_state();
   index_proj_rows_.reuse();
+  int tmp_ret = cached_doc_ids_.reserve(default_batch_row_count_);
+  if (OB_SUCCESS != tmp_ret) {
+    LOG_WARN_RET(tmp_ret, "failed to reserve cached doc id array", K(tmp_ret), K_(default_batch_row_count));
+  }
+  tmp_ret = cached_results_.reserve(default_batch_row_count_);
+  if (OB_SUCCESS != tmp_ret) {
+    LOG_WARN_RET(tmp_ret, "failed to reserve cached results array", K(tmp_ret), K_(default_batch_row_count));
+  }
+  cached_doc_ids_.clear();
+  cached_results_.clear();
 }
 
 int ObDASCacheLookupIter::inner_get_next_row()
@@ -304,7 +334,29 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(true, storage_count))) { // if need to project, save it
               LOG_WARN("save index proj rows failed", K(ret));
             } else {
+              // Save doc_ids for cache lookup
+              ObEvalCtx::BatchInfoScopeGuard batch_info_guard(*eval_ctx_);
+              batch_info_guard.set_batch_size(storage_count);
+              for (int64_t i = 0; OB_SUCC(ret) && i < storage_count; ++i) {
+                batch_info_guard.set_batch_idx(i);
+                if (rowkey_exprs_.count() > 0) {
+                  // Assume the first rowkey expr is doc_id
+                  ObDatum &doc_id_datum = rowkey_exprs_.at(0)->locate_expr_datum(*eval_ctx_);
+                  uint64_t doc_id = doc_id_datum.get_uint64();
+                  LOG_DEBUG("cache lookup doc id push", K(doc_id),
+                            "cached_count", cached_doc_ids_.count());
+                  if (OB_FAIL(cached_doc_ids_.push_back(doc_id))) {
+                    LOG_WARN("failed to push back doc id", K(ret),
+                             "count_before_push", cached_doc_ids_.count());
+                  } else {
+                    LOG_INFO("FTS_CACHE_TRACE", "event", "doc_id_collected", K(doc_id), "batch_idx", i,
+                             "cached_count", cached_doc_ids_.count());
+                  }
+                }
+              }
               lookup_rowkey_cnt_ += storage_count;
+              LOG_INFO("FTS_CACHE_TRACE", "event", "index_scan_batch_done", "batch_size", storage_count,
+                       K(lookup_rowkey_cnt_), "cached_doc_ids", cached_doc_ids_.count());
             } 
           }
         }
@@ -331,27 +383,108 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
       case OUTPUT_ROWS: {
         count = 0;
         data_table_iter_->clear_evaluated_flag();
-        if (OB_FAIL(data_table_iter_->get_next_rows(count, capacity))) {
-          if (OB_LIKELY(OB_ITER_END == ret)) {
-            ret = OB_SUCCESS;
-            if (count > 0) {
-              lookup_row_cnt_ += count;
-              get_next_rows = true;
-            } else {
-              if (OB_FAIL(check_index_lookup())) {
-                LOG_WARN("failed to check table lookup", K(ret));
-              } else {
-                state_ = INDEX_SCAN;
-              }
+        
+        // Use FTS Scalar Cache to fill output expressions
+        const ObDASScanCtDef *lookup_ctdef = static_cast<const ObDASScanCtDef*>(lookup_ctdef_);
+        int64_t hit_count = 0;
+        int64_t total_doc_ids = cached_doc_ids_.count();
+        
+        LOG_INFO("FTS_CACHE_TRACE", "event", "output_rows_enter", K(total_doc_ids), K(capacity),
+                 K(lookup_row_cnt_), K(lookup_rowkey_cnt_));
+        if (total_doc_ids > 0) {
+            ObEvalCtx::BatchInfoScopeGuard batch_info_guard(*eval_ctx_);
+            batch_info_guard.set_batch_size(total_doc_ids); // Process all cached doc_ids in one batch
+            
+            for (int64_t i = 0; OB_SUCC(ret) && i < total_doc_ids; ++i) {
+                uint64_t doc_id = cached_doc_ids_.at(i);
+                ScalarFields fields;
+                int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
+                if (OB_SUCC(cache_ret)) {
+                     batch_info_guard.set_batch_idx(hit_count); // Set index for output batch
+                     
+                     // Fill output expressions
+                     int string_slot = 0;
+                    for (int64_t j = 0; OB_SUCC(ret) && j < lookup_ctdef->result_output_.count(); ++j) {
+                       ObExpr *expr = lookup_ctdef->result_output_.at(j);
+                         // PROBE LOG: Check schema structure
+                         if (hit_count == 0 && i == 0) {
+                             LOG_WARN("FTS Cache Schema Probe",
+                                      K(j),
+                                      K(expr->datum_meta_.type_),
+                                      K(doc_id),
+                                      K(fields));
+                         }
+                         ObDatum &datum = expr->locate_datum_for_write(*eval_ctx_);
+                         if (expr->datum_meta_.type_ == ObUInt64Type || expr->datum_meta_.type_ == ObIntType) {
+                             // Heuristic: Assume Int/UInt is ID
+                             datum.set_uint(fields.id_);
+                         } else if (common::ob_is_string_type(expr->datum_meta_.type_)) {
+                             ObString val_to_copy;
+                             if (string_slot == 0) {
+                                 // 第一列字符串优先填 base_id，无数据就兜底 docid
+                                 val_to_copy = fields.base_id_.empty() ? fields.docid_col_ : fields.base_id_;
+                             } else {
+                                 // 第二列字符串优先填 docid，无数据就兜底 base_id
+                                 val_to_copy = fields.docid_col_.empty() ? fields.base_id_ : fields.docid_col_;
+                             }
+                             string_slot++;
+                             if (val_to_copy.empty()) {
+                                 datum.set_string(ObString());
+                             } else {
+                                char *buf = nullptr;
+                                if (OB_ISNULL(buf = expr->get_str_res_mem(*eval_ctx_, val_to_copy.length()))) {
+                                   ret = OB_ALLOCATE_MEMORY_FAILED;
+                                   LOG_WARN("failed to allocate memory for string", K(ret));
+                                } else {
+                                   MEMCPY(buf, val_to_copy.ptr(), val_to_copy.length());
+                                   datum.set_string(buf, val_to_copy.length());
+                                }
+                             }
+                         } else {
+                             // Other types: set null or zero
+                             datum.set_null();
+                         }
+                         if (OB_SUCC(ret)) {
+                             expr->set_evaluated_projected(*eval_ctx_);
+                             expr->get_eval_info(*eval_ctx_).evaluated_ = true; // Double ensure
+                         }
+                     }
+                     
+                     if (OB_SUCC(ret)) {
+                        LOG_INFO("FTS_CACHE_TRACE", "event", "cache_hit", K(doc_id), "output_idx", hit_count,
+                                 K(fields));
+                         hit_count++;
+                     }
+                } else {
+                    LOG_WARN("FTS_CACHE_TRACE", "event", "cache_miss", K(doc_id), K(cache_ret));
+                    ret = OB_SUCCESS; 
+                }
             }
-          } else {
-            LOG_WARN("failed to get next rows from data table", K(ret));
-          }
-        } else {
-          lookup_row_cnt_ += count;
-          get_next_rows = true;
         }
 
+        count = hit_count;
+        LOG_INFO("FTS_CACHE_TRACE", "event", "output_rows_processed", K(hit_count), K(total_doc_ids),
+                 K(count));
+        
+        // If we produced rows, set get_next_rows to true to continue state machine
+        if (count > 0) {
+            lookup_row_cnt_ += count;
+            get_next_rows = true;
+            LOG_INFO("FTS_CACHE_TRACE", "event", "output_rows_return", K(count), K(lookup_row_cnt_));
+        } else {
+             // No rows produced (all miss or empty), check if we should finish or go back to scan
+             LOG_WARN("FTS_CACHE_TRACE", "event", "output_rows_empty", K(total_doc_ids));
+             if (OB_FAIL(check_index_lookup())) {
+                LOG_WARN("failed to check table lookup", K(ret));
+             } else {
+                state_ = INDEX_SCAN;
+             }
+        }
+        
+        // Clear doc ids for next round
+        cached_doc_ids_.reuse();
+        LOG_INFO("FTS_CACHE_TRACE", "event", "output_rows_cleanup", "cached_doc_ids", cached_doc_ids_.count());
+        
         if (OB_FAIL(ret)) {
         } else if (get_next_rows && index_proj_rows_.have_data() &&
                    OB_FAIL(index_proj_rows_.to_expr(count))) {
