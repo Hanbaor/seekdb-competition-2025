@@ -21,6 +21,7 @@
 #include "sql/das/ob_das_scan_op.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
+#include "sql/das/ob_fts_scalar_cache.h"  // FTS Scalar Cache
 
 using namespace oceanbase::common;
 
@@ -148,6 +149,44 @@ int ObDASFuncDataIter::set_scan_rowkey(ObEvalCtx *eval_ctx,
     if (OB_FAIL(doc_id.from_datum(col_datum))) {
       LOG_WARN("failed to get doc id", K(ret), K(doc_id));
     } else {
+      // ========== ⭐ 验证：set_scan_rowkey 被调用 ==========
+      static int64_t set_rowkey_count = 0;
+      ++set_rowkey_count;
+      const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
+      const bool need_snapshot_log = (doc_id_val <= 2000)
+                                     && (set_rowkey_count <= 10
+                                         || (set_rowkey_count % 1000 == 1));
+      if (need_snapshot_log) {
+        LOG_ERROR("FUNC DATA: lookup doc_id snapshot",
+                  K(set_rowkey_count),
+                  K(doc_id_val));
+      }
+
+      if (set_rowkey_count <= 5 || set_rowkey_count % 100 == 1) {
+        LOG_ERROR("========== FUNC DATA: set_scan_rowkey ==========");
+        LOG_ERROR("set_scan_rowkey called",
+                  K(set_rowkey_count),
+                  K(doc_id_val),
+                  "has_main_lookup", has_main_lookup_iter());
+        LOG_ERROR("===============================================");
+      }
+      // ===================================================
+      
+      ScalarFields cached_fields;
+      const int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id_val, cached_fields);
+      if (set_rowkey_count <= 5 || set_rowkey_count % 100 == 1) {
+        if (OB_SUCCESS == cache_ret) {
+          LOG_ERROR("FUNC DATA: cache lookup hit",
+                    K(doc_id_val),
+                    K(cached_fields.id_),
+                    K(cached_fields.base_id_),
+                    K(cached_fields.docid_col_));
+        } else {
+          LOG_ERROR("FUNC DATA: cache lookup miss", K(doc_id_val), K(cache_ret));
+        }
+      }
+
+      // 原有逻辑继续
       // ===== SOURCE TRACE: 已注释 =====
       // const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
       // if (doc_id_val > 1000) {
@@ -295,6 +334,21 @@ int ObDASFuncDataIter::inner_get_next_row()
   int ret = OB_SUCCESS;
   int64_t default_size = doc_ids_.count();
   bool iter_end = false;
+  
+  // ========== ⭐ 验证：inner_get_next_row 被调用 ==========
+  static int64_t get_next_row_count = 0;
+  ++get_next_row_count;
+  
+  if (get_next_row_count <= 5 || get_next_row_count % 100 == 1) {
+    LOG_ERROR("========== FUNC DATA: inner_get_next_row ==========");
+    LOG_ERROR("inner_get_next_row called",
+              K(get_next_row_count),
+              "has_main_lookup", (main_lookup_iter_ != nullptr),
+              "doc_ids_count", default_size);
+    LOG_ERROR("=================================================");
+  }
+  // =======================================================
+  
   if (OB_ISNULL(tr_merge_iters_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, tr merge iter is nullptr", K(ret));
