@@ -16,6 +16,8 @@
 
  #define USING_LOG_PREFIX SQL_DAS
  #include "sql/das/iter/ob_das_cache_lookup_iter.h"
+ #include "sql/das/iter/ob_das_func_data_iter.h"
+ #include "sql/das/iter/ob_das_functional_lookup_iter.h"
  #include "sql/engine/ob_exec_context.h"
  #include "sql/das/ob_das_ir_define.h"
  #include "storage/concurrency_control/ob_data_validation_service.h"
@@ -160,15 +162,15 @@
      if (OB_FAIL(cached_doc_ids_.init(lookup_param.default_batch_row_count_))) {
        LOG_WARN("failed to init cached doc ids", K(ret));
      } else {
-       LOG_INFO("FTS_CACHE_TRACE", "event", "cached_doc_ids_inited",
-                "capacity", lookup_param.default_batch_row_count_);
+       // LOG_INFO("FTS_CACHE_TRACE", "event", "cached_doc_ids_inited",
+       //          "capacity", lookup_param.default_batch_row_count_);
      }
      if (OB_SUCC(ret)) {
        if (OB_FAIL(cached_results_.init(lookup_param.default_batch_row_count_))) {
          LOG_WARN("failed to init cached results", K(ret));
        } else {
-         LOG_INFO("FTS_CACHE_TRACE", "event", "cached_results_inited",
-                  "capacity", lookup_param.default_batch_row_count_);
+         // LOG_INFO("FTS_CACHE_TRACE", "event", "cached_results_inited",
+         //          "capacity", lookup_param.default_batch_row_count_);
        }
      }
    }
@@ -349,14 +351,14 @@
                      LOG_WARN("failed to push back doc id", K(ret),
                               "count_before_push", cached_doc_ids_.count());
                    } else {
-                     LOG_INFO("FTS_CACHE_TRACE", "event", "doc_id_collected", K(doc_id), "batch_idx", i,
-                              "cached_count", cached_doc_ids_.count());
+                     // LOG_INFO("FTS_CACHE_TRACE", "event", "doc_id_collected", K(doc_id), "batch_idx", i,
+                     //          "cached_count", cached_doc_ids_.count());
                    }
                  }
                }
                lookup_rowkey_cnt_ += storage_count;
-               LOG_INFO("FTS_CACHE_TRACE", "event", "index_scan_batch_done", "batch_size", storage_count,
-                        K(lookup_rowkey_cnt_), "cached_doc_ids", cached_doc_ids_.count());
+               // LOG_INFO("FTS_CACHE_TRACE", "event", "index_scan_batch_done", "batch_size", storage_count,
+               //          K(lookup_rowkey_cnt_), "cached_doc_ids", cached_doc_ids_.count());
              } 
            }
          }
@@ -380,166 +382,202 @@
          break;
        }
  
-      case OUTPUT_ROWS: {
-        count = 0;
-        data_table_iter_->clear_evaluated_flag();
-        
-        const ObDASScanCtDef *lookup_ctdef = static_cast<const ObDASScanCtDef*>(lookup_ctdef_);
-        int64_t total_doc_ids = cached_doc_ids_.count();
-        const bool cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
-        
-        // ========== 尝试从缓存获取数据，跳过回表 ==========
-        bool all_cache_hit = false;
-        int64_t cache_fill_count = 0;
-        
-        if (cache_available && total_doc_ids > 0 && OB_NOT_NULL(lookup_ctdef)) {
-          // 检查是否所有 doc_id 都在缓存中
-          all_cache_hit = true;
-          for (int64_t i = 0; i < total_doc_ids && all_cache_hit; ++i) {
-            uint64_t doc_id = cached_doc_ids_.at(i);
-            ScalarFields tmp_fields;
-            if (OB_SUCCESS != g_fts_scalar_cache.get_scalar_fields(doc_id, tmp_fields)) {
+       case OUTPUT_ROWS: {
+         count = 0;
+         data_table_iter_->clear_evaluated_flag();
+         
+         const ObDASScanCtDef *lookup_ctdef = static_cast<const ObDASScanCtDef*>(lookup_ctdef_);
+         int64_t total_doc_ids = cached_doc_ids_.count();
+         const bool cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+         
+         // ========== 尝试从缓存获取数据，跳过回表 ==========
+         bool all_cache_hit = false;
+         int64_t cache_fill_count = 0;
+         
+         if (cache_available && total_doc_ids > 0 && OB_NOT_NULL(lookup_ctdef)) {
+           // 检查是否所有 doc_id 都在缓存中
+           all_cache_hit = true;
+           for (int64_t i = 0; i < total_doc_ids && all_cache_hit; ++i) {
+             uint64_t doc_id = cached_doc_ids_.at(i);
+             ScalarFields tmp_fields;
+             if (OB_SUCCESS != g_fts_scalar_cache.get_scalar_fields(doc_id, tmp_fields)) {
+               all_cache_hit = false;
+             }
+           }
+           
+           // LOG_INFO("FTS_CACHE_HIT", "event", "cache_check", 
+           //          K(all_cache_hit), K(total_doc_ids), K(capacity));
+           
+           // 如果全部命中缓存，直接从缓存填充数据
+           if (all_cache_hit) {
+             int64_t output_col_count = lookup_ctdef->result_output_.count();
+             cache_fill_count = std::min(total_doc_ids, capacity);
+             
+             // ========== 向量化执行：使用 locate_batch_datums 获取整个批次的 datum 数组 ==========
+             // 这是 OceanBase 向量化执行的标准方式，参考 ob_das_text_retrieval_merge_iter.cpp
+             
+             // 预先获取所有输出列的 datum 数组
+             ObDatum **col_datums = nullptr;
+             int64_t *col_types = nullptr;
+             if (output_col_count > 0) {
+               col_datums = static_cast<ObDatum**>(alloca(sizeof(ObDatum*) * output_col_count));
+               col_types = static_cast<int64_t*>(alloca(sizeof(int64_t) * output_col_count));
+               
+               for (int64_t j = 0; j < output_col_count; ++j) {
+                 ObExpr *expr = lookup_ctdef->result_output_.at(j);
+                 if (OB_NOT_NULL(expr)) {
+                   col_datums[j] = expr->locate_batch_datums(*eval_ctx_);
+                   col_types[j] = static_cast<int64_t>(expr->datum_meta_.type_);
+                 } else {
+                   col_datums[j] = nullptr;
+                   col_types[j] = 0;
+                 }
+               }
+             }
+             
+             // 遍历每一行，从缓存填充数据到 datum 数组
+             for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
+               uint64_t doc_id = cached_doc_ids_.at(i);
+               ScalarFields fields;
+               int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
+               
+               if (OB_SUCCESS != cache_ret) {
+                 ret = OB_ERR_UNEXPECTED;
+                 LOG_WARN("cache hit check passed but get failed", K(ret), K(doc_id));
+                 break;
+               }
+               
+               // 遍历输出列，填充数据到 datum[i]
+               // 根据日志分析，回表只返回 2 列：
+               //   col_idx=0: 整数列 (id)
+               //   col_idx=1: 字符串列 (docid_col，值为 "doc-en-XXXX")
+               for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
+                 if (OB_ISNULL(col_datums[j])) continue;
+                 
+                 ObExpr *expr = lookup_ctdef->result_output_.at(j);
+                 ObDatum &datum = col_datums[j][i];  // 直接通过索引访问
+                 ObObjType col_type = static_cast<ObObjType>(col_types[j]);
+                 
+                 if (col_type == ObIntType || col_type == ObUInt64Type) {
+                   // 整数列 → 填充 id
+                   datum.set_uint(fields.id_);
+                 } else if (ob_is_string_type(col_type)) {
+                   // 字符串列 → 填充 docid_col
+                   ObString src = fields.docid_col_;
+                   
+                   if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
+                     // 向量化执行中，需要为每行分配独立的内存
+                     // 使用 eval_ctx_ 的 frame 内存
+                     char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
+                     if (OB_ISNULL(buf)) {
+                       ret = OB_ALLOCATE_MEMORY_FAILED;
+                       LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
+                     } else {
+                       MEMCPY(buf, src.ptr(), src.length());
+                       datum.set_string(buf, src.length());
+                     }
+                   } else {
+                     datum.set_string(nullptr, 0);
+                   }
+                 }
+               }
+             }
+             
+             // 设置表达式的 evaluated 标志（整批设置）
+             if (OB_SUCC(ret)) {
+               for (int64_t j = 0; j < output_col_count; ++j) {
+                 ObExpr *expr = lookup_ctdef->result_output_.at(j);
+                 if (OB_NOT_NULL(expr)) {
+                   expr->set_evaluated_projected(*eval_ctx_);
+                 }
+               }
+               
+              // ========== 缓存命中后的正确处理 ==========
+              // 关键发现：不能直接调用 func_data_iter->get_next_rows()！
+              // 
+              // 原因：ObDASFuncDataIter::doc_ids_ 是在 ObDASFuncLookupIter 的内部
+              // INDEX_SCAN 阶段通过 add_rowkey() -> set_scan_rowkey() 填充的。
+              // 如果直接调用 func_data_iter->get_next_rows()，会跳过这个流程，
+              // 导致 doc_ids_ 为空，tr_merge_iters_ 没有正确的范围键！
+              // 
+              // 正确做法：设置 skip_main_lookup_ 标志，然后走正常的 data_table_iter_->get_next_rows()
+              // 这样 ObDASFuncLookupIter 会正确执行内部流程填充 doc_ids_，
+              // 最终在 ObDASFuncDataIter::inner_get_next_rows() 中跳过主表回表。
+              
+              ObDASFuncDataIter *func_data_iter = nullptr;
+              if (data_table_iter_->get_type() == DAS_ITER_FUNC_LOOKUP) {
+                ObDASFuncLookupIter *func_lookup_iter = static_cast<ObDASFuncLookupIter*>(data_table_iter_);
+                func_data_iter = func_lookup_iter->get_func_data_iter();
+              } else if (data_table_iter_->get_type() == DAS_ITER_FUNC_DATA) {
+                func_data_iter = static_cast<ObDASFuncDataIter*>(data_table_iter_);
+              }
+              
+              if (OB_NOT_NULL(func_data_iter)) {
+                // 设置标志，让后续的 ObDASFuncDataIter::inner_get_next_rows() 跳过主表回表
+                func_data_iter->set_skip_main_lookup(true);
+                LOG_INFO("CACHE_HIT_OPTIMIZED", "event", "set_skip_flag_before_normal_flow",
+                         K(cache_fill_count), "iter_type", static_cast<int>(data_table_iter_->get_type()));
+              }
+              
+              // 强制走正常流程，但 main_lookup 会在最终执行时被跳过
               all_cache_hit = false;
             }
           }
-          
-          LOG_INFO("FTS_CACHE_HIT", "event", "cache_check", 
-                   K(all_cache_hit), K(total_doc_ids), K(capacity));
-          
-          // 如果全部命中缓存，直接从缓存填充数据
-          if (all_cache_hit) {
-            int64_t output_col_count = lookup_ctdef->result_output_.count();
-            cache_fill_count = std::min(total_doc_ids, capacity);
-            
-            // 清除表达式的 evaluated flags
-            for (int64_t j = 0; j < output_col_count; ++j) {
-              ObExpr *expr = lookup_ctdef->result_output_.at(j);
-              if (OB_NOT_NULL(expr)) {
-                expr->clear_evaluated_flag(*eval_ctx_);
-              }
-            }
-            
-            // 使用 BatchInfoScopeGuard 设置 batch 信息
-            ObEvalCtx::BatchInfoScopeGuard batch_info_guard(*eval_ctx_);
-            batch_info_guard.set_batch_size(cache_fill_count);
-            
-            // 遍历每一行，从缓存填充数据
-            for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
-              batch_info_guard.set_batch_idx(i);
-              
-              uint64_t doc_id = cached_doc_ids_.at(i);
-              ScalarFields fields;
-              int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
-              
-              if (OB_SUCCESS != cache_ret) {
-                ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("cache hit check passed but get failed", K(ret), K(doc_id));
-                break;
-              }
-              
-              // 遍历输出列，填充数据
-              // 根据日志分析，回表只返回 2 列：
-              //   col_idx=0: 整数列 (id)
-              //   col_idx=1: 字符串列 (docid_col，值为 "doc-en-XXXX")
-              for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
-                ObExpr *expr = lookup_ctdef->result_output_.at(j);
-                if (OB_ISNULL(expr)) continue;
-                
-                ObDatum &datum = expr->locate_datum_for_write(*eval_ctx_);
-                const ObObjType col_type = expr->datum_meta_.type_;
-                
-                if (col_type == ObIntType || col_type == ObUInt64Type) {
-                  // 整数列 → 填充 id（与回表返回的 col_idx=0 一致）
-                  datum.set_uint(fields.id_);
-                  expr->set_evaluated_projected(*eval_ctx_);
-                } else if (ob_is_string_type(col_type)) {
-                  // 字符串列 → 填充 docid_col（与回表返回的 col_idx=1 一致）
-                  // 注意：回表只返回 docid_col，不返回 base_id
-                  ObString src = fields.docid_col_;
-                  
-                  // 复制字符串到表达式内存
-                  if (src.length() > 0) {
-                    char *buf = expr->get_str_res_mem(*eval_ctx_, src.length());
-                    if (OB_ISNULL(buf)) {
-                      ret = OB_ALLOCATE_MEMORY_FAILED;
-                      LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
-                    } else {
-                      MEMCPY(buf, src.ptr(), src.length());
-                      datum.set_string(buf, src.length());
-                    }
-                  } else {
-                    datum.set_string(nullptr, 0);
-                  }
-                  
-                  if (OB_SUCC(ret)) {
-                    expr->set_evaluated_projected(*eval_ctx_);
-                  }
-                }
-              }
-            }
-            // batch_info_guard 在这里析构，会恢复原始 batch 信息
-            // 这是正常行为，和其他使用 BatchInfoScopeGuard 的代码一致
-            
-            if (OB_SUCC(ret)) {
-              count = cache_fill_count;
-              lookup_row_cnt_ += count;
-              get_next_rows = true;
-              
-              LOG_INFO("FTS_CACHE_HIT", "event", "cache_fill_success",
-                       K(cache_fill_count), K(lookup_row_cnt_));
-            }
-          }
         }
         
-        // ========== 如果缓存未全部命中，回退到正常回表 ==========
+        // ========== 正常回表流程（如果设置了 skip_main_lookup_，主表回表会被跳过）==========
         if (!all_cache_hit && OB_SUCC(ret)) {
-          if (OB_FAIL(data_table_iter_->get_next_rows(count, capacity))) {
-            if (OB_LIKELY(OB_ITER_END == ret)) {
-              ret = OB_SUCCESS;
-              if (count > 0) {
-                lookup_row_cnt_ += count;
-                get_next_rows = true;
+           // LOG_INFO("FTS_CACHE_LOOKUP_TRACE", "event", "before_data_table_iter_get_next_rows",
+           //          K(capacity), K(all_cache_hit));
+           if (OB_FAIL(data_table_iter_->get_next_rows(count, capacity))) {
+             if (OB_LIKELY(OB_ITER_END == ret)) {
+               ret = OB_SUCCESS;
+         if (count > 0) {
+             lookup_row_cnt_ += count;
+             get_next_rows = true;
+         } else {
+              if (OB_FAIL(check_index_lookup())) {
+                 LOG_WARN("failed to check table lookup", K(ret));
               } else {
-                if (OB_FAIL(check_index_lookup())) {
-                  LOG_WARN("failed to check table lookup", K(ret));
-                } else {
-                  state_ = INDEX_SCAN;
-                }
+                 state_ = INDEX_SCAN;
               }
-            } else {
-              LOG_WARN("failed to get next rows from data table", K(ret));
-            }
-          } else {
-            lookup_row_cnt_ += count;
-            get_next_rows = true;
-          }
-        }
-        
-        // 清理 doc_ids 缓存，准备下一批次
-        cached_doc_ids_.reuse();
-        
-        // ========== 状态转换 ==========
-        if (OB_SUCC(ret) && all_cache_hit && get_next_rows) {
-          // 缓存命中且数据填充成功后，这批数据已全部处理完
-          // 必须转换到 INDEX_SCAN 获取下一批，否则下次进入 OUTPUT_ROWS 时
-          // cached_doc_ids_ 已空，会走正常回表路径但没有数据
-          if (OB_FAIL(check_index_lookup())) {
-            LOG_WARN("failed to check table lookup after cache hit", K(ret));
-          } else {
-            state_ = INDEX_SCAN;
-            LOG_INFO("FTS_CACHE_HIT", "event", "state_to_index_scan",
-                     K(index_end_), K(lookup_rowkey_cnt_), K(lookup_row_cnt_));
-          }
-        }
-        
-        // 处理索引投影列（只有正常回表时需要）
-        if (OB_FAIL(ret)) {
-        } else if (!all_cache_hit && get_next_rows && need_index_proj && index_proj_rows_.have_data() &&
-                   OB_FAIL(index_proj_rows_.to_expr(count))) {
-          LOG_WARN("failed to convert store row to expr", K(ret));
-        }
-        break;
-      }
+         }
+             } else {
+               LOG_WARN("failed to get next rows from data table", K(ret));
+             }
+           } else {
+             lookup_row_cnt_ += count;
+             get_next_rows = true;
+             // LOG_INFO("FTS_CACHE_LOOKUP_TRACE", "event", "data_table_iter_success",
+             //          K(count), K(lookup_row_cnt_));
+           }
+         }
+         
+         // 清理 doc_ids 缓存，准备下一批次
+         cached_doc_ids_.reuse();
+         
+         // ========== 状态转换 ==========
+         if (OB_SUCC(ret) && all_cache_hit && get_next_rows) {
+           // 缓存命中且数据填充成功后，这批数据已全部处理完
+           // 必须转换到 INDEX_SCAN 获取下一批，否则下次进入 OUTPUT_ROWS 时
+           // cached_doc_ids_ 已空，会走正常回表路径但没有数据
+           if (OB_FAIL(check_index_lookup())) {
+             LOG_WARN("failed to check table lookup after cache hit", K(ret));
+           } else {
+             state_ = INDEX_SCAN;
+             // LOG_INFO("FTS_CACHE_HIT", "event", "state_to_index_scan",
+             //          K(index_end_), K(lookup_rowkey_cnt_), K(lookup_row_cnt_));
+           }
+         }
+         
+         // 处理索引投影列（只有正常回表时需要）
+         if (OB_FAIL(ret)) {
+         } else if (!all_cache_hit && get_next_rows && need_index_proj && index_proj_rows_.have_data() &&
+                    OB_FAIL(index_proj_rows_.to_expr(count))) {
+           LOG_WARN("failed to convert store row to expr", K(ret));
+         }
+         break;
+       }
  
        case FINISHED: {
          ret = OB_ITER_END;
@@ -548,6 +586,9 @@
      }
    } while (!get_next_rows && OB_SUCC(ret));
  
+   // LOG_INFO("FTS_CACHE_LOOKUP_TRACE", "event", "inner_get_next_rows_return",
+   //          K(ret), K(count), K(capacity), K(lookup_row_cnt_), K(lookup_rowkey_cnt_),
+   //          "state", static_cast<int>(state_), K(get_next_rows));
    return ret;
  }
  

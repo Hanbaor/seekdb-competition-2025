@@ -258,6 +258,8 @@ int ObSortOp::process_sort()
 int ObSortOp::process_sort_batch()
 {
   int ret = OB_SUCCESS;
+  // LOG_INFO("FTS_SORT_TRACE", "event", "process_sort_batch_start",
+  //          "all_exprs_count", MY_SPEC.all_exprs_.count());
   if (read_batch_func_ == &ObSortOp::prefix_sort_impl_next_batch) {
     // prefix sort get child row in it's own wrap, do nothing here
   } else if (read_batch_func_ == &ObSortOp::sort_impl_next_batch) {
@@ -270,14 +272,22 @@ int ObSortOp::process_sort_batch()
       } else if (OB_FAIL(child_->get_next_batch(MY_SPEC.max_batch_size_, input_brs))) {
         LOG_WARN("get next batch failed", K(ret));
       } else {
+        // LOG_INFO("FTS_SORT_TRACE", "event", "got_batch_from_child",
+        //          "size", input_brs->size_, "end", input_brs->end_);
         if (input_brs->size_ > 0) {
           sort_row_count_ += input_brs->size_
               - input_brs->skip_->accumulate_bit_cnt(input_brs->size_);
+          // LOG_INFO("FTS_SORT_TRACE", "event", "before_add_batch",
+          //          "size", input_brs->size_, K(sort_row_count_));
           OZ(sort_impl_.add_batch(MY_SPEC.all_exprs_, *input_brs->skip_,
                                   input_brs->size_, need_dump));
+          // LOG_INFO("FTS_SORT_TRACE", "event", "after_add_batch",
+          //          K(ret), K(need_dump));
           sort_impl_.collect_memory_dump_info(op_monitor_info_);
         }
         if (input_brs->end_ || (need_dump && MY_SPEC.prescan_enabled_)) {
+          // LOG_INFO("FTS_SORT_TRACE", "event", "loop_break",
+          //          "end", input_brs->end_, K(need_dump));
           break;
         }
       }
@@ -289,8 +299,10 @@ int ObSortOp::process_sort_batch()
       }
     }
     op_monitor_info_.otherstat_7_id_ = ObSqlMonitorStatIds::ROW_COUNT;
-    op_monitor_info_.otherstat_7_value_ = sort_row_count_; 
+    op_monitor_info_.otherstat_7_value_ = sort_row_count_;
+    // LOG_INFO("FTS_SORT_TRACE", "event", "before_sort", K(sort_row_count_));
     OZ(sort_impl_.sort());
+    // LOG_INFO("FTS_SORT_TRACE", "event", "after_sort", K(ret));
     sort_impl_.collect_memory_dump_info(op_monitor_info_);
   } else {
     ret = OB_ERR_UNEXPECTED;

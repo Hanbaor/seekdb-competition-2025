@@ -46,21 +46,22 @@
  {
  }
  
- ObDASFuncDataIter::ObDASFuncDataIter()
-    :ObDASIter(),
-     tr_merge_iters_(nullptr),
-     iter_count_(0),
-     main_lookup_ctdef_(nullptr),
-     main_lookup_rtdef_(nullptr),
-     main_lookup_iter_(nullptr),
-     main_lookup_tablet_id_(0),
-     main_lookup_ls_id_(0),
-     main_lookup_param_(),
-     merge_memctx_(),
-     doc_ids_(),
-     read_count_(0),
-     start_table_scan_(false)
-   {}
+ObDASFuncDataIter::ObDASFuncDataIter()
+   :ObDASIter(),
+    tr_merge_iters_(nullptr),
+    iter_count_(0),
+    main_lookup_ctdef_(nullptr),
+    main_lookup_rtdef_(nullptr),
+    main_lookup_iter_(nullptr),
+    main_lookup_tablet_id_(0),
+    main_lookup_ls_id_(0),
+    main_lookup_param_(),
+    merge_memctx_(),
+    doc_ids_(),
+    read_count_(0),
+    start_table_scan_(false),
+    skip_main_lookup_(false)
+  {}
  
  ObDASFuncDataIter::~ObDASFuncDataIter()
  {
@@ -149,82 +150,14 @@
      if (OB_FAIL(doc_id.from_datum(col_datum))) {
        LOG_WARN("failed to get doc id", K(ret), K(doc_id));
      } else {
-       // ========== ⭐ 验证：set_scan_rowkey 被调用 ==========
-       static int64_t set_rowkey_count = 0;
-       ++set_rowkey_count;
-       const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
-       const bool need_snapshot_log = (doc_id_val <= 2000)
-                                      && (set_rowkey_count <= 10
-                                          || (set_rowkey_count % 1000 == 1));
-       if (need_snapshot_log) {
-         LOG_ERROR("FUNC DATA: lookup doc_id snapshot",
-                   K(set_rowkey_count),
-                   K(doc_id_val));
-       }
- 
-       if (set_rowkey_count <= 5 || set_rowkey_count % 100 == 1) {
-         LOG_ERROR("========== FUNC DATA: set_scan_rowkey ==========");
-         LOG_ERROR("set_scan_rowkey called",
-                   K(set_rowkey_count),
-                   K(doc_id_val),
-                   "has_main_lookup", has_main_lookup_iter());
-         LOG_ERROR("===============================================");
-       }
-       // ===================================================
-       
-       // ========== 诊断：检查 HashMap 状态（增强版）==========
-       ScalarFields cached_fields;
-       const bool cache_inited = g_fts_scalar_cache.is_inited();
-       const int64_t cache_size = g_fts_scalar_cache.size();
-       
-       // 如果 HashMap 未初始化，尝试初始化它
-       if (!cache_inited) {
-         int init_ret = g_fts_scalar_cache.init(1000000);
-         if (OB_SUCCESS == init_ret) {
-           LOG_ERROR("FUNC DATA: HashMap was NOT initialized! Just initialized now (but empty)");
-         } else if (OB_INIT_TWICE == init_ret) {
-           LOG_ERROR("FUNC DATA: HashMap init returned INIT_TWICE, strange state");
-         } else {
-           LOG_ERROR("FUNC DATA: HashMap init FAILED", K(init_ret));
-         }
-       }
-       
-       const int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id_val, cached_fields);
-       
-       // 始终输出前几次查询的状态（用于调试）
-       if (set_rowkey_count <= 10 || set_rowkey_count % 500 == 1) {
-         // 输出 HashMap 状态
-         LOG_ERROR("FUNC DATA: HashMap status at query time",
-                   K(cache_inited),
-                   K(cache_size),
-                   K(doc_id_val),
-                   K(set_rowkey_count));
-         
-         if (OB_SUCCESS == cache_ret) {
-           LOG_ERROR("FUNC DATA: cache lookup HIT ✓",
-                     K(doc_id_val),
-                     K(cached_fields.id_),
-                     K(cached_fields.base_id_),
-                     K(cached_fields.docid_col_));
-         } else {
-           // 输出具体的错误码
-           // OB_NOT_INIT = -4002, OB_HASH_NOT_EXIST = -4018
-           const char* err_name = "OTHER";
-           if (cache_ret == -4002) err_name = "NOT_INIT";
-           else if (cache_ret == -4018) err_name = "HASH_NOT_EXIST";
-           
-           LOG_ERROR("FUNC DATA: cache lookup MISS ✗",
-                     K(doc_id_val),
-                     K(cache_ret),
-                     K(err_name),
-                     "hint", (cache_size == 0 ? 
-                              "HashMap is EMPTY! Index build may not have run yet." :
-                              "HashMap has data but doc_id not found."));
-         }
-       }
-       // ==========================================
- 
-       // 原有逻辑继续
+      // ========== ⭐ 调试日志已注释 ==========
+      // static int64_t set_rowkey_count = 0;
+      // ++set_rowkey_count;
+      // const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
+      // ... (所有调试日志已注释)
+      // ==========================================
+
+      // 原有逻辑继续
        // ===== SOURCE TRACE: 已注释 =====
        // const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
        // if (doc_id_val > 1000) {
@@ -297,12 +230,13 @@
    return ret;
  }
  
- int ObDASFuncDataIter::inner_reuse()
- {
-   int ret = OB_SUCCESS;
-   doc_ids_.reuse();
-   read_count_ = 0;
-   if (!start_table_scan_) {
+int ObDASFuncDataIter::inner_reuse()
+{
+  int ret = OB_SUCCESS;
+  doc_ids_.reuse();
+  read_count_ = 0;
+  skip_main_lookup_ = false;  // 重置标志
+  if (!start_table_scan_) {
    } else if (OB_NOT_NULL(main_lookup_iter_)) {
      ObDASScanIter *main_lookup_iter = static_cast<ObDASScanIter *>(main_lookup_iter_);
      storage::ObTableScanParam &main_lookup_scan_param = main_lookup_iter->get_scan_param();
@@ -373,19 +307,10 @@
    int64_t default_size = doc_ids_.count();
    bool iter_end = false;
    
-   // ========== ⭐ 验证：inner_get_next_row 被调用 ==========
-   static int64_t get_next_row_count = 0;
-   ++get_next_row_count;
-   
-   if (get_next_row_count <= 5 || get_next_row_count % 100 == 1) {
-     LOG_ERROR("========== FUNC DATA: inner_get_next_row ==========");
-     LOG_ERROR("inner_get_next_row called",
-               K(get_next_row_count),
-               "has_main_lookup", (main_lookup_iter_ != nullptr),
-               "doc_ids_count", default_size);
-     LOG_ERROR("=================================================");
-   }
-   // =======================================================
+  // ========== ⭐ 调试日志已注释 ==========
+  // static int64_t get_next_row_count = 0;
+  // ... (所有调试日志已注释)
+  // =======================================================
    
    if (OB_ISNULL(tr_merge_iters_)) {
      ret = OB_ERR_UNEXPECTED;
@@ -417,28 +342,50 @@
    return ret;
  }
  
- int ObDASFuncDataIter::inner_get_next_rows(int64_t &count, int64_t capacity)
- {
-   int ret = OB_SUCCESS;
-   int64_t main_lookup_count = 0;
-   int64_t tr_merge_count = 0;
-   int64_t default_size = doc_ids_.count();
- 
-   if (OB_ISNULL(tr_merge_iters_)) {
-     ret = OB_ERR_UNEXPECTED;
-     LOG_WARN("unexpected error, tr merge iter is nullptr", K(ret));
-   } else if (OB_NOT_NULL(main_lookup_iter_)) {
-     while (OB_SUCC(ret) && main_lookup_count == 0) {
-       if (OB_FAIL(main_lookup_iter_->get_next_rows(main_lookup_count, capacity))) {
-         if (OB_ITER_END != ret) {
-           LOG_WARN("fail to get next row for main lookup table", K(ret), KPC(main_lookup_iter_));
-         }
-       }
-     }
-     if (OB_ITER_END == ret) {
-       ret = OB_SUCCESS;
-     }
-   }
+int ObDASFuncDataIter::inner_get_next_rows(int64_t &count, int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  int64_t main_lookup_count = 0;
+  int64_t tr_merge_count = 0;
+  int64_t default_size = doc_ids_.count();
+
+  if (OB_ISNULL(tr_merge_iters_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error, tr merge iter is nullptr", K(ret));
+  } else if (skip_main_lookup_) {
+    // 主表数据已从缓存获取，跳过主表回表，使用 default_size 作为 main_lookup_count
+    // 关键：必须使用 default_size (doc_ids_.count())，因为这是实际需要处理的行数
+    // tr_merge_iters_ 的范围键是根据 doc_ids_ 设置的
+    main_lookup_count = default_size;
+    LOG_INFO("CACHE_HIT_SKIP_LOOKUP", "event", "skip_main_lookup_triggered",
+             K(default_size), K(capacity), "skip_flag_was", true);
+    // 重置标志，下次需要重新设置
+    skip_main_lookup_ = false;
+  } else if (OB_NOT_NULL(main_lookup_iter_)) {
+    // 正常回表流程
+    int64_t lookup_start = ObTimeUtility::current_time();
+    while (OB_SUCC(ret) && main_lookup_count == 0) {
+      if (OB_FAIL(main_lookup_iter_->get_next_rows(main_lookup_count, capacity))) {
+        if (OB_ITER_END != ret) {
+          LOG_WARN("fail to get next row for main lookup table", K(ret), KPC(main_lookup_iter_));
+        }
+      }
+    }
+    int64_t lookup_time = ObTimeUtility::current_time() - lookup_start;
+    
+    // 每 500 次输出一次日志
+    static int64_t normal_lookup_count = 0;
+    ++normal_lookup_count;
+    if (normal_lookup_count <= 5 || normal_lookup_count % 500 == 0) {
+      LOG_INFO("NORMAL_MAIN_LOOKUP", "event", "main_lookup_executed",
+               K(main_lookup_count), K(capacity), K(lookup_time), K(default_size),
+               K(normal_lookup_count));
+    }
+    
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+    }
+  }
    // ===== SR PRUNING: 允许 main_lookup_count > default_size =====
    // 因为我们在 add_doc_id 中过滤了 docid，所以 main_lookup_count (未过滤) 可能大于 default_size (过滤后)
    // 这是正常的，不应该报错

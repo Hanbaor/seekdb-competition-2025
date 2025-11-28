@@ -827,6 +827,10 @@ int ObDASMergeIter::get_next_seq_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
   bool got_rows = false;
+  
+  // LOG_INFO("FTS_MERGE_ITER_TRACE", "event", "get_next_seq_rows_start",
+  //          K(capacity), K(seq_task_idx_), "task_count", das_tasks_arr_.count());
+  
   if (OB_UNLIKELY(seq_task_idx_ == OB_INVALID_INDEX)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected invalid index", K(ret));
@@ -848,7 +852,15 @@ int ObDASMergeIter::get_next_seq_rows(int64_t &count, int64_t capacity)
           if (first_get_row_) {
             scan_op->get_scan_param().need_update_tablet_param_ = true;
           }
+          
+          // LOG_INFO("FTS_MERGE_ITER_TRACE", "event", "before_get_next_rows",
+          //          K(capacity), "is_local", scan_op->is_local_task());
+          
           ret = scan_op->get_output_result_iter()->get_next_rows(count, capacity);
+          
+          // LOG_INFO("FTS_MERGE_ITER_TRACE", "event", "after_get_next_rows",
+          //          K(ret), K(count), K(capacity));
+          
           scan_op->get_scan_param().need_update_tablet_param_ = false;
 
           if (OB_SUCC(ret)) {
@@ -866,13 +878,17 @@ int ObDASMergeIter::get_next_seq_rows(int64_t &count, int64_t capacity)
         }
         if (OB_SUCC(ret)) {
           got_rows = true;
+          // LOG_INFO("FTS_MERGE_ITER_TRACE", "event", "got_rows_success",
+          //          K(count), "is_local", scan_op->is_local_task());
           if (!scan_op->is_local_task()) {
             update_wild_datum_ptr(count);
           }
           // only for global index back and use pseudo_partition_id_expr_ in filter
+          // LOG_INFO("FTS_MERGE_ITER_TRACE", "event", "before_update_pseudo_columns");
           if (OB_FAIL(update_pseudo_columns(scan_op))) {
             LOG_WARN("update output tablet id failed", K(ret), K(scan_op->get_tablet_loc()->tablet_id_));
           }
+          // LOG_INFO("FTS_MERGE_ITER_TRACE", "event", "after_update_pseudo_columns", K(ret));
         } else if (OB_ITER_END == ret) {
           ++seq_task_idx_;
           if (seq_task_idx_ == das_tasks_arr_.count()) {
@@ -897,6 +913,8 @@ int ObDASMergeIter::get_next_seq_rows(int64_t &count, int64_t capacity)
       }
     } // while end
   }
+  // LOG_INFO("FTS_MERGE_ITER_TRACE", "event", "get_next_seq_rows_end",
+  //          K(ret), K(count), K(got_rows));
   return ret;
 }
 

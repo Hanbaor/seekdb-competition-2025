@@ -19,6 +19,7 @@
 
 #include "sql/das/iter/ob_das_local_lookup_iter.h"
 #include "sql/das/iter/ob_das_scan_iter.h"
+#include "sql/das/iter/ob_das_func_data_iter.h"
 
 namespace oceanbase
 {
@@ -101,6 +102,7 @@ public:
   virtual ~ObDASFuncLookupIter() {}
   void set_index_scan_param(storage::ObTableScanParam &scan_param) { static_cast<ObDASScanIter *>(index_table_iter_)->set_scan_param(scan_param);}
   ObDASScanIter *get_index_scan_iter() { return static_cast<ObDASScanIter *>(index_table_iter_); }
+  ObDASFuncDataIter *get_func_data_iter() { return static_cast<ObDASFuncDataIter *>(data_table_iter_); }
   int64 get_group_id() const
   {
     const ExprFixedArray *exprs = &(static_cast<const ObDASScanCtDef *>(index_ctdef_))->pd_expr_spec_.access_exprs_;

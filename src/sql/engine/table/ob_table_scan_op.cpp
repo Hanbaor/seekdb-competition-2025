@@ -2392,46 +2392,57 @@
      if (is_resume_point_saved()) {
        // If resume point is saved, we should return OB_ITER_END to prevent scan again.
        ret = OB_ITER_END;
-     } else {
-       ret = output_->get_next_rows(count, batch_size);
-       brs_.all_rows_active_ = true;
-     }
-     if (OB_ITER_END == ret && count > 0) {
-       ret = OB_SUCCESS;
-     }
-     if (OB_FAIL(ret)) {
-       if (OB_ITER_END != ret) {
-         LOG_WARN("get next batch from das result failed", K(ret));
-       }
-     } else {
-       // We need do filter first before do the limit.
-       // See the issue 47201028.
-       if (need_final_limit_ && !MY_SPEC.filters_.empty() && count > 0) {
-         bool all_filtered = false;
-         if (OB_FAIL(filter_rows(MY_SPEC.filters_,
+    } else {
+      // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "before_output_get_next_rows", K(batch_size));
+      ret = output_->get_next_rows(count, batch_size);
+      // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "after_output_get_next_rows", K(ret), K(count), K(batch_size));
+      brs_.all_rows_active_ = true;
+    }
+    if (OB_ITER_END == ret && count > 0) {
+      ret = OB_SUCCESS;
+    }
+    if (OB_FAIL(ret)) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("get next batch from das result failed", K(ret));
+      }
+    } else {
+      // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "before_filter_check", K(count), 
+      //          "has_filters", !MY_SPEC.filters_.empty(), K(need_final_limit_));
+      // We need do filter first before do the limit.
+      // See the issue 47201028.
+      if (need_final_limit_ && !MY_SPEC.filters_.empty() && count > 0) {
+        bool all_filtered = false;
+        // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "before_filter_rows", K(count));
+        if (OB_FAIL(filter_rows(MY_SPEC.filters_,
                                  *brs_.skip_,
                                  count,
                                  all_filtered,
                                  brs_.all_rows_active_))) {
-           LOG_WARN("filter batch failed in das get_next_batch", K(ret));
-         } else if (all_filtered) {
-           //Do nothing.
-           brs_.skip_->reset(count);
-         } else {
-           int64_t skipped_rows_count = brs_.skip_->accumulate_bit_cnt(count);
-           got_batch = true;
-           output_row_cnt_ += (count - skipped_rows_count);
-           input_row_cnt_ += (count - skipped_rows_count);
-         }
-       } else {
-         got_batch = true;
-         output_row_cnt_ += count;
-         input_row_cnt_ += count;
-       }
-     }
-   }
-   return ret;
- }
+          LOG_WARN("filter batch failed in das get_next_batch", K(ret));
+        } else if (all_filtered) {
+          //Do nothing.
+          // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "after_filter_rows_all_filtered");
+          brs_.skip_->reset(count);
+        } else {
+          int64_t skipped_rows_count = brs_.skip_->accumulate_bit_cnt(count);
+          got_batch = true;
+          output_row_cnt_ += (count - skipped_rows_count);
+          input_row_cnt_ += (count - skipped_rows_count);
+          // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "after_filter_rows_success", 
+          //          K(skipped_rows_count), K(output_row_cnt_), K(input_row_cnt_));
+        }
+      } else {
+        got_batch = true;
+        output_row_cnt_ += count;
+        input_row_cnt_ += count;
+        // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "no_filter_needed", K(output_row_cnt_), K(input_row_cnt_));
+      }
+      // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "loop_iteration_done", K(got_batch), K(ret));
+    }
+  }
+  // LOG_INFO("FTS_GET_BATCH_TRACE", "event", "get_next_batch_with_das_return", K(ret), K(count));
+  return ret;
+}
  
  int ObTableScanOp::inner_get_next_row_implement()
  {
@@ -2561,19 +2572,27 @@
      ObEvalCtx::BatchInfoScopeGuard batch_info_guard(eval_ctx_);
      batch_info_guard.set_batch_idx(0);
      batch_info_guard.set_batch_size(batch_size);
-     brs_.size_ = 0;
-     brs_.end_ = false;
-     if (0 == batch_size) {
-       brs_.end_ = true;
-     } else if (OB_FAIL(get_next_batch_with_das(brs_.size_, batch_size))) {
-       if (OB_ITER_END != ret) {
-         LOG_WARN("get next batch with mode failed", K(ret));
-       } else {
-         ret = OB_SUCCESS;
-         brs_.end_ = true;
-       }
-     }
-     access_expr_sanity_check();
+    brs_.size_ = 0;
+    brs_.end_ = false;
+    if (0 == batch_size) {
+      brs_.end_ = true;
+    } else {
+      // LOG_INFO("FTS_TSC_TRACE", "event", "before_get_next_batch_with_das", K(batch_size));
+      if (OB_FAIL(get_next_batch_with_das(brs_.size_, batch_size))) {
+        // LOG_INFO("FTS_TSC_TRACE", "event", "after_get_next_batch_with_das_fail", K(ret), "size", brs_.size_);
+        if (OB_ITER_END != ret) {
+          LOG_WARN("get next batch with mode failed", K(ret));
+        } else {
+          ret = OB_SUCCESS;
+          brs_.end_ = true;
+        }
+      } else {
+        // LOG_INFO("FTS_TSC_TRACE", "event", "after_get_next_batch_with_das_success", "size", brs_.size_, K(batch_size));
+      }
+    }
+    // LOG_INFO("FTS_TSC_TRACE", "event", "before_access_expr_sanity_check", "size", brs_.size_, "end", brs_.end_);
+    access_expr_sanity_check();
+    // LOG_INFO("FTS_TSC_TRACE", "event", "after_access_expr_sanity_check");
      // TODO bin.lb: for calc_exprs_ set ObEvalInfo::cnt_ to brs_.batch_size_ if evaluated
    }
  

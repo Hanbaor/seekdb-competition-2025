@@ -102,6 +102,10 @@ public:
   ObTableScanParam &get_main_lookup_scan_param() { return main_lookup_param_; }
   const ObDASScanCtDef *get_main_lookup_ctdef() { return main_lookup_ctdef_; }
   const ObIArray<std::pair<ObDocIdExt, int>> &get_doc_ids() { return doc_ids_; }
+  
+  // 设置是否跳过主表回表（当主表数据已从缓存获取时使用）
+  void set_skip_main_lookup(bool skip) { skip_main_lookup_ = skip; }
+  bool get_skip_main_lookup() const { return skip_main_lookup_; }
   INHERIT_TO_STRING_KV("ObDASIter", ObDASIter,
                       K(main_lookup_param_),
                       KPC(main_lookup_iter_));
@@ -156,6 +160,7 @@ private:
   ObSEArray<std::pair<ObDocIdExt, int>, 4> doc_ids_;
   int64_t read_count_;
   bool start_table_scan_;
+  bool skip_main_lookup_;  // 当主表数据从缓存获取时，跳过主表回表，只执行相关性分数计算
 };
 
 } // end namespace sql
