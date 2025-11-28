@@ -787,9 +787,24 @@ int ObDASTRMergeIter::set_children_iter_rangekey(const common::ObIArray<std::pai
   return ret;
 }
 
+// namespace
+// {
+// bool should_skip_token_by_docid_sparse(const ObString &query_token)
+// {
+//   UNUSED(query_token);
+//   // 临时 HACK：验证 sparse 路径提前返回的性能上限，强制跳过所有 token。
+//   return true;
+// }
+// }
+
 int ObDASTRMergeIter::gen_inv_idx_scan_default_range(const ObString &query_token, ObNewRange &scan_range)
 {
   int ret = OB_SUCCESS;
+  // if (should_skip_token_by_docid_sparse(query_token)) {
+  //   ret = OB_ITER_END;
+  //   LOG_ERROR("sparse skip token due to doc_id predicate", K(query_token));
+  //   return ret;
+  // }
   void *buf = nullptr;
   ObObj *obj_ptr = nullptr;
   common::ObArenaAllocator &ctx_alloc = mem_context_->get_arena_allocator();

@@ -420,13 +420,19 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
     LOG_WARN("retrieval token iterator not inited", K(ret));
   } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
     LOG_WARN("failed to estimate token doc cnt", K(ret));
-  } else if (OB_FAIL(inv_idx_scan_iter_->get_next_rows(count, OB_MIN(max_batch_size_, capacity)))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
-    } else if (count != 0) {
-      ret = OB_SUCCESS;
+  } else {
+    const int64_t requested = OB_MIN(max_batch_size_, capacity);
+    int tmp_ret = inv_idx_scan_iter_->get_next_rows(count, requested);
+    LOG_ERROR("FTS get_next_rows result", K(requested), K(tmp_ret), K(count));
+    if (OB_FAIL(tmp_ret)) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
+      } else if (count != 0) {
+        ret = OB_SUCCESS;
+      }
     }
   }
+
 
   if (OB_FAIL(ret)) {
   } else if (need_calc_relevance()) {

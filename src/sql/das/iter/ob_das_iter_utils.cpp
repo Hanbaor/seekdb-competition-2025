@@ -2258,19 +2258,6 @@ int ObDASIterUtils::create_function_lookup_tree(ObTableScanParam &scan_param,
     if (OB_FAIL(create_das_iter(alloc, iter_param, scan_iter))) {
       LOG_WARN("failed to create data table lookup scan iter", K(ret));
     } else {
-      // ===== LAYER 8: 已禁用，恢复默认 MAX 上限 =====
-      // for (int64_t i = 0; i < scan_param.key_ranges_.count(); ++i) {
-      //   ObNewRange &range = scan_param.key_ranges_.at(i);
-      //   if (range.start_key_.get_obj_cnt() >= 2) {
-      //      int64_t last_idx = range.end_key_.get_obj_cnt() - 1;
-      //      ObObj &end_doc_id_obj = const_cast<ObObj&>(range.end_key_.get_obj_ptr()[last_idx]);
-      //      if (end_doc_id_obj.is_max_value() || (end_doc_id_obj.is_uint64() && end_doc_id_obj.get_uint64() > 1000)) {
-      //        end_doc_id_obj.set_uint64(1000);
-      //      }
-      //   }
-      // }
-      // ==============================================
-      
       scan_iter->set_scan_param(scan_param);
       
       rowkey_scan_iter = scan_iter;
