@@ -387,10 +387,39 @@
          data_table_iter_->clear_evaluated_flag();
          
          const ObDASScanCtDef *lookup_ctdef = static_cast<const ObDASScanCtDef*>(lookup_ctdef_);
-         int64_t total_doc_ids = cached_doc_ids_.count();
-         const bool cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+        int64_t total_doc_ids = cached_doc_ids_.count();
+        const bool cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+        const int64_t output_col_count = OB_NOT_NULL(lookup_ctdef) ? lookup_ctdef->result_output_.count() : 0;
+
+        auto iter_type_to_str = [](ObDASIterType type) -> const char * {
+        switch (type) {
+          case ObDASIterType::DAS_ITER_INVALID: return "INVALID";
+          case ObDASIterType::DAS_ITER_SCAN: return "SCAN";
+          case ObDASIterType::DAS_ITER_MERGE: return "MERGE";
+          case ObDASIterType::DAS_ITER_GROUP_FOLD: return "GROUP_FOLD";
+          case ObDASIterType::DAS_ITER_LOCAL_LOOKUP: return "LOCAL_LOOKUP";
+          case ObDASIterType::DAS_ITER_GLOBAL_LOOKUP: return "GLOBAL_LOOKUP";
+          case ObDASIterType::DAS_ITER_TEXT_RETRIEVAL: return "TEXT_RETRIEVAL";
+          case ObDASIterType::DAS_ITER_SORT: return "SORT";
+          case ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE: return "TR_MERGE";
+          case ObDASIterType::DAS_ITER_INDEX_MERGE: return "INDEX_MERGE";
+          case ObDASIterType::DAS_ITER_FUNC_LOOKUP: return "FUNC_LOOKUP";
+          case ObDASIterType::DAS_ITER_FUNC_DATA: return "FUNC_DATA";
+          case ObDASIterType::DAS_ITER_MVI_LOOKUP: return "MVI_LOOKUP";
+          case ObDASIterType::DAS_ITER_HNSW_SCAN: return "HNSW_SCAN";
+          case ObDASIterType::DAS_ITER_DOMAIN_ID_MERGE: return "DOMAIN_ID_MERGE";
+          case ObDASIterType::DAS_ITER_IVF_SCAN: return "IVF_SCAN";
+          case ObDASIterType::DAS_ITER_SPIV_MERGE: return "SPIV_MERGE";
+          case ObDASIterType::DAS_ITER_SPIV_SCAN: return "SPIV_SCAN";
+          case ObDASIterType::DAS_ITER_ES_MATCH: return "ES_MATCH";
+          default: return "UNKNOWN";
+        }
+      };
+
+        LOG_INFO("FTS_CACHE_TRACE", "event", "data_iter_entry",
+                 "iter_type", iter_type_to_str(data_table_iter_->get_type()),
+                 K(total_doc_ids), K(cache_available));
          
-         // ========== 尝试从缓存获取数据，跳过回表 ==========
          bool all_cache_hit = false;
          int64_t cache_fill_count = 0;
          
