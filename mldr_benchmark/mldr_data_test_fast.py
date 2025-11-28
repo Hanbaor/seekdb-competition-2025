@@ -64,7 +64,16 @@ class MLDRDataTestFast:
         
         logger.info(f'MLDRDataTestFast initialized: lang={lang}, query_types={query_types}, db_port={db_port}')
         logger.info(f'Query result directory: {self.query_result_dir}')
-    
+
+    def step1_insert_data(self) -> bool:
+        """
+        步骤1: 插入数据并创建索引，与完整版脚本保持一致，确保 HashMap/索引数据可用
+        """
+        logger.info(f"开始插入数据并创建索引: lang={self.lang}")
+        test_simple_insert(self.lang)
+        logger.info("✓ Data insertion and index creation complete (fast mode)")
+        return True
+
     def step3_evaluate(self) -> float:
         """
         步骤3: 评估搜索结果
@@ -139,6 +148,9 @@ class MLDRDataTestFast:
         logger.info("=" * 60)
         
         try:
+            # 先执行索引创建，避免 observer 重启后 HashMap 为空
+            self.step1_insert_data()
+
             # 直接进行正式测试：只执行1次搜索和评估
             logger.info("=" * 60)
             logger.info("Running 1 search and evaluation")
