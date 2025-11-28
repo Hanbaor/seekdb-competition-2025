@@ -97,49 +97,6 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
   } else {
     skip_->init(max_batch_size_);
   }
-
-  // HACK: Competition Optimization for id < 1000
-  // We modify the scan range to stop at doc_id = 1000.
-  // This pushes the predicate down to the storage layer scan, preventing massive unnecessary IO.
-  if (OB_SUCC(ret) && inv_idx_scan_param_ && inv_idx_scan_param_->key_ranges_.count() > 0 && inv_scan_domain_id_col_) {
-      common::ObObjType doc_id_type = inv_scan_domain_id_col_->datum_meta_.type_;
-      // Use a slightly larger buffer to be safe, as DocID might not be exactly ID.
-      // But based on test observation, DocID ~= ID.
-      int64_t limit_doc_id = 1000; 
-      
-      for (int64_t i = 0; i < inv_idx_scan_param_->key_ranges_.count(); ++i) {
-          common::ObNewRange &range = inv_idx_scan_param_->key_ranges_.at(i);
-          if (range.end_key_.get_obj_cnt() >= 2) {
-              // Allocate new obj array to avoid modifying shared/const memory if any
-              int64_t obj_cnt = range.end_key_.get_obj_cnt();
-              void *buf = allocator_->alloc(sizeof(common::ObObj) * obj_cnt);
-              if (buf != nullptr) {
-                  common::ObObj *new_objs = new (buf) common::ObObj[obj_cnt];
-                  // Copy existing objects (token is at 0)
-                  for (int64_t j = 0; j < obj_cnt; ++j) {
-                      new_objs[j] = range.end_key_.get_obj_ptr()[j];
-                  }
-                  
-                  // Set the second object (doc_id) to limit
-                  if (doc_id_type == common::ObIntType) {
-                      new_objs[1].set_int(limit_doc_id);
-                  } else if (doc_id_type == common::ObUInt64Type) {
-                      new_objs[1].set_uint64(limit_doc_id);
-                  } else {
-                      // Default to int if unknown
-                      new_objs[1].set_int(limit_doc_id);
-                  }
-                  
-                  // Update range
-                  range.end_key_.assign(new_objs, obj_cnt);
-                  range.border_flag_.set_inclusive_end(); // <= 1000
-                  
-                  // LOG_INFO("HACK: Updated inverted index scan range limit", K(limit_doc_id), K(doc_id_type));
-              }
-          }
-      }
-  }
-
   is_inited_ = true;
   return ret;
 }
@@ -463,32 +420,18 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
     LOG_WARN("retrieval token iterator not inited", K(ret));
   } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
     LOG_WARN("failed to estimate token doc cnt", K(ret));
-  } else {
-    const int64_t requested = OB_MIN(max_batch_size_, capacity);
-    if (OB_FAIL(inv_idx_scan_iter_->get_next_rows(count, requested))) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
-      } else if (count != 0) {
-        ret = OB_SUCCESS;
-      }
+  } else if (OB_FAIL(inv_idx_scan_iter_->get_next_rows(count, OB_MIN(max_batch_size_, capacity)))) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
+    } else if (count != 0) {
+      ret = OB_SUCCESS;
     }
   }
 
-  // ===== LAYER 4: 已注释，测试纯净模式 =====
-  // if (OB_SUCC(ret) && count > 0) {
-  //   const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
-  //   for (int64_t i = 0; i < count; ++i) {
-  //     const uint64_t doc_id_val = doc_id_datum.at(i)->get_uint64();
-  //     if (doc_id_val > 1000) {
-  //       skip_->set(i);
-  //     }
-  //   }
-  // }
-  // ==============================================
-
   if (OB_FAIL(ret)) {
   } else if (need_calc_relevance()) {
-    PRINT_VECTORIZED_ROWS(SQL, DEBUG, *eval_ctx_, *inv_idx_scan_param_->output_exprs_, count, skip_);
+    const ObBitVector *skip = NULL;
+    PRINT_VECTORIZED_ROWS(SQL, DEBUG, *eval_ctx_, *inv_idx_scan_param_->output_exprs_, count, skip);
     clear_batch_wise_evaluated_flag(count);
     if (OB_FAIL(batch_fill_token_cnt_with_doc_len(count))) {
       LOG_WARN("failed to fill batch token cnt with document length", K(ret));
@@ -839,7 +782,7 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
         if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
           LOG_WARN("failed to get doc id", K(ret));
-        }
+        };
       }
     }
   }
