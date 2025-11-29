@@ -4054,6 +4054,26 @@ int ObTableScanOp::fetch_next_fts_index_rows()
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpeted error, ft or doc id datum is nullptr", K(ret), KP(ft_datum), KP(doc_id_datum));
     } else {
+      // 如果 doc_id_datum 是 null，尝试从 output_[0] 获取主键作为 doc_id
+      // output_[0] 通常是主键列（expr_type=89，即 T_REF_COLUMN）
+      ObDatum *real_doc_id_datum = doc_id_datum;
+      ObDatum pk_datum_copy;
+      if (doc_id_datum->is_null() && MY_SPEC.output_.count() > 0) {
+        ObExpr *pk_expr = MY_SPEC.output_.at(0);
+        ObDatum *pk_datum = nullptr;
+        if (OB_NOT_NULL(pk_expr) && 
+            OB_SUCCESS == pk_expr->eval(eval_ctx_, pk_datum) && 
+            OB_NOT_NULL(pk_datum) && 
+            !pk_datum->is_null()) {
+          // 使用主键值作为 doc_id
+          pk_datum_copy = *pk_datum;
+          real_doc_id_datum = &pk_datum_copy;
+          LOG_TRACE("[FTS] using primary key as doc_id", 
+                    "pk_value", pk_datum->get_int(),
+                    "pk_len", pk_datum->len_);
+        }
+      }
+      
       ObString ft = ft_datum->get_string();
       ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
       if (OB_FAIL(ObTextStringHelper::read_real_string_data(tmp_allocator,
@@ -4062,8 +4082,8 @@ int ObTableScanOp::fetch_next_fts_index_rows()
                                                             ft_expr->obj_meta_.has_lob_header(),
                                                             ft))) {
         LOG_WARN("fail to read real string data", K(ret));
-      } else if (OB_FAIL(fts_index_.segment(ft_expr->obj_meta_, *doc_id_datum, ft)) &&OB_ITER_END != ret) {
-        LOG_WARN("fail to segment fulltext", K(ret), K(doc_id_datum), K(ft));
+      } else if (OB_FAIL(fts_index_.segment(ft_expr->obj_meta_, *real_doc_id_datum, ft)) &&OB_ITER_END != ret) {
+        LOG_WARN("fail to segment fulltext", K(ret), K(real_doc_id_datum), K(ft));
       } else if (OB_ITER_END == ret) {
         has_segment_word = false;
         ret = OB_SUCCESS;

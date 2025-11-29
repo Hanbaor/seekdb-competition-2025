@@ -69,6 +69,7 @@ ob_set_subtarget(ob_sql das
   das/ob_das_retry_ctrl.cpp
   das/ob_das_simple_op.cpp
   das/ob_das_domain_utils.cpp
+  das/ob_fts_token_doc_cache.cpp
   das/ob_das_attach_define.cpp
   das/ob_group_scan_iter.cpp
   das/ob_das_dml_vec_iter.cpp
