@@ -150,41 +150,12 @@ ObDASFuncDataIter::ObDASFuncDataIter()
      if (OB_FAIL(doc_id.from_datum(col_datum))) {
        LOG_WARN("failed to get doc id", K(ret), K(doc_id));
      } else {
-      // ========== ⭐ 调试日志已注释 ==========
-      // static int64_t set_rowkey_count = 0;
-      // ++set_rowkey_count;
-      // const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
-      // ... (所有调试日志已注释)
-      // ==========================================
-
-      // 原有逻辑继续
-       // ===== SOURCE TRACE: 已注释 =====
-       // const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
-       // if (doc_id_val > 1000) {
-       //   LOG_WARN("SR PRUNING [SOURCE TRACE]: doc_id > 1000 from set_scan_rowkey!", 
-       //            K(doc_id_val), "expr_type", expr->type_, 
-       //            "has_main_lookup", has_main_lookup_iter());
-       // }
-       // ==============================================
        if (OB_FAIL(add_doc_id(doc_id))) {
          LOG_WARN("failed to add doc_id", K(ret));
        }
      }
      LOG_DEBUG("set func data iter scan rowkey", K(doc_id), K(ret));
    }
-   // ===== LAYER 7: 已注释，测试纯净模式 =====
-   // if (OB_SUCC(ret) && has_main_lookup_iter() && nullptr != lookup_ctdef) {
-   //   const ObExpr *expr = rowkey_exprs.at(0);
-   //   ObDatum &col_datum = expr->locate_expr_datum(*eval_ctx);
-   //   ObDocIdExt doc_id_check;
-   //   if (OB_SUCC(doc_id_check.from_datum(col_datum))) {
-   //     const uint64_t doc_id_val = doc_id_check.get_datum().get_uint64();
-   //     if (doc_id_val > 1000) {
-   //       return ret; // 跳过 main_lookup
-   //     }
-   //   }
-   // }
-   // ==============================================
    if (OB_SUCC(ret) && has_main_lookup_iter() && nullptr != lookup_ctdef) {
      if (OB_FAIL(main_lookup_iter_->set_scan_rowkey(eval_ctx, rowkey_exprs, lookup_ctdef, alloc, group_id))) {
        LOG_WARN("failed to set scan rowkey of main lookup iter", K(ret));
