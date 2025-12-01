@@ -133,6 +133,8 @@ private:
   ObDocIdExt advance_doc_id_;
   bool token_doc_cnt_calculated_;
   bool inv_idx_agg_cache_mode_;
+  // for MLDR competition: hard limit docid/id < 1000 to early stop inverted scan
+  bool reached_docid_limit_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
 };
