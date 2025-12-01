@@ -436,7 +436,8 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
       } else if (count != 0) {
         ret = OB_SUCCESS;
       }
-    } else if (count > 0 && OB_NOT_NULL(inv_scan_domain_id_col_)) {
+    } 
+    else if (count > 0 && OB_NOT_NULL(inv_scan_domain_id_col_)) {
       // hard-coded docid/id upper bound for MLDR: id < 1000
       const uint64_t DOCID_LIMIT = 1000;
       const ObDatumVector &doc_id_vec = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
