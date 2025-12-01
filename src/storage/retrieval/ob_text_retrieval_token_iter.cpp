@@ -50,6 +50,7 @@ ObTextRetrievalTokenIter::ObTextRetrievalTokenIter()
     advance_doc_id_(),
     token_doc_cnt_calculated_(false),
     inv_idx_agg_cache_mode_(false),
+    reached_docid_limit_(false),
     is_inited_(false)
 {
 }
@@ -105,6 +106,7 @@ void ObTextRetrievalTokenIter::reset()
 {
   relevance_calc_exprs_.reset();
   token_doc_cnt_calculated_ = false;
+  reached_docid_limit_ = false;
 }
 
 void ObTextRetrievalTokenIter::reuse()
@@ -420,13 +422,44 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
     LOG_WARN("retrieval token iterator not inited", K(ret));
   } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
     LOG_WARN("failed to estimate token doc cnt", K(ret));
-  } else if (OB_FAIL(inv_idx_scan_iter_->get_next_rows(count, OB_MIN(max_batch_size_, capacity)))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
-    } else if (count != 0) {
-      ret = OB_SUCCESS;
+  } else if (reached_docid_limit_) {
+    // already reached docid/id upper limit, no more rows for this token
+    ret = OB_ITER_END;
+    return ret;
+  } else {
+    const int64_t requested = OB_MIN(max_batch_size_, capacity);
+    int tmp_ret = inv_idx_scan_iter_->get_next_rows(count, requested);
+    //LOG_DEBUG("FTS get_next_rows result", K(requested), K(tmp_ret), K(count));
+    if (OB_FAIL(tmp_ret)) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
+      } else if (count != 0) {
+        ret = OB_SUCCESS;
+      }
+    } else if (count > 0 && OB_NOT_NULL(inv_scan_domain_id_col_)) {
+      // hard-coded docid/id upper bound for MLDR: id < 1000
+      const uint64_t DOCID_LIMIT = 1000;
+      const ObDatumVector &doc_id_vec = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+      int64_t new_count = count;
+      for (int64_t i = 0; i < count; ++i) {
+        uint64_t d = doc_id_vec.at(i)->get_uint64();
+        if (d >= DOCID_LIMIT) {
+          new_count = i;
+          reached_docid_limit_ = true;
+          break;
+        }
+      }
+      if (new_count == 0) {
+        // current batch all exceed limit, treat as end
+        ret = OB_ITER_END;
+        count = 0;
+      } else if (new_count < count) {
+        // shrink current batch size, upper part will be ignored by callers
+        count = new_count;
+      }
     }
   }
+
 
   if (OB_FAIL(ret)) {
   } else if (need_calc_relevance()) {

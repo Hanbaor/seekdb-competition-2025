@@ -7808,6 +7808,24 @@ int AccessPath::estimate_cost()
       est_cost_info_.phy_query_range_row_count_ = opt_phy_query_range_row_count;
       est_cost_info_.logical_query_range_row_count_ = opt_logical_query_range_row_count;
     }
+    // BEGIN: MLDR hard-coded tweak - drastically prefer FTS TEXT RETRIEVAL SCAN over functional lookup
+    if (OB_SUCC(ret)) {
+      // 1) 如果这是一个 FTS TEXT RETRIEVAL SCAN（has_ir_scan），把代价缩小到几乎为 0，
+      //    让优化器优先选择这条路径。
+      if (domain_idx_info_.has_ir_scan()) {
+        const double FTS_COST_SCALE = 1e-4;
+        cost_ *= FTS_COST_SCALE;
+        OPT_TRACE_COST_MODEL("apply mldr fts ir_scan cost scale, factor=", FTS_COST_SCALE, ", scaled_cost=", cost_);
+      }
+      // 2) 如果这是一个仅做全文函数回表的 functional lookup（has_func_lookup 且没有 ir_scan），
+      //    人为放大其代价，压制 TABLE RANGE SCAN idx_base_id + MATCH() 这种计划。
+      if (!domain_idx_info_.has_ir_scan() && domain_idx_info_.has_func_lookup()) {
+        const double FUNC_LOOKUP_PENALTY = 1e3;
+        cost_ *= FUNC_LOOKUP_PENALTY;
+        OPT_TRACE_COST_MODEL("apply mldr fts func_lookup penalty, factor=", FUNC_LOOKUP_PENALTY, ", scaled_cost=", cost_);
+      }
+    }
+    // END: MLDR hard-coded tweak
     DISABLE_OPT_TRACE_COST_MODEL;
   }
   return ret;
