@@ -78,48 +78,18 @@ public:
   int64_t doc_count_;
 };
 
-// 前向声明
-class ObFTSTokenDocCache;
-
 /**
- * @brief 线程局部缓存
- */
-class ObFTSThreadLocalCache
-{
-public:
-  typedef common::hash::ObHashMap<common::ObString, ObTokenDocRange> TokenDocMap;
-  static const int64_t DEFAULT_BUCKET_COUNT = 10000;
-
-  ObFTSThreadLocalCache();
-  ~ObFTSThreadLocalCache();
-
-  int init();
-  void reset();
-  void destroy();
-  bool is_inited() const { return is_inited_; }
-
-  int add_token_doc_id(const common::ObString &token, int64_t doc_id);
-  int get_token_doc_range(const common::ObString &token, ObTokenDocRange &doc_range) const;
-
-  TokenDocMap &get_map() { return token_doc_map_; }
-  const TokenDocMap &get_map() const { return token_doc_map_; }
-
-private:
-  bool is_inited_;
-  TokenDocMap token_doc_map_;
-  common::ObArenaAllocator allocator_;
-};
-
-/**
- * @brief 全局缓存管理器
- * - 写入时：每个线程写自己的局部缓存（无锁）
- * - 查询时：遍历所有线程的局部缓存（有锁，但只在查询时）
+ * @brief 全局 FTS Token-Doc 缓存（单锁版本）
+ * - 单一全局 HashMap，禁用内部锁
+ * - 使用单一全局锁保护所有操作
  */
 class ObFTSTokenDocCache
 {
 public:
-  typedef common::hash::ObHashMap<common::ObString, ObTokenDocRange> TokenDocMap;
-  static const int64_t MAX_THREAD_CACHES = 256;
+  // 使用 NoPthreadDefendMode 禁用 HashMap 内部锁，由我们自己管理锁
+  typedef common::hash::ObHashMap<common::ObString, ObTokenDocRange,
+                                   common::hash::NoPthreadDefendMode> TokenDocMap;
+  static const int64_t DEFAULT_BUCKET_COUNT = 100000;
 
   static ObFTSTokenDocCache &get_instance();
 
@@ -128,13 +98,13 @@ public:
   void destroy();
 
   /**
-   * @brief 添加 token（写入线程局部缓存，无锁）
+   * @brief 添加 token 和 doc_id 到缓存（全局锁）
    */
   int add_token_doc_id(const common::ObString &token, int64_t doc_id);
   int add_token_doc_id(const common::ObString &token, const common::ObDatum &doc_id_datum);
 
   /**
-   * @brief 查询 token（遍历所有线程局部缓存）
+   * @brief 查询 token 的 doc_id 范围（全局锁）
    */
   int get_token_doc_range(const common::ObString &token, ObTokenDocRange &doc_range) const;
   bool contains_token(const common::ObString &token) const;
@@ -144,25 +114,19 @@ public:
   void print_statistics() const;
   int get_all_tokens(common::ObIArray<common::ObString> &tokens) const;
 
-  /**
-   * @brief 注册线程局部缓存（首次写入时自动调用）
-   */
-  int register_thread_local_cache(ObFTSThreadLocalCache *cache);
-
 private:
   ObFTSTokenDocCache();
   ~ObFTSTokenDocCache();
 
   int ensure_inited();
-  ObFTSThreadLocalCache *get_or_create_thread_local_cache();
 
 private:
   bool is_inited_;
+  TokenDocMap token_doc_map_;
+  common::ObArenaAllocator allocator_;
   
-  // 所有线程局部缓存的指针数组
-  ObFTSThreadLocalCache *thread_caches_[MAX_THREAD_CACHES];
-  int64_t thread_cache_count_;
-  mutable common::SpinRWLock registry_lock_;  // 只在注册/查询时用
+  // 单一全局锁保护所有操作
+  mutable common::SpinRWLock lock_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTSTokenDocCache);
 };

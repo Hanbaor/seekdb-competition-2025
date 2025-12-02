@@ -81,29 +81,31 @@
    return ret;
  }
  
- int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
-                                const ObDatum &doc_id_datum,
-                                const ObString &fulltext)
- {
-   int ret = OB_SUCCESS;
-   if (OB_UNLIKELY(!is_inited_)) {
-     ret = OB_NOT_INIT;
-     LOG_WARN("ObFTIndexRowCache hasn't be initialized", K(ret), K(is_inited_));
-   } else if (FALSE_IT(reuse())) {
-   } else if (OB_FAIL(ObDASDomainUtils::generate_fulltext_word_rows(merge_memctx_->get_arena_allocator(),
-                                                                    &helper_,
-                                                                    ft_obj_meta,
-                                                                    doc_id_datum,
-                                                                    fulltext,
-                                                                    is_fts_index_aux_,
-                                                                    rows_))) {
-     LOG_WARN("fail to generate fulltext word rows", K(ret), K(helper_), K(is_fts_index_aux_));
-   } else {
-     row_idx_ = 0;
-   }
-   LOG_TRACE("word segment", K(ret), K(row_idx_), K(rows_.count()), K(doc_id_datum), K(fulltext));
-   return ret;
- }
+int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
+                               const ObDatum &doc_id_datum,
+                               const ObString &fulltext,
+                               int64_t real_doc_id_for_cache /*= -1*/)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObFTIndexRowCache hasn't be initialized", K(ret), K(is_inited_));
+  } else if (FALSE_IT(reuse())) {
+  } else if (OB_FAIL(ObDASDomainUtils::generate_fulltext_word_rows(merge_memctx_->get_arena_allocator(),
+                                                                   &helper_,
+                                                                   ft_obj_meta,
+                                                                   doc_id_datum,
+                                                                   fulltext,
+                                                                   is_fts_index_aux_,
+                                                                   rows_,
+                                                                   real_doc_id_for_cache))) {
+    LOG_WARN("fail to generate fulltext word rows", K(ret), K(helper_), K(is_fts_index_aux_));
+  } else {
+    row_idx_ = 0;
+  }
+  LOG_TRACE("word segment", K(ret), K(row_idx_), K(rows_.count()), K(doc_id_datum), K(fulltext));
+  return ret;
+}
  
  int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
  {
@@ -305,13 +307,14 @@
    return ret;
  }
  
- /*static*/ int ObDASDomainUtils::generate_fulltext_word_rows(common::ObIAllocator &allocator,
-                                                              storage::ObFTParseHelper *helper,
-                                                              const common::ObObjMeta &ft_obj_meta,
-                                                              const ObDatum &doc_id_datum,
-                                                              const ObString &fulltext,
-                                                              const bool is_fts_index_aux,
-                                                              ObDomainIndexRow &word_rows)
+/*static*/ int ObDASDomainUtils::generate_fulltext_word_rows(common::ObIAllocator &allocator,
+                                                             storage::ObFTParseHelper *helper,
+                                                             const common::ObObjMeta &ft_obj_meta,
+                                                             const ObDatum &doc_id_datum,
+                                                             const ObString &fulltext,
+                                                             const bool is_fts_index_aux,
+                                                             ObDomainIndexRow &word_rows,
+                                                             int64_t real_doc_id_for_cache /*= -1*/)
  {
    int ret = OB_SUCCESS;
    static int64_t FT_WORD_DOC_COL_CNT = 4;
@@ -365,18 +368,17 @@
          rows[i].storage_datums_[word_cnt_idx].set_uint(word_cnt);
          rows[i].storage_datums_[doc_len_idx].set_uint(doc_length);
  
-         // 将token和doc_id添加到全局缓存中，用于测试标量+全文混合检索功能
-         // 仅在构建fts_index_aux时记录（避免重复记录）
-         if (is_fts_index_aux) {
-           const ObString &token_str = ft_word.get_word().get_string();
-           int cache_ret = FTS_TOKEN_DOC_CACHE.add_token_doc_id(token_str, doc_id_datum);
-           if (OB_UNLIKELY(OB_SUCCESS != cache_ret)) {
-             // 缓存失败不影响主流程，仅记录警告日志
-             LOG_WARN("fail to add token to cache, ignored", K(cache_ret), K(token_str), K(doc_id_datum));
-           } else {
-             //LOG_ERROR("token added to cache", K(token_str), K(doc_id_datum));
-           }
-         }
+        // 将token和doc_id添加到全局缓存中，用于查询优化
+        // 仅在构建fts_index_aux时记录（避免重复记录）
+        // 使用传入的 real_doc_id_for_cache（表的真实主键），如果没有传入则不写缓存
+        if (is_fts_index_aux && real_doc_id_for_cache >= 0) {
+          const ObString &token_str = ft_word.get_word().get_string();
+          int cache_ret = FTS_TOKEN_DOC_CACHE.add_token_doc_id(token_str, real_doc_id_for_cache);
+          if (OB_UNLIKELY(OB_SUCCESS != cache_ret)) {
+            // 缓存失败不影响主流程，仅记录警告日志
+            LOG_WARN("fail to add token to cache, ignored", K(cache_ret), K(token_str), K(real_doc_id_for_cache));
+          }
+        }
  
          if (OB_FAIL(word_rows.push_back(&rows[i]))) {
            LOG_WARN("fail to push back row", K(ret), K(rows[i]));

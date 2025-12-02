@@ -44,7 +44,8 @@ public:
       const bool is_fts_index_aux,
       const common::ObString &parser_name,
       const common::ObString &parser_properties);
-  int segment(const common::ObObjMeta &ft_obj_meta, const ObDatum &doc_id, const common::ObString &fulltext);
+  int segment(const common::ObObjMeta &ft_obj_meta, const ObDatum &doc_id, const common::ObString &fulltext,
+              int64_t real_doc_id_for_cache = -1);
   int get_next_row(blocksstable::ObDatumRow *&row);
   void reset();
   void reuse();
@@ -182,7 +183,8 @@ public:
                                          const ObDatum &doc_id_datum,
                                          const ObString &fulltext,
                                          const bool is_fts_index_aux,
-                                         ObDomainIndexRow &word_rows);
+                                         ObDomainIndexRow &word_rows,
+                                         int64_t real_doc_id_for_cache = -1);
   static int generate_multivalue_index_rows(
       ObIAllocator &allocator,
       const ObDASDMLBaseCtDef &das_ctdef,

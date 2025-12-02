@@ -797,12 +797,22 @@
    // 对于 WHERE id < 1000 的查询，可以直接跳过
    {
      ObTokenDocRange doc_range;
+     bool should_skip = false;
      if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(query_token, doc_range)) {
        if (doc_range.min_doc_id_ > 1000) {
          ret = OB_ITER_END;
-         LOG_INFO("skip token due to doc_id predicate", K(query_token), K(doc_range));
+         //LOG_INFO("[TOKEN IF SKIP]skip token due to doc_id predicate", K(query_token), K(doc_range));
+         should_skip = true;
          return ret;
        }
+       else{
+         //LOG_INFO("[TOKEN IF SKIP]token doc range found", K(query_token), K(doc_range));
+       }
+
+       if(should_skip){
+         return ret;
+       }
+       
      }
    }
    void *buf = nullptr;
