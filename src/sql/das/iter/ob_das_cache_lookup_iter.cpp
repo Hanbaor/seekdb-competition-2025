@@ -318,27 +318,27 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             }
           }
           if (OB_SUCC(ret) && storage_count > 0) {
-            if (OB_FAIL(add_rowkeys(storage_count))) {
-              LOG_WARN("failed to add row keys", K(ret));
-            } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(true, storage_count))) { // if need to project, save it
-              LOG_WARN("save index proj rows failed", K(ret));
-            } else {
-              // 只在 SCAN 迭代器时收集 doc_ids 用于缓存查询
-              const ObDASIterType iter_type = data_table_iter_->get_type();
-              if (iter_type == DAS_ITER_SCAN) {
-                ObEvalCtx::BatchInfoScopeGuard batch_guard(*eval_ctx_);
-                batch_guard.set_batch_size(storage_count);
-                for (int64_t i = 0; OB_SUCC(ret) && i < storage_count; ++i) {
-                  batch_guard.set_batch_idx(i);
-                  if (rowkey_exprs_.count() > 0) {
-                    ObDatum &doc_id_datum = rowkey_exprs_.at(0)->locate_expr_datum(*eval_ctx_);
-                    uint64_t doc_id = doc_id_datum.get_uint64();
-                    if (OB_FAIL(cached_doc_ids_.push_back(doc_id))) {
-                      LOG_WARN("failed to push doc_id", K(ret), K(doc_id));
-                    }
-                  }
+            // 在 add_rowkeys 之前收集 doc_ids（仅 SCAN 迭代器）
+            const ObDASIterType iter_type = data_table_iter_->get_type();
+            if (iter_type == DAS_ITER_SCAN && rowkey_exprs_.count() > 0) {
+              ObEvalCtx::BatchInfoScopeGuard batch_guard(*eval_ctx_);
+              batch_guard.set_batch_size(storage_count);
+              for (int64_t i = 0; OB_SUCC(ret) && i < storage_count; ++i) {
+                batch_guard.set_batch_idx(i);
+                ObDatum &doc_id_datum = rowkey_exprs_.at(0)->locate_expr_datum(*eval_ctx_);
+                uint64_t doc_id = doc_id_datum.get_uint64();
+                if (OB_FAIL(cached_doc_ids_.push_back(doc_id))) {
+                  LOG_WARN("failed to push doc_id", K(ret), K(doc_id));
                 }
               }
+            }
+            
+            if (OB_FAIL(ret)) {
+            } else if (OB_FAIL(add_rowkeys(storage_count))) {
+              LOG_WARN("failed to add row keys", K(ret));
+            } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(true, storage_count))) {
+              LOG_WARN("save index proj rows failed", K(ret));
+            } else {
               lookup_rowkey_cnt_ += storage_count;
             } 
           }
