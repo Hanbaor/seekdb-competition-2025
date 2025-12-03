@@ -416,9 +416,7 @@
         }
       };
 
-        LOG_INFO("FTS_CACHE_TRACE", "event", "data_iter_entry",
-                 "iter_type", iter_type_to_str(data_table_iter_->get_type()),
-                 K(total_doc_ids), K(cache_available));
+        const ObDASIterType iter_type = data_table_iter_->get_type();
          
          bool all_cache_hit = false;
          int64_t cache_fill_count = 0;
@@ -521,36 +519,37 @@
                  }
                }
                
-              // ========== 缓存命中后的正确处理 ==========
-              // 关键发现：不能直接调用 func_data_iter->get_next_rows()！
-              // 
-              // 原因：ObDASFuncDataIter::doc_ids_ 是在 ObDASFuncLookupIter 的内部
-              // INDEX_SCAN 阶段通过 add_rowkey() -> set_scan_rowkey() 填充的。
-              // 如果直接调用 func_data_iter->get_next_rows()，会跳过这个流程，
-              // 导致 doc_ids_ 为空，tr_merge_iters_ 没有正确的范围键！
-              // 
-              // 正确做法：设置 skip_main_lookup_ 标志，然后走正常的 data_table_iter_->get_next_rows()
-              // 这样 ObDASFuncLookupIter 会正确执行内部流程填充 doc_ids_，
-              // 最终在 ObDASFuncDataIter::inner_get_next_rows() 中跳过主表回表。
-              
-              ObDASFuncDataIter *func_data_iter = nullptr;
-              if (data_table_iter_->get_type() == DAS_ITER_FUNC_LOOKUP) {
-                ObDASFuncLookupIter *func_lookup_iter = static_cast<ObDASFuncLookupIter*>(data_table_iter_);
-                func_data_iter = func_lookup_iter->get_func_data_iter();
-              } else if (data_table_iter_->get_type() == DAS_ITER_FUNC_DATA) {
-                func_data_iter = static_cast<ObDASFuncDataIter*>(data_table_iter_);
-              }
-              
-              if (OB_NOT_NULL(func_data_iter)) {
-                // 设置标志，让后续的 ObDASFuncDataIter::inner_get_next_rows() 跳过主表回表
-                func_data_iter->set_skip_main_lookup(true);
-                LOG_INFO("CACHE_HIT_OPTIMIZED", "event", "set_skip_flag_before_normal_flow",
-                         K(cache_fill_count), "iter_type", static_cast<int>(data_table_iter_->get_type()));
-              }
-              
-              // 强制走正常流程，但 main_lookup 会在最终执行时被跳过
-              all_cache_hit = false;
-            }
+               if (scan_cache_candidate) {
+                 if (need_index_proj && index_proj_rows_.have_data() &&
+                     OB_FAIL(index_proj_rows_.to_expr(cache_fill_count))) {
+                   LOG_WARN("failed to convert store row to expr after cache hit", K(ret));
+                 } else {
+                   count = cache_fill_count;
+                   get_next_rows = true;
+                   lookup_row_cnt_ += count;
+                   LOG_INFO("CACHE_HIT_OPTIMIZED", "event", "skip_scan_iter_lookup",
+                            K(cache_fill_count), "iter_type", "SCAN",
+                            "data_filled", true, "evaluated_set", true);
+                 }
+               } else if (func_cache_candidate) {
+                 // 对 FUNC_* 类型，仅设置 skip_main_lookup_ 标志，后续仍走正常流程
+                 ObDASFuncDataIter *func_data_iter = nullptr;
+                 if (iter_type == DAS_ITER_FUNC_LOOKUP) {
+                   auto *func_lookup_iter = static_cast<ObDASFuncLookupIter*>(data_table_iter_);
+                   func_data_iter = func_lookup_iter->get_func_data_iter();
+                 } else if (iter_type == DAS_ITER_FUNC_DATA) {
+                   func_data_iter = static_cast<ObDASFuncDataIter*>(data_table_iter_);
+                 }
+
+                 if (OB_NOT_NULL(func_data_iter)) {
+                   func_data_iter->set_skip_main_lookup(true);
+                   LOG_INFO("CACHE_HIT_OPTIMIZED", "event", "set_skip_flag_before_normal_flow",
+                            K(cache_fill_count), "iter_type", static_cast<int>(iter_type));
+                 }
+
+                 all_cache_hit = false;
+               }
+             }
           }
         }
         
