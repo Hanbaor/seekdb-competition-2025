@@ -489,9 +489,6 @@
                    // 整数列 → 填充 id
                    datum.set_uint(fields.id_);
                  } else if (ob_is_string_type(col_type)) {
-                   // 字符串列：按顺序分配
-                   // 第1个字符串列 -> docid_col
-                   // 第2个字符串列 -> base_id
                    ObString src;
                    if (string_col_index == 0) {
                      src = fields.base_id_;
