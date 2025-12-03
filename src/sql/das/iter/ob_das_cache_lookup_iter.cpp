@@ -21,6 +21,7 @@
  #include "sql/engine/ob_exec_context.h"
  #include "sql/das/ob_das_ir_define.h"
  #include "storage/concurrency_control/ob_data_validation_service.h"
+ #include "lib/string/ob_sql_string.h"
  
  #include "sql/das/ob_fts_scalar_cache.h"
  
@@ -390,6 +391,30 @@
         int64_t total_doc_ids = cached_doc_ids_.count();
         const bool cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
         const int64_t output_col_count = OB_NOT_NULL(lookup_ctdef) ? lookup_ctdef->result_output_.count() : 0;
+        static bool logged_result_output = false;
+        logged_result_output = true;
+        ObSqlString column_desc;
+        for (int64_t idx = 0; idx < output_col_count; ++idx) {
+          ObExpr *expr = lookup_ctdef->result_output_.at(idx);
+          int tmp_ret = OB_SUCCESS;
+          if (OB_NOT_NULL(expr)) {
+            tmp_ret = column_desc.append_fmt("%s%ld:%d:%d",
+                                             column_desc.length() == 0 ? "" : "|",
+                                             idx,
+                                             expr->datum_meta_.type_,
+                                             expr->obj_meta_.get_type());
+          } else {
+            tmp_ret = column_desc.append_fmt("%s%ld:-1:-1",
+                                             column_desc.length() == 0 ? "" : "|",
+                                             idx);
+          }
+          if (OB_FAIL(tmp_ret)) {
+            LOG_WARN("failed to format column desc", K(tmp_ret));
+            column_desc.reset();
+            break;
+          }
+        }
+        LOG_INFO("CACHE_RESULT_OUTPUT_INFO", K(output_col_count), "columns", column_desc.ptr());
         const ObDASIterType iter_type = data_table_iter_->get_type();
         const bool can_try_cache = cache_available && total_doc_ids > 0 && OB_NOT_NULL(lookup_ctdef);
         const bool scan_cache_candidate = can_try_cache && iter_type == DAS_ITER_SCAN;
@@ -452,10 +477,7 @@
                  break;
                }
                
-               // 遍历输出列，填充数据到 datum[i]
-               // 根据日志分析，回表只返回 2 列：
-               //   col_idx=0: 整数列 (id)
-               //   col_idx=1: 字符串列 (docid_col，值为 "doc-en-XXXX")
+               int string_col_index = 0; // 记录当前是第几个字符串列
                for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
                  if (OB_ISNULL(col_datums[j])) continue;
                  
@@ -467,12 +489,17 @@
                    // 整数列 → 填充 id
                    datum.set_uint(fields.id_);
                  } else if (ob_is_string_type(col_type)) {
-                   // 字符串列 → 填充 docid_col
-                   ObString src = fields.docid_col_;
+                   // 字符串列：按顺序分配
+                   // 第1个字符串列 -> docid_col
+                   // 第2个字符串列 -> base_id
+                   ObString src;
+                   if (string_col_index == 0) {
+                     src = fields.base_id_;
+                   } else if (string_col_index == 1) {
+                     src = fields.docid_col_;
+                   }
                    
-                   if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
-                     // 向量化执行中，需要为每行分配独立的内存
-                     // 使用 eval_ctx_ 的 frame 内存
+                   if (src.length() > 0) {
                      char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
                      if (OB_ISNULL(buf)) {
                        ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -484,6 +511,7 @@
                    } else {
                      datum.set_string(nullptr, 0);
                    }
+                   string_col_index++;
                  }
                }
              }
@@ -509,24 +537,25 @@
                             K(cache_fill_count), "iter_type", "SCAN",
                             "data_filled", true, "evaluated_set", true);
                  }
-               } else {
-                 // 对 FUNC_* 类型，仅设置 skip_main_lookup_ 标志，后续仍走正常流程
-                 ObDASFuncDataIter *func_data_iter = nullptr;
-                 if (iter_type == DAS_ITER_FUNC_LOOKUP) {
-                   auto *func_lookup_iter = static_cast<ObDASFuncLookupIter*>(data_table_iter_);
-                   func_data_iter = func_lookup_iter->get_func_data_iter();
-                 } else if (iter_type == DAS_ITER_FUNC_DATA) {
-                   func_data_iter = static_cast<ObDASFuncDataIter*>(data_table_iter_);
-                 }
+               } 
+              //  else {
+              //    // 对 FUNC_* 类型，仅设置 skip_main_lookup_ 标志，后续仍走正常流程
+              //    ObDASFuncDataIter *func_data_iter = nullptr;
+              //    if (iter_type == DAS_ITER_FUNC_LOOKUP) {
+              //      auto *func_lookup_iter = static_cast<ObDASFuncLookupIter*>(data_table_iter_);
+              //      func_data_iter = func_lookup_iter->get_func_data_iter();
+              //    } else if (iter_type == DAS_ITER_FUNC_DATA) {
+              //      func_data_iter = static_cast<ObDASFuncDataIter*>(data_table_iter_);
+              //    }
 
-                 if (OB_NOT_NULL(func_data_iter)) {
-                   func_data_iter->set_skip_main_lookup(true);
-                   LOG_INFO("CACHE_HIT_OPTIMIZED", "event", "set_skip_flag_before_normal_flow",
-                            K(cache_fill_count), "iter_type", static_cast<int>(iter_type));
-                 }
+              //    if (OB_NOT_NULL(func_data_iter)) {
+              //      func_data_iter->set_skip_main_lookup(true);
+              //      LOG_INFO("CACHE_HIT_OPTIMIZED", "event", "set_skip_flag_before_normal_flow",
+              //               K(cache_fill_count), "iter_type", static_cast<int>(iter_type));
+              //    }
 
-                 all_cache_hit = false;
-               }
+              //    all_cache_hit = false;
+              //  }
              }
           }
         }
