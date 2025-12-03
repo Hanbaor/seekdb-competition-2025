@@ -390,38 +390,16 @@
         int64_t total_doc_ids = cached_doc_ids_.count();
         const bool cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
         const int64_t output_col_count = OB_NOT_NULL(lookup_ctdef) ? lookup_ctdef->result_output_.count() : 0;
-
-        auto iter_type_to_str = [](ObDASIterType type) -> const char * {
-        switch (type) {
-          case ObDASIterType::DAS_ITER_INVALID: return "INVALID";
-          case ObDASIterType::DAS_ITER_SCAN: return "SCAN";
-          case ObDASIterType::DAS_ITER_MERGE: return "MERGE";
-          case ObDASIterType::DAS_ITER_GROUP_FOLD: return "GROUP_FOLD";
-          case ObDASIterType::DAS_ITER_LOCAL_LOOKUP: return "LOCAL_LOOKUP";
-          case ObDASIterType::DAS_ITER_GLOBAL_LOOKUP: return "GLOBAL_LOOKUP";
-          case ObDASIterType::DAS_ITER_TEXT_RETRIEVAL: return "TEXT_RETRIEVAL";
-          case ObDASIterType::DAS_ITER_SORT: return "SORT";
-          case ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE: return "TR_MERGE";
-          case ObDASIterType::DAS_ITER_INDEX_MERGE: return "INDEX_MERGE";
-          case ObDASIterType::DAS_ITER_FUNC_LOOKUP: return "FUNC_LOOKUP";
-          case ObDASIterType::DAS_ITER_FUNC_DATA: return "FUNC_DATA";
-          case ObDASIterType::DAS_ITER_MVI_LOOKUP: return "MVI_LOOKUP";
-          case ObDASIterType::DAS_ITER_HNSW_SCAN: return "HNSW_SCAN";
-          case ObDASIterType::DAS_ITER_DOMAIN_ID_MERGE: return "DOMAIN_ID_MERGE";
-          case ObDASIterType::DAS_ITER_IVF_SCAN: return "IVF_SCAN";
-          case ObDASIterType::DAS_ITER_SPIV_MERGE: return "SPIV_MERGE";
-          case ObDASIterType::DAS_ITER_SPIV_SCAN: return "SPIV_SCAN";
-          case ObDASIterType::DAS_ITER_ES_MATCH: return "ES_MATCH";
-          default: return "UNKNOWN";
-        }
-      };
-
         const ObDASIterType iter_type = data_table_iter_->get_type();
+        const bool can_try_cache = cache_available && total_doc_ids > 0 && OB_NOT_NULL(lookup_ctdef);
+        const bool scan_cache_candidate = can_try_cache && iter_type == DAS_ITER_SCAN;
+        const bool func_cache_candidate = can_try_cache &&
+            (iter_type == DAS_ITER_FUNC_LOOKUP || iter_type == DAS_ITER_FUNC_DATA);
          
          bool all_cache_hit = false;
          int64_t cache_fill_count = 0;
          
-         if (cache_available && total_doc_ids > 0 && OB_NOT_NULL(lookup_ctdef)) {
+         if (scan_cache_candidate || func_cache_candidate) {
            // 检查是否所有 doc_id 都在缓存中
            all_cache_hit = true;
            for (int64_t i = 0; i < total_doc_ids && all_cache_hit; ++i) {
@@ -519,7 +497,7 @@
                  }
                }
                
-               if (scan_cache_candidate) {
+               if (iter_type == DAS_ITER_SCAN) {
                  if (need_index_proj && index_proj_rows_.have_data() &&
                      OB_FAIL(index_proj_rows_.to_expr(cache_fill_count))) {
                    LOG_WARN("failed to convert store row to expr after cache hit", K(ret));
@@ -531,7 +509,7 @@
                             K(cache_fill_count), "iter_type", "SCAN",
                             "data_filled", true, "evaluated_set", true);
                  }
-               } else if (func_cache_candidate) {
+               } else {
                  // 对 FUNC_* 类型，仅设置 skip_main_lookup_ 标志，后续仍走正常流程
                  ObDASFuncDataIter *func_data_iter = nullptr;
                  if (iter_type == DAS_ITER_FUNC_LOOKUP) {
