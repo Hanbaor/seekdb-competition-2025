@@ -513,6 +513,7 @@ int ObDASTRMergeIter::create_sparse_retrieval_iter()
   }
   if (OB_FAIL(ret)) {
   } else if (topk_mode_) {
+    LOG_INFO("FTS: Using BMW (topk_mode) for text retrieval", K_(topk_mode), K_(function_lookup_mode));
     ObTextDaaTParam iter_param;
     ObTextBMWIter *bmw_iter = nullptr;
     if (OB_FAIL(init_daat_iter_param(iter_param))) {
@@ -526,6 +527,7 @@ int ObDASTRMergeIter::create_sparse_retrieval_iter()
       sparse_retrieval_iter_ = bmw_iter;
     }
   } else if (daat_mode_) {
+    LOG_INFO("FTS: Using DAAT (daat_mode) for text retrieval", K_(daat_mode), K_(function_lookup_mode), K_(topk_mode));
     ObTextDaaTParam iter_param;
     ObTextDaaTIter *daat_iter = nullptr;
     if (OB_FAIL(init_daat_iter_param(iter_param))) {
@@ -557,10 +559,9 @@ int ObDASTRMergeIter::create_sparse_retrieval_iter()
   }
   if (OB_SUCC(ret) && function_lookup_mode_) {
     ObSRLookupIter *lookup_iter = nullptr;
-    if (OB_UNLIKELY(topk_mode_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected both topk mode and function lookup mode", K(ret));
-    } else if (daat_mode_) {
+    // 允许 topk_mode + function_lookup_mode：BMW 剪枝 + 缓存回表
+    // topk_mode 同时设置了 daat_mode，使用 sorted lookup iter
+    if (topk_mode_ || daat_mode_) {
       if (OB_ISNULL(lookup_iter = OB_NEWx(ObSRSortedLookupIter, &myself_allocator_))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("failed to allocate memory for sorted lookup iter", K(ret));

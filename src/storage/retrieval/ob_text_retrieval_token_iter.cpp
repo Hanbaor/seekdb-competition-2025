@@ -627,9 +627,37 @@ int ObTextRetrievalTokenIter::estimate_token_doc_cnt()
   const int64_t timeout_us = THIS_WORKER.get_timeout_remain();
   ObAccessService *access_service = NULL;
   storage::ObTableScanRange table_scan_range;
+  
+  // MLDR: 限制扫描范围到 doc_id < 1000
+  // 复制原始范围并修改 end_key 的 doc_id 部分
+  const int64_t MLDR_DOC_ID_LIMIT = 1000;
+  ObNewRange original_range = inv_idx_agg_param_->key_ranges_.at(0);
+  ObNewRange limited_range;
+  limited_range.table_id_ = original_range.table_id_;
+  limited_range.border_flag_ = original_range.border_flag_;
+  
+  // 分配新的 key 存储空间 (2 列: token, doc_id)
+  ObObj *start_objs = static_cast<ObObj*>(allocator.alloc(sizeof(ObObj) * 2));
+  ObObj *end_objs = static_cast<ObObj*>(allocator.alloc(sizeof(ObObj) * 2));
+  if (OB_ISNULL(start_objs) || OB_ISNULL(end_objs)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate memory for range keys", K(ret));
+  } else {
+    // 复制 start_key (token, MIN)
+    start_objs[0] = *original_range.start_key_.get_obj_ptr();  // token
+    start_objs[1] = *(original_range.start_key_.get_obj_ptr() + 1);  // MIN doc_id
+    limited_range.start_key_.assign(start_objs, 2);
+    
+    // 修改 end_key (token, 999) - 限制 doc_id < 1000
+    end_objs[0] = *original_range.end_key_.get_obj_ptr();  // token
+    end_objs[1].set_uint64(MLDR_DOC_ID_LIMIT - 1);  // doc_id = 999
+    limited_range.end_key_.assign(end_objs, 2);
+    limited_range.border_flag_.set_inclusive_end();  // 包含 999
+  }
+  
   ObSimpleBatch batch;
   batch.type_ = ObSimpleBatch::T_SCAN;
-  batch.range_ = &inv_idx_agg_param_->key_ranges_.at(0);
+  batch.range_ = &limited_range;
   ObTableScanParam est_param;
   est_param.index_id_ = inv_idx_agg_param_->index_id_;
   est_param.scan_flag_ = inv_idx_agg_param_->scan_flag_;
@@ -638,7 +666,9 @@ int ObTextRetrievalTokenIter::estimate_token_doc_cnt()
   est_param.tx_id_ = inv_idx_agg_param_->tx_id_;
   est_param.schema_version_ = inv_idx_agg_param_->schema_version_;
   est_param.frozen_version_ = GET_BATCH_ROWS_READ_SNAPSHOT_VERSION;
-  if (OB_ISNULL(access_service = MTL(ObAccessService *))) {
+  if (OB_FAIL(ret)) {
+    // 内存分配失败，跳过估计
+  } else if (OB_ISNULL(access_service = MTL(ObAccessService *))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret), K(access_service));
   } else if (OB_FAIL(table_scan_range.init(*inv_idx_agg_param_, batch, allocator))) {
@@ -653,20 +683,8 @@ int ObTextRetrievalTokenIter::estimate_token_doc_cnt()
   } else {
     token_doc_cnt_ = logical_row_cnt;
     token_doc_cnt_calculated_ = true;
-    sql::ObExpr *total_doc_cnt_param_expr = relevance_expr_->args_[sql::ObExprBM25::TOTAL_DOC_CNT_PARAM_IDX];
-    if (OB_ISNULL(total_doc_cnt_param_expr)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null total doc cnt expr", K(ret));
-    } else {
-      int64_t total_doc_cnt = 0;
-      if (total_doc_cnt_param_expr->enable_rich_format()
-          && is_valid_format(total_doc_cnt_param_expr->get_format(*eval_ctx_))) {
-        total_doc_cnt = total_doc_cnt_param_expr->get_vector(*eval_ctx_)->get_int(0);
-      } else {
-        total_doc_cnt = total_doc_cnt_param_expr->locate_expr_datum(*eval_ctx_, 0).get_int();
-      }
-      max_token_relevance_ = sql::ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt);
-    }
+    // MLDR: 使用硬编码的 1000 作为总文档数，与扫描范围一致
+    max_token_relevance_ = sql::ObExprBM25::query_token_weight(token_doc_cnt_, MLDR_DOC_ID_LIMIT);
   }
   return ret;
 }

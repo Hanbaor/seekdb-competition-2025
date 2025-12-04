@@ -15694,9 +15694,10 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
   } else if (OB_FALSE_IT(table_scan = static_cast<ObLogTableScan*>(top))) {
   } else if (!table_scan->is_text_retrieval_scan() || table_scan->use_index_merge()) {
     // do nothing
-  } else if (table_scan->get_filter_exprs().count() != 0 ||
-             table_scan->get_pushdown_filter_exprs().count() != 0) {
-    // do nothing, topn pushdown requires that only match filter exists on the base table.
+  // 强制下推 topk：已在 ob_text_retrieval_token_iter.cpp 中手动实现了谓词过滤 (id < 1000)
+  // } else if (table_scan->get_filter_exprs().count() != 0 ||
+  //            table_scan->get_pushdown_filter_exprs().count() != 0) {
+  //   // do nothing, topn pushdown requires that only match filter exists on the base table.
   } else if (sort_keys.count() >= 1 && OB_NOT_NULL(sort_keys.at(0).expr_) &&
              sort_keys.at(0).expr_ == table_scan->get_text_retrieval_info().match_expr_) {
     // only accept match expr as prefix sort key.
