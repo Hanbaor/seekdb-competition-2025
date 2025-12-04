@@ -538,7 +538,8 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         }
         
         // 清理 doc_ids 缓存，准备下一批次
-        cached_doc_ids_.reuse();
+        // 注意：使用 clear() 而不是 reuse()，因为 reuse() 会重置初始化状态
+        cached_doc_ids_.clear();
         
         // === 状态转换 ===
         if (OB_SUCC(ret) && all_cache_hit && get_next_rows) {

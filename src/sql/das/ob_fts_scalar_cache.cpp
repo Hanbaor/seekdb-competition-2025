@@ -84,9 +84,9 @@ int ObFtsScalarCache::add_mapping(uint64_t doc_id,
       }
     }
     
-    // 插入到 HashMap
+    // 插入到 HashMap（使用覆盖模式，避免重复插入失败）
     if (OB_SUCC(ret)) {
-      if (OB_FAIL(mapping_.set_refactored(doc_id, fields))) {
+      if (OB_FAIL(mapping_.set_refactored(doc_id, fields, 1 /*overwrite*/))) {
         LOG_WARN("failed to add mapping to hash map", K(ret), K(doc_id), K(fields));
       } else {
         LOG_DEBUG("added mapping", K(doc_id), K(fields));
