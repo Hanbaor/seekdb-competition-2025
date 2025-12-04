@@ -94,7 +94,8 @@ public:
       store_allocator_("SqlCacheLookup", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID),
       index_proj_rows_(),
       cached_doc_ids_(store_allocator_),
-      cached_results_(store_allocator_)
+      cached_results_(store_allocator_),
+      cache_hit_(false)
   {}
   virtual ~ObDASCacheLookupIter() {}
 
@@ -106,6 +107,7 @@ protected:
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;
   virtual void reset_lookup_state() override;
+  void reset_lookup_state_internal(bool skip_data_iter_reuse);
   
   // 在 add_rowkeys 过程中同时收集 doc_id
   int add_rowkeys_and_collect(int64_t count);
@@ -116,6 +118,7 @@ private:
   IndexProjRowStore index_proj_rows_;
   common::ObFixedArray<uint64_t, common::ObIAllocator> cached_doc_ids_;
   common::ObFixedArray<ScalarFields, common::ObIAllocator> cached_results_;
+  bool cache_hit_;  // 标记当前批次是否缓存全命中，用于跳过 data_table_iter_
 };
 
 }  // namespace sql
