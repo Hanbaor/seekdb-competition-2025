@@ -7813,7 +7813,7 @@ int AccessPath::estimate_cost()
       // 1) 如果这是一个 FTS TEXT RETRIEVAL SCAN（has_ir_scan），把代价缩小到几乎为 0，
       //    让优化器优先选择这条路径。
       if (domain_idx_info_.has_ir_scan()) {
-        const double FTS_COST_SCALE = 1e-4;
+        const double FTS_COST_SCALE = 0;
         cost_ *= FTS_COST_SCALE;
         OPT_TRACE_COST_MODEL("apply mldr fts ir_scan cost scale, factor=", FTS_COST_SCALE, ", scaled_cost=", cost_);
       }

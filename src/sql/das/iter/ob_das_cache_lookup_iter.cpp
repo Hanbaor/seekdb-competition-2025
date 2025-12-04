@@ -265,6 +265,7 @@ int ObDASCacheLookupIter::inner_get_next_row()
                 LOG_WARN("failed to push back doc id", K(ret));
               }
             }
+            
             if (OB_SUCC(ret) && OB_FAIL(ObDASLocalLookupIter::add_rowkey())) {
               LOG_WARN("failed to add row key", K(ret));
             } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(false, 1))) {
@@ -344,6 +345,8 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         reset_lookup_state();
         int64_t storage_count = 0;
         int64_t index_capacity = 0;
+        
+        // 先收集所有数据，包括 index_proj_rows_
         while (OB_SUCC(ret) && !index_end_ && lookup_rowkey_cnt_ < default_batch_row_count_) {
           storage_count = 0;
           index_capacity = std::min(capacity, std::min(max_size_, default_batch_row_count_ - lookup_rowkey_cnt_));
@@ -359,20 +362,38 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             }
           }
           if (OB_SUCC(ret) && storage_count > 0) {
-            // 在 add_rowkeys 过程中同时收集 doc_ids（使用正确的 batch_idx）
+            // 在 add_rowkeys 过程中同时收集 doc_ids
             if (OB_FAIL(add_rowkeys_and_collect(storage_count))) {
               LOG_WARN("failed to add row keys and collect", K(ret));
             } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(true, storage_count))) {
               LOG_WARN("save index proj rows failed", K(ret));
             } else {
               lookup_rowkey_cnt_ += storage_count;
-            } 
+            }
+          }
+        }
+
+        // 收集完毕后，统一检查缓存命中
+        bool will_cache_hit = false;
+        if (OB_SUCC(ret) && lookup_rowkey_cnt_ > 0 && g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0) {
+          will_cache_hit = true;
+          for (int64_t i = 0; i < cached_doc_ids_.count(); ++i) {
+            uint64_t doc_id = cached_doc_ids_.at(i);
+            ScalarFields tmp_fields;
+            if (OB_SUCCESS != g_fts_scalar_cache.get_scalar_fields(doc_id, tmp_fields)) {
+              will_cache_hit = false;
+              break;
+            }
           }
         }
 
         if (OB_SUCC(ret)) {
           if (OB_LIKELY(lookup_rowkey_cnt_ > 0)) {
-            state_ = DO_LOOKUP;
+            if (will_cache_hit) {
+              state_ = OUTPUT_ROWS;  // 全部缓存命中，跳过回表
+            } else {
+              state_ = DO_LOOKUP;
+            }
           } else {
             state_ = FINISHED;
           }
