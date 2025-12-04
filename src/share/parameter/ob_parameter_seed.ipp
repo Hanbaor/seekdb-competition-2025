@@ -399,7 +399,7 @@ DEF_BOOL(_rowsets_enabled, OB_CLUSTER_PARAMETER, "True",
 DEF_INT(_rowsets_target_maxsize, OB_CLUSTER_PARAMETER, "524288", "[262144, 8388608]",
         "the size of the memory reserved for vectorized sql engine. Range: [262144, 8388608]",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_INT(_rowsets_max_rows, OB_CLUSTER_PARAMETER, "256", "[0, 65535]",
+DEF_INT(_rowsets_max_rows, OB_CLUSTER_PARAMETER, "1024", "[0, 65535]",
         "the row number processed by vectorized sql engine within one batch. Range: [0, 65535]",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_STR_WITH_CHECKER(_ctx_memory_limit, OB_CLUSTER_PARAMETER, "",

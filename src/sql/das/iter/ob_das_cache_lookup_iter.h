@@ -106,6 +106,9 @@ protected:
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;
   virtual void reset_lookup_state() override;
+  
+  // 在 add_rowkeys 过程中同时收集 doc_id
+  int add_rowkeys_and_collect(int64_t count);
 
 private:
   // for store rows
