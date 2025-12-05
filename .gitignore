@@ -417,3 +417,5 @@ perf-analysis.txt
 perf-manual.data
 perf-manual.data.old
 mldr-test-main
+bm25s-main
+pisa-main
