@@ -20,6 +20,7 @@
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
 #include "sql/das/ob_fts_scalar_cache.h"  // ← 新增：HashMap支持
+#include "sql/das/ob_fts_token_doc_cache.h"
 
 namespace oceanbase
 {
@@ -711,6 +712,29 @@ int ObDASTextRetrievalIter::reuse_fwd_idx_iter()
 int ObDASTextRetrievalIter::gen_default_inv_idx_scan_range(const ObString &query_token, ObNewRange &scan_range)
 {
   int ret = OB_SUCCESS;
+  // 基于 token-doc_id 缓存的跳过优化
+  // 如果 token 的 min_doc_id > 1000，说明该 token 的所有文档 id 都 > 1000
+  // 对于 WHERE id < 1000 的查询，可以直接跳过
+  {
+    ObTokenDocRange doc_range;
+    bool should_skip = false;
+    if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(query_token, doc_range)) {
+      if (doc_range.min_doc_id_ > 1000) {
+        ret = OB_ITER_END;
+        //LOG_INFO("[TOKEN IF SKIP]skip token due to doc_id predicate", K(query_token), K(doc_range));
+        should_skip = true;
+        return ret;
+      }
+      else{
+        //LOG_INFO("[TOKEN IF SKIP]token doc range found", K(query_token), K(doc_range));
+      }
+
+      if(should_skip){
+        return ret;
+      }
+      
+    }
+  }
   void *buf = nullptr;
   ObObj *obj_ptr = nullptr;
   common::ObArenaAllocator &ctx_alloc = mem_context_->get_arena_allocator();

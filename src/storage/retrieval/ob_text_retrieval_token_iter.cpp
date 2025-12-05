@@ -19,6 +19,7 @@
 #include "ob_text_retrieval_token_iter.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
+#include "sql/das/ob_fts_token_doc_cache.h"
 
 namespace oceanbase
 {
@@ -524,6 +525,29 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
 int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::ObArenaAllocator &allocator)
 {
   int ret = OB_SUCCESS;
+  // 基于 token-doc_id 缓存的跳过优化
+  // 如果 token 的 min_doc_id > 1000，说明该 token 的所有文档 id 都 > 1000
+  // 对于 WHERE id < 1000 的查询，可以直接跳过
+  {
+    sql::ObTokenDocRange doc_range;
+    bool should_skip = false;
+    if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(token, doc_range)) {
+      if (doc_range.min_doc_id_ > 1000) {
+        ret = OB_ITER_END;
+        //LOG_INFO("[TOKEN IF SKIP]skip token due to doc_id predicate", K(token), K(doc_range));
+        should_skip = true;
+        return ret;
+      }
+      else{
+        //LOG_INFO("[TOKEN IF SKIP]token doc range found", K(token), K(doc_range));
+      }
+
+      if(should_skip){
+        return ret;
+      }
+      
+    }
+  }
   if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected key range count", K(ret), K(inv_idx_agg_param_->key_ranges_.count()));
