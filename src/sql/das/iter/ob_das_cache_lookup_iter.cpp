@@ -193,9 +193,27 @@ int ObDASCacheLookupIter::inner_release()
 
 void ObDASCacheLookupIter::reset_lookup_state()
 {
-  ObDASLookupIter::reset_lookup_state();
+  reset_lookup_state_internal(false);
+}
+
+void ObDASCacheLookupIter::reset_lookup_state_internal(bool skip_data_iter_reuse)
+{
+  // 重置基本状态，但可选跳过 data_table_iter_->reuse()
+  lookup_row_cnt_ = 0;
+  lookup_rowkey_cnt_ = 0;
+  index_end_ = false;
+  state_ = LookupState::INDEX_SCAN;
+  cache_hit_ = false;  // 重置缓存命中标志
+  
+  // 只在需要回表时才 reuse data_table_iter_，避免不必要的存储层操作
+  if (!skip_data_iter_reuse && OB_NOT_NULL(data_table_iter_)) {
+    data_table_iter_->reuse();
+  }
+  if (OB_NOT_NULL(lookup_memctx_)) {
+    lookup_memctx_->reset_remain_one_page();
+  }
+  
   index_proj_rows_.reuse();
-  // 不使用 reuse()，因为它会重置初始化状态
   // 使用 clear() 清空数据但保持初始化状态
   if (cached_doc_ids_.count() > 0) {
     cached_doc_ids_.clear();
@@ -342,7 +360,7 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   do {
     switch (state_) {
       case INDEX_SCAN: {
-        reset_lookup_state();
+        reset_lookup_state();  // 正常重置，包含 data_table_iter_->reuse()
         int64_t storage_count = 0;
         int64_t index_capacity = 0;
         
@@ -390,8 +408,10 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         if (OB_SUCC(ret)) {
           if (OB_LIKELY(lookup_rowkey_cnt_ > 0)) {
             if (will_cache_hit) {
+              cache_hit_ = true;  // 标记缓存命中，跳过 data_table_iter_
               state_ = OUTPUT_ROWS;  // 全部缓存命中，跳过回表
             } else {
+              cache_hit_ = false;
               state_ = DO_LOOKUP;
             }
           } else {
@@ -412,130 +432,101 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
 
       case OUTPUT_ROWS: {
         count = 0;
-        data_table_iter_->clear_evaluated_flag();
         
         const ObDASScanCtDef *lookup_ctdef = static_cast<const ObDASScanCtDef*>(lookup_ctdef_);
         int64_t total_doc_ids = cached_doc_ids_.count();
-        const bool cache_inited = g_fts_scalar_cache.is_inited();
-        const int64_t cache_size = g_fts_scalar_cache.size();
-        const bool cache_available = cache_inited && cache_size > 0;
         const int64_t output_col_count = OB_NOT_NULL(lookup_ctdef) ? lookup_ctdef->result_output_.count() : 0;
-        const ObDASIterType iter_type = data_table_iter_->get_type();
-        const bool can_try_cache = cache_available && total_doc_ids > 0 && OB_NOT_NULL(lookup_ctdef);
-        const bool scan_cache_candidate = can_try_cache && iter_type == DAS_ITER_SCAN;
         
-        bool all_cache_hit = false;
-        int64_t cache_fill_count = 0;
-        
-        if (scan_cache_candidate) {  // 尝试缓存命中路径
-          // 索引扫描已经应用了 WHERE 条件（id < 1000 等），无需再过滤
-          // 直接检查 doc_ids 是否都在缓存中
-          all_cache_hit = (total_doc_ids > 0);
-          for (int64_t i = 0; i < total_doc_ids; ++i) {
-            uint64_t doc_id = cached_doc_ids_.at(i);
-            ScalarFields tmp_fields;
-            if (OB_SUCCESS != g_fts_scalar_cache.get_scalar_fields(doc_id, tmp_fields)) {
-              all_cache_hit = false;
-              break;
+        // 缓存命中路径：完全不使用 data_table_iter_
+        if (cache_hit_) {
+          int64_t cache_fill_count = std::min(total_doc_ids, capacity);
+          
+          // 预先获取所有输出列的 datum 数组
+          ObDatum **col_datums = nullptr;
+          int64_t *col_types = nullptr;
+          if (output_col_count > 0) {
+            col_datums = static_cast<ObDatum**>(alloca(sizeof(ObDatum*) * output_col_count));
+            col_types = static_cast<int64_t*>(alloca(sizeof(int64_t) * output_col_count));
+            
+            for (int64_t j = 0; j < output_col_count; ++j) {
+              ObExpr *expr = lookup_ctdef->result_output_.at(j);
+              if (OB_NOT_NULL(expr)) {
+                col_datums[j] = expr->locate_batch_datums(*eval_ctx_);
+                col_types[j] = static_cast<int64_t>(expr->datum_meta_.type_);
+              } else {
+                col_datums[j] = nullptr;
+                col_types[j] = 0;
+              }
             }
           }
           
-          // 如果全部命中缓存，直接从缓存填充数据
-          // 使用 default_batch_row_count_ 而不是 capacity，因为 cached_doc_ids_ 最多收集 default_batch_row_count_ 个
-          if (all_cache_hit) {
-            cache_fill_count = std::min(total_doc_ids, capacity);  // 受 capacity 限制，分批返回
+          // 遍历每一行，从缓存填充数据到 datum 数组
+          for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
+            uint64_t doc_id = cached_doc_ids_.at(i);
+            ScalarFields fields;
+            int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
             
-            // 预先获取所有输出列的 datum 数组
-            ObDatum **col_datums = nullptr;
-            int64_t *col_types = nullptr;
-            if (output_col_count > 0) {
-              col_datums = static_cast<ObDatum**>(alloca(sizeof(ObDatum*) * output_col_count));
-              col_types = static_cast<int64_t*>(alloca(sizeof(int64_t) * output_col_count));
-              
-              for (int64_t j = 0; j < output_col_count; ++j) {
-                ObExpr *expr = lookup_ctdef->result_output_.at(j);
-                if (OB_NOT_NULL(expr)) {
-                  col_datums[j] = expr->locate_batch_datums(*eval_ctx_);
-                  col_types[j] = static_cast<int64_t>(expr->datum_meta_.type_);
-                } else {
-                  col_datums[j] = nullptr;
-                  col_types[j] = 0;
-                }
-              }
+            if (OB_SUCCESS != cache_ret) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("cache hit check passed but get failed", K(ret), K(doc_id));
+              break;
             }
             
-            // 遍历每一行，从缓存填充数据到 datum 数组
-            for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
-              uint64_t doc_id = cached_doc_ids_.at(i);
-              ScalarFields fields;
-              int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
+            int string_col_index = 0;
+            for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
+              if (OB_ISNULL(col_datums[j])) continue;
               
-              if (OB_SUCCESS != cache_ret) {
-                ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("cache hit check passed but get failed", K(ret), K(doc_id));
-                break;
-              }
+              ObExpr *expr = lookup_ctdef->result_output_.at(j);
+              ObDatum &datum = col_datums[j][i];
+              ObObjType col_type = static_cast<ObObjType>(col_types[j]);
               
-              int string_col_index = 0;
-              for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
-                if (OB_ISNULL(col_datums[j])) continue;
-                
-                ObExpr *expr = lookup_ctdef->result_output_.at(j);
-                ObDatum &datum = col_datums[j][i];
-                ObObjType col_type = static_cast<ObObjType>(col_types[j]);
-                
-                if (col_type == ObIntType || col_type == ObUInt64Type) {
-                  datum.set_uint(fields.id_);
-                } else if (ob_is_string_type(col_type)) {
-                  ObString src;
-                  if (string_col_index == 0) {
-                    src = fields.base_id_;
-                  } else if (string_col_index == 1) {
-                    src = fields.docid_col_;
-                  }
-                  
-                  if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
-                    char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
-                    if (OB_ISNULL(buf)) {
-                      ret = OB_ALLOCATE_MEMORY_FAILED;
-                      LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
-                    } else {
-                      MEMCPY(buf, src.ptr(), src.length());
-                      datum.set_string(buf, src.length());
-                    }
-                  } else {
-                    datum.set_string(nullptr, 0);
-                  }
-                  string_col_index++;
+              if (col_type == ObIntType || col_type == ObUInt64Type) {
+                datum.set_uint(fields.id_);
+              } else if (ob_is_string_type(col_type)) {
+                ObString src;
+                if (string_col_index == 0) {
+                  src = fields.base_id_;
+                } else if (string_col_index == 1) {
+                  src = fields.docid_col_;
                 }
-              }
-            }
-            
-            // 设置表达式的 evaluated 标志
-            if (OB_SUCC(ret)) {
-              for (int64_t j = 0; j < output_col_count; ++j) {
-                ObExpr *expr = lookup_ctdef->result_output_.at(j);
-                if (OB_NOT_NULL(expr)) {
-                  expr->set_evaluated_projected(*eval_ctx_);
-                }
-              }
-              
-              if (need_index_proj && index_proj_rows_.have_data()) {
-                if (OB_FAIL(index_proj_rows_.to_expr(cache_fill_count))) {
-                  LOG_WARN("failed to convert store row to expr after cache hit", K(ret));
-                }
-              }
-              if (OB_SUCC(ret)) {
-                count = cache_fill_count;
-                get_next_rows = true;
-                lookup_row_cnt_ += count;
+                datum.set_string(src.ptr(), src.length());
+                string_col_index++;
               }
             }
           }
-        }
-        
-        // === 正常回表流程 ===
-        if (!all_cache_hit && OB_SUCC(ret)) {
+          
+          // 设置表达式的 evaluated 标志
+          if (OB_SUCC(ret)) {
+            for (int64_t j = 0; j < output_col_count; ++j) {
+              ObExpr *expr = lookup_ctdef->result_output_.at(j);
+              if (OB_NOT_NULL(expr)) {
+                expr->set_evaluated_projected(*eval_ctx_);
+              }
+            }
+            
+            if (need_index_proj && index_proj_rows_.have_data()) {
+              if (OB_FAIL(index_proj_rows_.to_expr(cache_fill_count))) {
+                LOG_WARN("failed to convert store row to expr after cache hit", K(ret));
+              }
+            }
+            if (OB_SUCC(ret)) {
+              count = cache_fill_count;
+              get_next_rows = true;
+              lookup_row_cnt_ += count;
+            }
+          }
+          
+          // 缓存命中后重置状态，跳过 data_table_iter_->reuse()
+          if (OB_SUCC(ret) && get_next_rows) {
+            if (OB_FAIL(check_index_lookup())) {
+              LOG_WARN("failed to check table lookup after cache hit", K(ret));
+            } else {
+              reset_lookup_state_internal(true);  // skip_data_iter_reuse = true
+            }
+          }
+        } else {
+          // === 正常回表流程：使用 data_table_iter_ ===
+          data_table_iter_->clear_evaluated_flag();
           if (OB_FAIL(data_table_iter_->get_next_rows(count, capacity))) {
             if (OB_LIKELY(OB_ITER_END == ret)) {
               ret = OB_SUCCESS;
@@ -556,26 +547,13 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             lookup_row_cnt_ += count;
             get_next_rows = true;
           }
-        }
-        
-        // 清理 doc_ids 缓存，准备下一批次
-        // 注意：使用 clear() 而不是 reuse()，因为 reuse() 会重置初始化状态
-        cached_doc_ids_.clear();
-        
-        // === 状态转换 ===
-        if (OB_SUCC(ret) && all_cache_hit && get_next_rows) {
-          if (OB_FAIL(check_index_lookup())) {
-            LOG_WARN("failed to check table lookup after cache hit", K(ret));
-          } else {
-            state_ = INDEX_SCAN;
+          
+          // 处理索引投影列（只有正常回表时需要）
+          if (OB_SUCC(ret) && get_next_rows && need_index_proj && index_proj_rows_.have_data()) {
+            if (OB_FAIL(index_proj_rows_.to_expr(count))) {
+              LOG_WARN("failed to convert store row to expr", K(ret));
+            }
           }
-        }
-        
-        // 处理索引投影列（只有正常回表时需要）
-        if (OB_FAIL(ret)) {
-        } else if (!all_cache_hit && get_next_rows && need_index_proj && index_proj_rows_.have_data() &&
-                   OB_FAIL(index_proj_rows_.to_expr(count))) {
-          LOG_WARN("failed to convert store row to expr", K(ret));
         }
         break;
       }

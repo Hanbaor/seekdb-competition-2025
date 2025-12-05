@@ -1658,6 +1658,10 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
     LOG_WARN("unexpected pushdown topk in functional lookup mode", K(ret));
   } else {
     merge_iter_param.function_lookup_mode_ = is_func_lookup ? 1 : 0;
+    // FORCE TAAT MODE FOR TESTING
+    merge_iter_param.taat_mode_ = 1;
+    FLOG_INFO("FORCE TAAT MODE enabled for testing");
+#if 0  // Original DAAT/TAAT selection logic - temporarily disabled
     if (ir_scan_ctdef->has_pushdown_topk() && !has_duplicate_boolean_tokens) {
       merge_iter_param.topk_mode_ = 1;
       merge_iter_param.daat_mode_ = 1;
@@ -1672,6 +1676,7 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
     } else {
       merge_iter_param.daat_mode_ = 1;
     }
+#endif
     if (OB_SUCC(ret) && ir_scan_ctdef->has_pushdown_topk() && has_duplicate_boolean_tokens) {
       FLOG_INFO("disable pushdown topk since boolean query has duplicate tokens", K(merge_iter_param.topk_mode_));
     }
