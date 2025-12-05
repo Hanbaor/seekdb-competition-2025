@@ -22,6 +22,7 @@
 #include "ob_das_text_retrieval_eval_node.h"
 #include "ob_das_text_retrieval_iter.h"
 #include "sql/das/ob_das_ir_define.h"
+#include "sql/das/ob_fts_token_doc_cache.h"
 
 namespace oceanbase
 {
@@ -271,6 +272,18 @@ int ObDASTextRetrievalMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_c
           ++iter) {
         const ObFTWord &token = iter->first;
         ObString token_string;
+        
+        // 提前过滤：检查token的min_doc_id是否大于1000
+        // 如果是，直接跳过不加入query_tokens，避免创建迭代器
+        sql::ObTokenDocRange doc_range;
+        if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(
+                token.get_word().get_string(), doc_range)) {
+          if (doc_range.min_doc_id_ > 1000) {
+            // token的所有文档id都>1000，对于WHERE id<1000的查询无效，跳过
+            continue;
+          }
+        }
+        
         if (OB_FAIL(ob_write_string(alloc, token.get_word().get_string(), token_string))) {
           LOG_WARN("failed to deep copy query token", K(ret));
         } else if (OB_FAIL(query_tokens.push_back(token_string))) {

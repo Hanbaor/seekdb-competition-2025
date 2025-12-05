@@ -530,24 +530,18 @@ int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::O
   // 基于 token-doc_id 缓存的跳过优化
   // 如果 token 的 min_doc_id > 1000，说明该 token 的所有文档 id 都 > 1000
   // 对于 WHERE id < 1000 的查询，可以直接跳过
+  // 通过设置reached_docid_limit_标志让后续的get_next_batch直接返回OB_ITER_END
   {
     sql::ObTokenDocRange doc_range;
-    bool should_skip = false;
     if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(token, doc_range)) {
       if (doc_range.min_doc_id_ > 1000) {
-        ret = OB_ITER_END;
-        //LOG_INFO("[TOKEN IF SKIP]skip token due to doc_id predicate", K(token), K(doc_range));
-        should_skip = true;
-        return ret;
+        // 设置reached_docid_limit_标志，让get_next_batch直接返回OB_ITER_END
+        reached_docid_limit_ = true;
+        // 直接返回成功，后续的扫描范围设置不需要执行（因为不会真正扫描）
+        /*LOG_INFO("[TAAT_TOKEN_SKIP] token skipped, all docs > 1000", K(token), 
+                 "min_doc_id", doc_range.min_doc_id_);*/
+        return OB_SUCCESS;
       }
-      else{
-        //LOG_INFO("[TOKEN IF SKIP]token doc range found", K(token), K(doc_range));
-      }
-
-      if(should_skip){
-        return ret;
-      }
-      
     }
   }
   if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
