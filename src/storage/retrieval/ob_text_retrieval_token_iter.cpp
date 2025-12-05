@@ -116,6 +116,8 @@ void ObTextRetrievalTokenIter::reuse()
   } else {
     token_doc_cnt_calculated_ = false;
   }
+  // Reset docid limit flag when switching to next token (important for TAAT mode)
+  reached_docid_limit_ = false;
 }
 
 int ObTextRetrievalTokenIter::init_calc_exprs_in_relevance_expr()
