@@ -4091,6 +4091,34 @@
        ret = OB_ERR_UNEXPECTED;
        LOG_WARN("unexpeted error, ft or doc id datum is nullptr", K(ret), KP(ft_datum), KP(doc_id_datum));
      } else {
+      // 获取表的真实主键值用于缓存
+       // FTS DDL 时 output_ 可能包含: 主键列(T_REF_COLUMN), doc_id列, fulltext列等
+       int64_t real_pk_for_cache = -1;  // 用于缓存的真实主键值
+       
+       // 遍历找主键列（类型为 T_REF_COLUMN 且不是 doc_id_expr）
+       for (int64_t i = 0; real_pk_for_cache < 0 && i < MY_SPEC.output_.count(); ++i) {
+         ObExpr *pk_expr = MY_SPEC.output_.at(i);
+         ObDatum *pk_datum = nullptr;
+         if (OB_NOT_NULL(pk_expr) && 
+             T_REF_COLUMN == pk_expr->type_ &&
+             pk_expr != doc_id_expr &&
+             OB_SUCCESS == pk_expr->eval(eval_ctx_, pk_datum) && 
+             OB_NOT_NULL(pk_datum) && 
+             !pk_datum->is_null()) {
+           // 找到主键列，根据数据长度获取值
+           const uint32_t len = pk_datum->len_;
+           if (len == sizeof(int64_t)) {
+             real_pk_for_cache = pk_datum->get_int();
+           } else if (len == sizeof(int32_t)) {
+             real_pk_for_cache = static_cast<int64_t>(pk_datum->get_int32());
+           } else if (len == sizeof(uint64_t)) {
+             real_pk_for_cache = static_cast<int64_t>(pk_datum->get_uint64());
+           } else {
+             // 其他类型暂不支持，使用 -1 表示不写入缓存
+             real_pk_for_cache = -1;
+           }
+         }
+       }
        // ========== FTS Scalar Cache: 填充 HashMap ==========
        // 此时已经读取了主表的一行数据，可以访问所有列
        // 从 MY_SPEC.output_ 中获取标量字段
@@ -4208,7 +4236,7 @@
                                                              ft_expr->obj_meta_.has_lob_header(),
                                                              ft))) {
          LOG_WARN("fail to read real string data", K(ret));
-       } else if (OB_FAIL(fts_index_.segment(ft_expr->obj_meta_, *doc_id_datum, ft)) &&OB_ITER_END != ret) {
+       } else if (OB_FAIL(fts_index_.segment(ft_expr->obj_meta_, *doc_id_datum, ft, real_pk_for_cache)) && OB_ITER_END != ret) {
          LOG_WARN("fail to segment fulltext", K(ret), K(doc_id_datum), K(ft));
        } else if (OB_ITER_END == ret) {
          has_segment_word = false;
@@ -4218,16 +4246,6 @@
        }
      }
    }
-   
-   // ========== FTS Scalar Cache: 索引构建完成时输出统计 ==========
-   if (OB_ITER_END == ret) {
-     LOG_INFO("FTS Scalar Cache: Index build completed, HashMap fill summary",
-              "rows_processed", fts_row_process_count,
-              "total_filled", fts_cache_fill_count,
-              "cache_size", g_fts_scalar_cache.size(),
-              "cache_inited", g_fts_scalar_cache.is_inited());
-   }
-   
    return ret;
  }
  
