@@ -524,6 +524,7 @@ int ObDASTRMergeIter::create_sparse_retrieval_iter()
     } else if (OB_FAIL(bmw_iter->init(iter_param))) {
       LOG_WARN("failed to init text retrieval bm25 iter", K(ret));
     } else {
+      // ... 创建 BMW 迭代器
       sparse_retrieval_iter_ = bmw_iter;
     }
   } else if (daat_mode_) {
@@ -1427,6 +1428,19 @@ int ObDASTRMergeIter::init_topk_limit()
     }
   }
   return ret;
+}
+
+void ObDASTRMergeIter::set_bmw_initial_threshold(double threshold)
+{
+  if (OB_NOT_NULL(sparse_retrieval_iter_) && topk_mode_) {
+    // 尝试将阈值下推给 BMW 迭代器
+    // sparse_retrieval_iter_ 可能是 ObTextBMWIter 或其他类型
+    storage::ObTextBMWIter *bmw_iter = dynamic_cast<storage::ObTextBMWIter *>(sparse_retrieval_iter_);
+    if (OB_NOT_NULL(bmw_iter)) {
+      bmw_iter->set_initial_threshold(threshold);
+      LOG_TRACE("set bmw initial threshold", K(threshold));
+    }
+  }
 }
 
 } // namespace sql

@@ -436,7 +436,7 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
       } else if (count != 0) {
         ret = OB_SUCCESS;
       }
-    } 
+    }
     else if (count > 0 && OB_NOT_NULL(inv_scan_domain_id_col_)) {
       // hard-coded docid/id upper bound for MLDR: id < 1000
       const uint64_t DOCID_LIMIT = 1000;
@@ -509,9 +509,8 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(inv_idx_scan_iter_->reuse())) {
       LOG_WARN("failed to reuse inverted index scan iterator", K(ret));
-    } else if (OB_UNLIKELY(!inv_idx_scan_param_->key_ranges_.empty())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected non-empty scan range", K(ret), K(inv_idx_scan_param_->key_ranges_));
+    } else if (FALSE_IT(inv_idx_scan_param_->key_ranges_.reuse())) {
+      // clear key_ranges_ before pushing new scan range
     } else if (OB_FAIL(inv_idx_scan_param_->key_ranges_.push_back(scan_range))) {
       LOG_WARN("failed to push back scan range", K(ret));
     } else if (OB_FAIL(inv_idx_scan_iter_->rescan())) {

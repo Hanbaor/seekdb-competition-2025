@@ -121,6 +121,15 @@ public:
   int get_query_max_score(double &score) {
     return sparse_retrieval_iter_->get_query_max_score(score);
   }
+  
+  // 设置 BMW 初始阈值，用于两阶段优化
+  // 当第一阶段 Index Merge 获取到 min_score 后，可以将其下推给 BMW 迭代器
+  void set_bmw_initial_threshold(double threshold);
+  
+  // 获取内部的 sparse retrieval 迭代器
+  storage::ObISparseRetrievalMergeIter *get_sparse_retrieval_iter() {
+    return sparse_retrieval_iter_;
+  }
 private:
   int init_das_iter_scan_params();
   static int init_das_iter_scan_param(

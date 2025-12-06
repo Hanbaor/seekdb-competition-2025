@@ -17,6 +17,7 @@
 #ifndef OB_SPARSE_BMW_ITER_H_
 #define OB_SPARSE_BMW_ITER_H_
 
+#include <algorithm>
 #include "lib/container/ob_heap.h"
 #include "ob_sparse_daat_iter.h"
 #include "ob_sparse_retrieval_util.h"
@@ -39,6 +40,18 @@ public:
       ObIAllocator &iter_allocator,
       ObSRDaaTRelevanceCollector &relevance_collector);
   virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
+  
+  // 设置初始阈值，用于两阶段 BMW 加速优化
+  // 第一阶段 Index Merge 获取的 min_score 可以作为第二阶段 BMW 的初始阈值
+  void set_initial_threshold(double threshold)
+  {
+    initial_threshold_ = threshold;
+  }
+  
+  double get_initial_threshold() const
+  {
+    return initial_threshold_;
+  }
 protected:
   virtual int process_collected_row(const ObDatum &id_datum, const double relevance) override;
   virtual int init_before_wand_process() { return OB_SUCCESS; }
@@ -51,7 +64,8 @@ protected:
   int evaluate_pivot_range(const int64_t pivot_iter_idx, bool &is_candidate);
   double get_top_k_threshold()
   {
-    return top_k_heap_.empty() ? 0.0 : top_k_heap_.top().relevance_;
+    double heap_threshold = top_k_heap_.empty() ? 0.0 : top_k_heap_.top().relevance_;
+    return std::max(heap_threshold, initial_threshold_);
   }
 
 private:
@@ -105,6 +119,9 @@ protected:
   ObDomainIdCmp domain_id_cmp_;
   ObFixedArray<ObDocIdExt, ObIAllocator> id_cache_;
   BMWStatus status_;
+  // 初始阈值，用于两阶段 BMW 加速优化
+  // 当设置了初始阈值时，BMW 剪枝会从该阈值开始，而不是从 0 开始
+  double initial_threshold_;
 };
 
 

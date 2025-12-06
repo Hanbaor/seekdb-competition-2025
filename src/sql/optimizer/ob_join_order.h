@@ -1799,6 +1799,7 @@ struct NullAwareAntiJoinInfo {
 
     int generate_candi_index_merge_trees(const uint64_t ref_table_id,
                                          const ObIArray<ObRawExpr*> &filters,
+                                         const ObIArray<MatchExprInfo> &match_expr_infos,
                                          ObIArray<uint64_t> &valid_index_ids,
                                          ObIArray<ObSEArray<uint64_t, 4>> &valid_index_cols,
                                          ObIArray<ObIndexMergeNode *> &candi_index_trees);

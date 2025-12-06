@@ -3291,6 +3291,7 @@ int ObJoinOrder::get_candi_index_merge_trees(const uint64_t table_id,
     LOG_WARN("failed to get valid index merge ids with hint", K(ret));
   } else if (OB_FAIL(generate_candi_index_merge_trees(ref_table_id,
                                                       helper.filters_,
+                                                      helper.match_expr_infos_,
                                                       valid_index_ids,
                                                       valid_index_cols,
                                                       candi_index_trees))) {
@@ -3313,6 +3314,7 @@ int ObJoinOrder::get_candi_index_merge_trees(const uint64_t table_id,
     LOG_WARN("failed to get valid index merge ids", K(ret));
   } else if (OB_FAIL(generate_candi_index_merge_trees(ref_table_id,
                                                       helper.filters_,
+                                                      helper.match_expr_infos_,
                                                       valid_index_ids,
                                                       valid_index_cols,
                                                       candi_index_trees))) {
@@ -3402,14 +3404,35 @@ int ObJoinOrder::get_valid_index_merge_indexes(const uint64_t table_id,
 
 int ObJoinOrder::generate_candi_index_merge_trees(const uint64_t ref_table_id,
                                                   const ObIArray<ObRawExpr*> &filters,
+                                                  const ObIArray<MatchExprInfo> &match_expr_infos,
                                                   ObIArray<uint64_t> &valid_index_ids,
                                                   ObIArray<ObSEArray<uint64_t, 4>> &valid_index_cols,
                                                   ObIArray<ObIndexMergeNode *> &candi_index_trees)
 {
   int ret = OB_SUCCESS;
+  // 调试日志：查看 filters 和 match_expr_infos 的内容
+  LOG_WARN("[INDEX_MERGE_DEBUG] generate_candi_index_merge_trees input", 
+            K(ref_table_id), K(filters.count()), K(match_expr_infos.count()),
+            K(valid_index_ids.count()));
+  for (int64_t i = 0; i < filters.count(); ++i) {
+    if (OB_NOT_NULL(filters.at(i))) {
+      LOG_WARN("[INDEX_MERGE_DEBUG] filter info", K(i), 
+                "expr_type", filters.at(i)->get_expr_type(),
+                "has_CNT_MATCH_EXPR", filters.at(i)->has_flag(CNT_MATCH_EXPR),
+                "has_IS_SIMPLE_COND", filters.at(i)->has_flag(IS_SIMPLE_COND),
+                "has_IS_RANGE_COND", filters.at(i)->has_flag(IS_RANGE_COND));
+    }
+  }
+  for (int64_t i = 0; i < match_expr_infos.count(); ++i) {
+    LOG_WARN("[INDEX_MERGE_DEBUG] match_expr_info", K(i), 
+             "inv_idx_id", match_expr_infos.at(i).inv_idx_id_,
+             "match_expr_not_null", (match_expr_infos.at(i).match_expr_ != nullptr));
+  }
+  
   if (valid_index_ids.empty()) {
     // do nothing
   } else {
+    // 处理单个 OR/AND 表达式
     for (int64_t i = 0; OB_SUCC(ret) && i < filters.count(); ++i) {
       ObRawExpr *filter = filters.at(i);
       ObIndexMergeNode *candi_node = NULL;
@@ -3417,8 +3440,8 @@ int ObJoinOrder::generate_candi_index_merge_trees(const uint64_t ref_table_id,
       if (OB_ISNULL(filter)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get unexpected null filter", K(ret), K(i));
-      } else if (filter->get_expr_type() != T_OP_OR) {
-        // do nothing, only support UNION MERGE now
+      } else if (filter->get_expr_type() != T_OP_OR && filter->get_expr_type() != T_OP_AND) {
+        // support both UNION MERGE (OR) and INTERSECT MERGE (AND)
       } else if (OB_FAIL(generate_candi_index_merge_node(ref_table_id,
                                                          filter,
                                                          valid_index_ids,
@@ -3434,6 +3457,10 @@ int ObJoinOrder::generate_candi_index_merge_trees(const uint64_t ref_table_id,
         LOG_WARN("failed to push back candi index tree", K(ret));
       }
     }
+    
+    // TODO: Index Merge AND with FTS 暂时禁用，需要进一步调试
+    // 当前实现会导致执行错误 (4016)
+    UNUSED(match_expr_infos);
   }
   return ret;
 }
@@ -3492,7 +3519,12 @@ int ObJoinOrder::generate_candi_index_merge_node(const uint64_t ref_table_id,
       is_valid_node = false;
     } else if (!(filter->has_flag(IS_SIMPLE_COND)
                  || filter->has_flag(IS_RANGE_COND)
-                 || filter->has_flag(CNT_MATCH_EXPR))) {
+                 || filter->has_flag(CNT_MATCH_EXPR)
+                 || filter->get_expr_type() == T_OP_IN
+                 || filter->get_expr_type() == T_OP_LT
+                 || filter->get_expr_type() == T_OP_LE
+                 || filter->get_expr_type() == T_OP_GT
+                 || filter->get_expr_type() == T_OP_GE)) {
       is_valid_node = false;
     } else if (OB_FAIL(collect_candicate_indexes(ref_table_id,
                                                  filter,
@@ -3564,9 +3596,8 @@ int ObJoinOrder::collect_candicate_indexes(const uint64_t ref_table_id,
     ObSEArray<uint64_t, 4> column_ids;
     if (OB_FAIL(ObRawExprUtils::extract_column_ids(filter, column_ids))) {
       LOG_WARN("failed to extract column ids", K(filter), K(ret));
-    } else if (OB_UNLIKELY(column_ids.count() != 1)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid filter node for index merge", K(filter), K(ret));
+    } else if (column_ids.empty() || column_ids.count() > 1) {
+      // 没有列或多列条件，跳过（candicate_index_tids 保持为空）
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < valid_index_ids.count(); ++i) {
         const uint64_t index_id = valid_index_ids.at(i);
@@ -19458,7 +19489,38 @@ int ObJoinOrder::init_basic_text_retrieval_info(uint64_t table_id,
     LOG_WARN("unexpected null plan or stmt", K(ret), KP(get_plan()), KP(get_plan()->get_stmt()));
   } else if (OB_FAIL(get_plan()->get_stmt()->get_match_expr_on_table(table_id, match_exprs))) {
     LOG_WARN("failed to get match exprs", K(ret), K(table_id));
-  } else if (match_exprs.empty()) {
+  } else {
+    // 检查 restrict_infos 中是否有 MATCH 表达式
+    int match_in_restrict = 0;
+    int bool_op_count = 0;
+    for (int64_t j = 0; j < get_restrict_infos().count(); ++j) {
+      if (OB_NOT_NULL(get_restrict_infos().at(j))) {
+        if (get_restrict_infos().at(j)->has_flag(CNT_MATCH_EXPR)) {
+          match_in_restrict++;
+        }
+        if (get_restrict_infos().at(j)->get_expr_type() == T_OP_BOOL) {
+          bool_op_count++;
+        }
+      }
+    }
+    // 检查 condition_exprs 中是否有 MATCH 表达式
+    int match_in_cond = 0;
+    const ObDMLStmt *stmt = get_plan()->get_stmt();
+    for (int64_t j = 0; j < stmt->get_condition_exprs().count(); ++j) {
+      if (OB_NOT_NULL(stmt->get_condition_exprs().at(j)) &&
+          stmt->get_condition_exprs().at(j)->has_flag(CNT_MATCH_EXPR)) {
+        match_in_cond++;
+      }
+    }
+    LOG_WARN("[INDEX_MERGE_DEBUG] init_basic_text_retrieval_info", 
+             K(table_id), K(ref_table_id), K(match_exprs.count()),
+             "stmt_match_exprs_count", get_plan()->get_stmt()->get_match_exprs().count(),
+             "restrict_infos_count", get_restrict_infos().count(),
+             K(match_in_restrict), K(bool_op_count),
+             "condition_exprs_count", stmt->get_condition_exprs().count(),
+             K(match_in_cond));
+  }
+  if (OB_FAIL(ret) || match_exprs.empty()) {
     //do nothing
   } else if (OB_FAIL(compute_table_location(table_id, ref_table_id, false, partition_info))) {
     LOG_WARN("failed to compute table location", K(ret));

@@ -32,7 +32,8 @@ ObSRBMWIterImpl::ObSRBMWIterImpl()
     top_k_count_(0),
     domain_id_cmp_(),
     id_cache_(),
-    status_(BMWStatus::MAX_STATUS)
+    status_(BMWStatus::MAX_STATUS),
+    initial_threshold_(0.0)
 {}
 
 int ObSRBMWIterImpl::init(
@@ -75,6 +76,7 @@ void ObSRBMWIterImpl::reuse(const bool switch_tablet)
     top_k_heap_.pop();
   }
   status_ = BMWStatus::MAX_STATUS;
+  initial_threshold_ = 0.0;
   ObSRDaaTIterImpl::reuse(switch_tablet);
 }
 
@@ -86,6 +88,7 @@ void ObSRBMWIterImpl::reset()
   domain_id_cmp_.reset();
   id_cache_.reset();
   allocator_.reset();
+  initial_threshold_ = 0.0;
 }
 
 int ObSRBMWIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
@@ -408,7 +411,8 @@ int ObSRBMWIterImpl::next_pivot_range(int64_t &skip_range_cnt)
     if (OB_ISNULL(min_unevaluated_id)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null advance to domain id", K(ret));
-    } else if (OB_FAIL(advance_dim_iters_for_next_round(*min_unevaluated_id, false))) {
+    } else if (OB_FAIL(advance_dim_iters_for_next_round(*min_unevaluated_id, true))) {
+      // iter_end_available should be true because some dim iters may have ended during evaluate_pivot_range
       LOG_WARN("failed to advance dim iters for next round", K(ret));
     }
   }

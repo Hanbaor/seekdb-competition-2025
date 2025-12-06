@@ -1653,13 +1653,8 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
   } else if (OB_UNLIKELY(is_func_lookup && !ir_scan_ctdef->need_proj_relevance_score())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("functional lookup without relevance score not supported", K(ret));
-  // 允许 function_lookup + pushdown_topk：BMW 先剪枝，回表阶段用缓存
-  // } else if (OB_UNLIKELY(is_func_lookup && ir_scan_ctdef->has_pushdown_topk())) {
-  //   ret = OB_ERR_UNEXPECTED;
-  //   LOG_WARN("unexpected pushdown topk in functional lookup mode", K(ret));
   } else {
     merge_iter_param.function_lookup_mode_ = is_func_lookup ? 1 : 0;
-    // 即使是 function_lookup，也可以启用 topk_mode（BMW）
     if (ir_scan_ctdef->has_pushdown_topk() && !has_duplicate_boolean_tokens) {
       merge_iter_param.topk_mode_ = 1;
       merge_iter_param.daat_mode_ = 1;
