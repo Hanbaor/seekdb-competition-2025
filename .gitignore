@@ -411,3 +411,6 @@ store/
 etc/
 
 run/telemetry.json
+pisa-main
+bm25s-main
+mldr-test-main
