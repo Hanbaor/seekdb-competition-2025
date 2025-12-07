@@ -20,6 +20,7 @@
  
  #include "ob_das_domain_utils.h"
  #include "ob_fts_token_doc_cache.h"
+ #include "ob_fts_bm25s_index.h"
  #include "lib/geo/ob_geo_utils.h"
  #include "sql/das/ob_das_utils.h"
  #include "sql/das/ob_das_dml_vec_iter.h"
@@ -367,23 +368,24 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
          rows[i].storage_datums_[doc_id_idx].shallow_copy_from_datum(doc_id_datum);
          rows[i].storage_datums_[word_cnt_idx].set_uint(word_cnt);
          rows[i].storage_datums_[doc_len_idx].set_uint(doc_length);
- 
-        // 将token和doc_id添加到全局缓存中，用于查询优化
-        // 仅在构建fts_index_aux时记录（避免重复记录）
-        // 使用传入的 real_doc_id_for_cache（表的真实主键），如果没有传入则不写缓存
-        if (is_fts_index_aux && real_doc_id_for_cache >= 0) {
-          const ObString &token_str = ft_word.get_word().get_string();
-          int cache_ret = FTS_TOKEN_DOC_CACHE.add_token_doc_id(token_str, real_doc_id_for_cache);
-          if (OB_UNLIKELY(OB_SUCCESS != cache_ret)) {
-            // 缓存失败不影响主流程，仅记录警告日志
-            LOG_WARN("fail to add token to cache, ignored", K(cache_ret), K(token_str), K(real_doc_id_for_cache));
-          }
-        }
- 
+
+         // ========== BM25S 索引：单个 token 收集 ==========
+         if (is_fts_index_aux && real_doc_id_for_cache >= 0) {
+           const ObString &token_str = ft_word.get_word().get_string();
+           int bm25s_ret = g_bm25s_index.collect_raw_data(
+               token_str,
+               real_doc_id_for_cache,
+               static_cast<int32_t>(word_cnt),
+               static_cast<int32_t>(doc_length));
+           if (OB_UNLIKELY(OB_SUCCESS != bm25s_ret)) {
+             LOG_WARN("fail to collect bm25s token, ignored", K(bm25s_ret), K(token_str), K(real_doc_id_for_cache));
+           }
+         }
+         // ================================================
+
          if (OB_FAIL(word_rows.push_back(&rows[i]))) {
            LOG_WARN("fail to push back row", K(ret), K(rows[i]));
          } else {
-           //LOG_ERROR("succeed to add word row", K(ret), K(is_fts_index_aux), K(ft_word), K(word_cnt), K(i), K(rows[i]));
            ++i;
          }
        }

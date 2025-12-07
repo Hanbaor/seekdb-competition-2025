@@ -29,6 +29,8 @@
  #include "sql/engine/expr/ob_expr_lob_utils.h"
  // FTS Scalar Cache: 在索引构建时填充 HashMap
  #include "sql/das/ob_fts_scalar_cache.h"
+ // BM25S 索引：预计算 BM25 得分
+ #include "sql/das/ob_fts_bm25s_index.h"
  #include "common/object/ob_object.h"  // for ObDocId
  
  namespace oceanbase
@@ -4066,14 +4068,48 @@
      }
    }
    // ==========================================================
-   while (OB_SUCC(ret) && !has_segment_word) {
-     ObExpr *ft_expr = nullptr;
-     ObExpr *doc_id_expr = nullptr;
-     ObDatum *ft_datum = nullptr;
-     ObDatum *doc_id_datum = nullptr;
- 
-     if (OB_FAIL(ObTableScanOp::inner_get_next_row_implement())) {
-       if (OB_ITER_END != ret) {
+  
+  // ========== BM25S 索引：标记一个并行任务开始 ==========
+  static thread_local bool bm25s_task_started = false;
+  if (!bm25s_task_started && g_bm25s_index.is_inited() && !g_bm25s_index.is_finalized()) {
+    g_bm25s_index.begin_collect();
+    bm25s_task_started = true;
+    bm25s_log("BEGIN_COLLECT: task started");
+  }
+  // =====================================================
+  
+  while (OB_SUCC(ret) && !has_segment_word) {
+    ObExpr *ft_expr = nullptr;
+    ObExpr *doc_id_expr = nullptr;
+    ObDatum *ft_datum = nullptr;
+    ObDatum *doc_id_datum = nullptr;
+
+    if (OB_FAIL(ObTableScanOp::inner_get_next_row_implement())) {
+      if (OB_ITER_END == ret) {
+        // ========== BM25S 索引：并行任务结束，尝试 finalize ==========
+        if (bm25s_task_started && g_bm25s_index.is_inited() && !g_bm25s_index.is_finalized()) {
+          bm25s_task_started = false;
+          bm25s_log("END_COLLECT: task ending, calling end_collect()");
+          // 只有当所有并行任务都完成时才 finalize
+          if (g_bm25s_index.end_collect()) {
+            bm25s_log("END_COLLECT: all tasks done, starting finalize");
+            int finalize_ret = g_bm25s_index.finalize();
+            if (OB_SUCCESS != finalize_ret) {
+              LOG_WARN("fail to finalize bm25s index", K(finalize_ret));
+              bm25s_log("FINALIZE_ERROR: ret=%d", finalize_ret);
+            } else {
+              LOG_INFO("BM25S index finalized successfully",
+                       "total_docs", g_bm25s_index.get_total_docs(),
+                       "vocab_size", g_bm25s_index.get_vocab_size(),
+                       "total_entries", g_bm25s_index.get_total_entries());
+            }
+          } else {
+            bm25s_log("END_COLLECT: waiting for other parallel tasks");
+            LOG_INFO("BM25S task ended, waiting for other parallel tasks");
+          }
+        }
+        // ============================================================
+      } else {
          LOG_WARN("fail to get next row implement", K(ret));
        }
      } else if (OB_FAIL(get_output_fts_col_expr_by_type(T_FUN_SYS_DOC_ID, doc_id_expr))) {
