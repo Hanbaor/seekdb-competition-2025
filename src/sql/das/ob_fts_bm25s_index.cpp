@@ -613,7 +613,7 @@ int ObFtsBM25SIndex::search(const ObIArray<ObString> &tokens,
   } else {
     SpinRLockGuard guard(lock_);
     
-    // 累加每个文档的得分
+    // 使用哈希表累加分数（安全但稍慢）
     hash::ObHashMap<uint32_t, double, hash::NoPthreadDefendMode> doc_scores;
     if (OB_FAIL(doc_scores.create(1024, ObMemAttr(OB_SERVER_TENANT_ID, "BM25SSearch")))) {
       LOG_WARN("fail to create doc scores map", K(ret));
@@ -634,7 +634,6 @@ int ObFtsBM25SIndex::search(const ObIArray<ObString> &tokens,
       // 二分剪枝：id < id_limit
       uint64_t valid_end = end;
       if (id_limit > 0) {
-        // 使用二分查找找到第一个 >= id_limit 的位置
         int64_t lo = start, hi = end;
         while (lo < hi) {
           int64_t mid = (lo + hi) / 2;
@@ -685,7 +684,6 @@ int ObFtsBM25SIndex::search(const ObIArray<ObString> &tokens,
       if (OB_SUCC(ret) && all_results.count() > 0) {
         int64_t k = std::min(top_k, (int64_t)all_results.count());
         
-        // 使用指针进行排序，因为 ObSEArray 迭代器不兼容 std::sort
         if (all_results.count() > 1) {
           std::partial_sort(&all_results.at(0), 
                             &all_results.at(0) + k,
@@ -705,6 +703,106 @@ int ObFtsBM25SIndex::search(const ObIArray<ObString> &tokens,
     }
     
     doc_scores.destroy();
+  }
+  
+  return ret;
+}
+
+// ========== 栈上数组优化版本（无锁）==========
+static const int64_t STACK_ARRAY_SIZE = 2000;  // 栈上预分配
+
+int ObFtsBM25SIndex::search_with_array(const ObIArray<ObString> &tokens,
+                                        int64_t id_limit,
+                                        int64_t top_k,
+                                        ObIArray<DocScore> &results)
+{
+  int ret = OB_SUCCESS;
+  
+  if (OB_UNLIKELY(!is_ready())) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("BM25S index not ready", K(ret), K_(is_inited), K_(is_finalized));
+  } else if (id_limit <= 0 || id_limit > STACK_ARRAY_SIZE) {
+    // 超出栈数组范围，fallback 到哈希表版本
+    ret = search(tokens, id_limit, top_k, results);
+  } else {
+    SpinRLockGuard guard(lock_);
+    
+    // 栈上分配数组（无锁，每次调用独立）
+    double scores_array[STACK_ARRAY_SIZE] = {0};
+    uint32_t touched_docs[STACK_ARRAY_SIZE];
+    int64_t touched_count = 0;
+    
+    // 遍历每个查询 token
+    for (int64_t t = 0; OB_SUCC(ret) && t < tokens.count(); t++) {
+      const ObString &token = tokens.at(t);
+      uint32_t token_id = 0;
+      
+      if (OB_SUCCESS != token_to_id_.get_refactored(token, token_id)) {
+        continue;
+      }
+      
+      uint64_t start = token_ptr_.at(token_id);
+      uint64_t end = token_ptr_.at(token_id + 1);
+      
+      // 二分剪枝
+      uint64_t valid_end = end;
+      {
+        int64_t lo = start, hi = end;
+        while (lo < hi) {
+          int64_t mid = (lo + hi) / 2;
+          if (doc_ids_.at(mid) < id_limit) {
+            lo = mid + 1;
+          } else {
+            hi = mid;
+          }
+        }
+        valid_end = lo;
+      }
+      
+      // 累加得分（数组直接访问，O(1)）
+      for (uint64_t i = start; i < valid_end; i++) {
+        uint32_t doc_id = doc_ids_.at(i);
+        float score = scores_.at(i);
+        
+        if (scores_array[doc_id] == 0.0) {
+          touched_docs[touched_count++] = doc_id;
+        }
+        scores_array[doc_id] += score;
+      }
+    }
+    
+    // 收集结果
+    if (OB_SUCC(ret) && touched_count > 0) {
+      ObSEArray<DocScore, 256> all_results;
+      for (int64_t i = 0; OB_SUCC(ret) && i < touched_count; i++) {
+        uint32_t doc_id = touched_docs[i];
+        double score = scores_array[doc_id];
+        if (score > 0.0) {
+          if (OB_FAIL(all_results.push_back(DocScore(doc_id, score)))) {
+            LOG_WARN("fail to push result", K(ret));
+          }
+        }
+      }
+      
+      // 部分排序取 top_k
+      if (OB_SUCC(ret) && all_results.count() > 0) {
+        int64_t k = std::min(top_k, (int64_t)all_results.count());
+        if (all_results.count() > 1) {
+          std::partial_sort(&all_results.at(0), 
+                            &all_results.at(0) + k,
+                            &all_results.at(0) + all_results.count(),
+                            [](const DocScore &a, const DocScore &b) {
+                              return a.score > b.score;
+                            });
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < k; i++) {
+          if (OB_FAIL(results.push_back(all_results.at(i)))) {
+            LOG_WARN("fail to push result", K(ret));
+          }
+        }
+      }
+    }
+    // 栈上数组自动清理，无需手动清零
   }
   
   return ret;

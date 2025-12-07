@@ -149,6 +149,15 @@ public:
              int64_t top_k,
              common::ObIArray<DocScore> &results);
 
+  /**
+   * @brief 搜索查询（全局数组优化版本，使用锁）
+   * 当 id_limit <= 2000 时使用数组优化，否则 fallback 到哈希表
+   */
+  int search_with_array(const common::ObIArray<common::ObString> &tokens,
+                        int64_t id_limit,
+                        int64_t top_k,
+                        common::ObIArray<DocScore> &results);
+
   // ========== 并行任务管理 ==========
   /**
    * @brief 开始一个收集任务（在并行扫描开始时调用）

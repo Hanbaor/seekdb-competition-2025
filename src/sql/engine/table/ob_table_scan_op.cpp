@@ -1788,9 +1788,16 @@
            LOG_WARN("assign task ranges failed", K(ret));
          }
        }
+       bool skip_prepare_das = false;
+       if (g_bm25s_index.is_ready() && MY_CTDEF.attach_spec_.attach_ctdef_ != nullptr) {
+         const ObDASBaseCtDef *attach = MY_CTDEF.attach_spec_.attach_ctdef_;
+         if (attach->op_type_ == DAS_OP_IR_SCAN || attach->op_type_ == DAS_OP_IR_AUX_LOOKUP) {
+           skip_prepare_das = true;
+         }
+       }
        if (OB_FAIL(ret) || OB_UNLIKELY(iter_end_)) {
          // do nothing
-       } else if (OB_FAIL(prepare_all_das_tasks())) {
+       } else if (!skip_prepare_das && OB_FAIL(prepare_all_das_tasks())) {
          LOG_WARN("prepare das task failed", K(ret));
        } else if (OB_FAIL(do_table_scan())) {
          if (OB_TRY_LOCK_ROW_CONFLICT != ret) {

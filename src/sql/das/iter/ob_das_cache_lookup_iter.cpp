@@ -374,13 +374,13 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             }
           }
           
-          // 调用 BM25S 搜索
+          // 调用 BM25S 搜索（使用数组优化版本）
           if (OB_SUCC(ret) && tokens.count() > 0) {
             int64_t id_limit = 1000;  // id < 1000 过滤
             int64_t top_k = tr_iter->get_topk_limit();
             if (top_k <= 0) top_k = 10;  // 默认值
             
-            if (OB_SUCCESS == g_bm25s_index.search(tokens, id_limit, top_k, bm25s_results)) {
+            if (OB_SUCCESS == g_bm25s_index.search_with_array(tokens, id_limit, top_k, bm25s_results)) {
               use_bm25s_fast_path = true;
             }
           }
