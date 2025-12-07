@@ -15,7 +15,6 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
-
 #include "ob_text_retrieval_token_iter.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
