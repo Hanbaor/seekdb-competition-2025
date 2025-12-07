@@ -808,6 +808,31 @@ int ObFtsBM25SIndex::search_with_array(const ObIArray<ObString> &tokens,
   return ret;
 }
 
+bool ObFtsBM25SIndex::get_posting_list(const common::ObString &token, int64_t id_limit, uint64_t &start, uint64_t &end) const
+{
+  uint32_t token_id = 0;
+  if (OB_SUCCESS != token_to_id_.get_refactored(token, token_id)) {
+    return false;
+  }
+  start = token_ptr_.at(token_id);
+  end = token_ptr_.at(token_id + 1);
+  
+  // 二分剪枝：找到 doc_id < id_limit 的范围
+  if (id_limit > 0 && start < end) {
+    int64_t lo = start, hi = end;
+    while (lo < hi) {
+      int64_t mid = (lo + hi) / 2;
+      if (doc_ids_.at(mid) < id_limit) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    end = lo;
+  }
+  return start < end;  // 只有有效数据时返回 true
+}
+
 void ObFtsBM25SIndex::print_statistics() const
 {
   SpinRLockGuard guard(lock_);

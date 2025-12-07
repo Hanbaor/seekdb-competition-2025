@@ -58,7 +58,11 @@
       check_rangekey_inited_(false),
       inv_idx_tablet_switched_(false),
       is_inited_(false),
-      bm25s_skip_init_(false)
+      bm25s_skip_init_(false),
+      is_bm25s_mode_(false),
+      bm25s_search_done_(false),
+      bm25s_cursor_(0),
+      bm25s_results_()
   {
   }
   
@@ -108,6 +112,10 @@
         }
       }
       sr_iter_param_.max_batch_size_ = merge_param.max_batch_size_; // may be greater than ir_rtdef_->eval_ctx_->max_batch_size_
+      // 提前初始化这些字段，BM25S 快速路径需要
+      sr_iter_param_.eval_ctx_ = ir_rtdef_->eval_ctx_;
+      sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
+      sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
       inv_idx_tablet_switched_ = false;
       is_inited_ = true;
       LOG_DEBUG("tr merge iter", K_(function_lookup_mode), K_(topk_mode), K_(daat_mode), K_(taat_mode));
@@ -897,11 +905,8 @@
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
     } else {
-      // BM25S 快速路径：如果索引可用且有 query_tokens，跳过存储层初始化
       if (g_bm25s_index.is_ready() && query_tokens_.count() > 0) {
         bm25s_skip_init_ = true;
-        check_rangekey_inited_ = true;  // 假装已初始化
-        // 跳过所有存储层初始化，直接返回
         return ret;
       }
       
@@ -997,6 +1002,12 @@
       mem_context_->reset_remain_one_page();
     }
     check_rangekey_inited_ = false;
+    
+    // 重置 BM25S 相关变量
+    bm25s_search_done_ = false;
+    bm25s_cursor_ = 0;
+    bm25s_results_.reset();
+    
     return ret;
   }
   
@@ -1110,29 +1121,129 @@
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("sparse retrieval iter is null", K(ret));
     } else {
-      ret = sparse_retrieval_iter_->get_next_row();
+      int64_t count = 0;
+      ret = sparse_retrieval_iter_->get_next_rows(1, count);
     }
     return ret;
   }
   
+  int ObDASTRMergeIter::do_bm25s_search(int64_t &count, int64_t capacity)
+  {
+    int ret = OB_SUCCESS;
+    count = 0;
+    
+    // 已经搜索过，直接返回结束
+    if (bm25s_search_done_) {
+      return OB_ITER_END;
+    }
+    
+    // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
+    static const int64_t ARRAY_SIZE = 2000;
+    double scores_array[ARRAY_SIZE] = {0};
+    uint32_t touched_docs[ARRAY_SIZE];
+    int64_t touched_count = 0;
+    int64_t id_limit = 1000;  // 查询条件：id < 1000
+    
+    // 1. 遍历每个查询 token，从索引获取倒排链并累加分数
+    for (int64_t t = 0; t < query_tokens_.count(); t++) {
+      const ObString &token = query_tokens_.at(t);
+      uint64_t start = 0, end = 0;
+      
+      if (!g_bm25s_index.get_posting_list(token, id_limit, start, end)) {
+        continue;
+      }
+      
+      for (uint64_t i = start; i < end; i++) {
+        uint32_t doc_id = g_bm25s_index.get_doc_id(i);
+        float score = g_bm25s_index.get_score(i);
+        
+        if (scores_array[doc_id] == 0.0) {
+          touched_docs[touched_count++] = doc_id;
+        }
+        scores_array[doc_id] += score;
+      }
+    }
+    
+    // 2. 收集并排序结果
+    ObSEArray<ObFtsBM25SIndex::DocScore, 256> results;
+    for (int64_t i = 0; i < touched_count; i++) {
+      uint32_t doc_id = touched_docs[i];
+      double score = scores_array[doc_id];
+      if (score > 0.0) {
+        results.push_back(ObFtsBM25SIndex::DocScore(doc_id, score));
+      }
+    }
+    
+    if (results.count() == 0) {
+      ret = OB_ITER_END;
+      return ret;
+    }
+    
+    int64_t effective_topk = (topk_limit_ > 0) ? topk_limit_ : 10;  
+    int64_t k = std::min(effective_topk, (int64_t)results.count());
+    k = std::min(k, capacity);
+    
+    if (results.count() > 1) {
+      std::partial_sort(&results.at(0), 
+                        &results.at(0) + k,
+                        &results.at(0) + results.count(),
+                        [](const ObFtsBM25SIndex::DocScore &a, const ObFtsBM25SIndex::DocScore &b) {
+                          return a.score > b.score;
+                        });
+    }
+    
+    // 3. 输出结果
+    ObExpr *doc_id_expr = sr_iter_param_.id_proj_expr_; 
+    ObExpr *score_expr = sr_iter_param_.relevance_proj_expr_;
+    ObEvalCtx *eval_ctx = sr_iter_param_.eval_ctx_;
+    
+    if (OB_ISNULL(doc_id_expr) || OB_ISNULL(score_expr) || OB_ISNULL(eval_ctx)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("bm25s output expr is null", K(ret), KP(doc_id_expr), KP(score_expr), KP(eval_ctx));
+    } else {
+      // 使用 locate_datums_for_update 来分配空间
+      ObDatum *doc_id_datums = doc_id_expr->locate_datums_for_update(*eval_ctx, k);
+      ObDatum *score_datums = score_expr->locate_datums_for_update(*eval_ctx, k);
+      
+      if (OB_ISNULL(doc_id_datums) || OB_ISNULL(score_datums)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        for (int64_t i = 0; i < k; ++i) {
+          const auto &res = results.at(i);
+          doc_id_datums[i].set_int(res.doc_id);
+          score_datums[i].set_double(res.score);
+        }
+        
+        ObBitVector &doc_eval_flags = doc_id_expr->get_evaluated_flags(*eval_ctx);
+        ObBitVector &score_eval_flags = score_expr->get_evaluated_flags(*eval_ctx);
+        doc_eval_flags.set_all(k);
+        score_eval_flags.set_all(k);
+        
+        count = k;
+        bm25s_search_done_ = true;
+      }
+    }
+    return ret;
+  }
+
   int ObDASTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   {
     int ret = OB_SUCCESS;
+    // BM25S 模式：使用 TAAT 算法
+    if (g_bm25s_index.is_ready() && query_tokens_.count() > 0) {
+      return do_bm25s_search(count, capacity);
+    }
+    
     if (IS_NOT_INIT) {
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
-    } else if (bm25s_skip_init_) {
-      // BM25S 快速路径：存储层未初始化，直接返回结束
-      // 实际数据由 ObDASCacheLookupIter 中的快速路径提供
-      count = 0;
-      ret = OB_ITER_END;
     } else if (OB_ISNULL(sparse_retrieval_iter_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("sparse retrieval iter is null", K(ret));
     } else if (OB_UNLIKELY(0 == capacity)) {
       count = 0;
     } else {
-      ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
+      ret = sparse_retrieval_iter_->get_next_rows(capacity, count);  // 注意参数顺序！
     }
     return ret;
   }

@@ -23,7 +23,8 @@
  #include "storage/retrieval/ob_text_daat_iter.h"
  #include "storage/retrieval/ob_text_taat_iter.h"
  #include "storage/retrieval/ob_sparse_lookup_iter.h"
- 
+ #include "sql/das/ob_fts_bm25s_index.h"
+
  namespace oceanbase
  {
  namespace sql
@@ -123,8 +124,12 @@
    }
    const common::ObIArray<ObString> &get_query_tokens() const { return query_tokens_; }
    bool is_bm25s_skip_init() const { return bm25s_skip_init_; }
-   int64_t get_topk_limit() const { return topk_limit_; }
- private:
+   int get_topk_limit() const { return topk_limit_; }
+   void set_bm25s_mode(bool v) { is_bm25s_mode_ = v; }
+   bool is_bm25s_mode() const { return is_bm25s_mode_; }
+
+private:
+   int do_bm25s_search(int64_t &count, int64_t capacity);
    int init_das_iter_scan_params();
    static int init_das_iter_scan_param(
        const ObLSID &ls_id,
@@ -196,12 +201,16 @@
    bool check_rangekey_inited_;
    bool inv_idx_tablet_switched_;
    bool is_inited_;
-   bool bm25s_skip_init_;  // BM25S 快速路径：跳过存储层初始化
-   DISALLOW_COPY_AND_ASSIGN(ObDASTRMergeIter);
+   bool bm25s_skip_init_;  // BM25S 快速路径
+   bool is_bm25s_mode_;    // BM25S 模式：使用内存索引
+   bool bm25s_search_done_;
+   int64_t bm25s_cursor_;
+   ObSEArray<ObFtsBM25SIndex::DocScore, 256> bm25s_results_;
+  
+  DISALLOW_COPY_AND_ASSIGN(ObDASTRMergeIter);
  };
  
  } // namespace sql
  } // namespace oceanbase
  
  #endif // OB_DAS_TR_MERGE_ITER_H_
- 

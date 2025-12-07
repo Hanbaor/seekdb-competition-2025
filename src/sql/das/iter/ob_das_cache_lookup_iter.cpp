@@ -347,138 +347,24 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
       case INDEX_SCAN: {
         reset_lookup_state();
         
-        // ========== BM25S 快速路径 ==========
-        if (bm25s_fast_path_done_) {
-          state_ = FINISHED;
-          break;
-        }
-        
-        bool use_bm25s_fast_path = false;
-        ObSEArray<ObFtsBM25SIndex::DocScore, 256> bm25s_results;
-        
-        // 检查快速路径条件
-        if (g_bm25s_index.is_ready() && need_index_proj && 
-            index_table_iter_ && index_table_iter_->get_type() == DAS_ITER_TEXT_RETRIEVAL_MERGE) {
-          
-          ObDASTRMergeIter *tr_iter = static_cast<ObDASTRMergeIter*>(index_table_iter_);
-          const ObIArray<ObString> &query_tokens = tr_iter->get_query_tokens();
-          
-          // 收集有效 tokens
-          ObSEArray<ObString, 16> tokens;
-          for (int64_t i = 0; OB_SUCC(ret) && i < query_tokens.count(); ++i) {
-            const ObString &token = query_tokens.at(i);
-            if (token.ptr() != nullptr && token.length() > 0) {
-              if (OB_FAIL(tokens.push_back(token))) {
-                break;
-              }
-            }
-          }
-          
-          // 调用 BM25S 搜索（使用数组优化版本）
-          if (OB_SUCC(ret) && tokens.count() > 0) {
-            int64_t id_limit = 1000;  // id < 1000 过滤
-            int64_t top_k = tr_iter->get_topk_limit();
-            if (top_k <= 0) top_k = 10;  // 默认值
-            
-            if (OB_SUCCESS == g_bm25s_index.search_with_array(tokens, id_limit, top_k, bm25s_results)) {
-              use_bm25s_fast_path = true;
-            }
-          }
-        }
-        
-        // ========== BM25S 快速路径处理 ==========
-        if (use_bm25s_fast_path) do {
-          if (bm25s_results.count() == 0) {
-            lookup_rowkey_cnt_ = 0;
+        if (OB_FAIL(ret) || index_end_) {
+          // do nothing
+        } else if (OB_FAIL(index_table_iter_->get_next_rows(count, capacity))) {
+          if (OB_LIKELY(OB_ITER_END == ret)) {
+            ret = OB_SUCCESS;
             index_end_ = true;
-            bm25s_fast_path_done_ = true;
-            state_ = FINISHED;
-            break;
+          } else {
+            LOG_WARN("failed to get next rows from index iter", K(ret));
           }
-          
-          if (index_proj_rows_.index_scan_proj_exprs_.count() < 2) {
-            use_bm25s_fast_path = false;
-            break;
-          }
-          
-          ObExpr *doc_id_expr = index_proj_rows_.index_scan_proj_exprs_.at(0);
-          ObExpr *score_expr = index_proj_rows_.index_scan_proj_exprs_.at(1);
-          if (doc_id_expr == nullptr || score_expr == nullptr) {
-            use_bm25s_fast_path = false;
-            break;
-          }
-          
-          // 填充数据
-          ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx_);
-          sql::ObBitVector &doc_id_flags = doc_id_expr->get_evaluated_flags(*eval_ctx_);
-          sql::ObBitVector &score_flags = score_expr->get_evaluated_flags(*eval_ctx_);
-          
-          for (int64_t i = 0; OB_SUCC(ret) && i < bm25s_results.count(); ++i) {
-            guard.set_batch_idx(i);
-            int64_t doc_id = bm25s_results.at(i).doc_id;
-            double score = bm25s_results.at(i).score;
-            
-            ObDatum &doc_id_datum = doc_id_expr->locate_datum_for_write(*eval_ctx_);
-            doc_id_datum.set_uint(doc_id);
-            doc_id_flags.set(i);
-            doc_id_expr->set_evaluated_projected(*eval_ctx_);
-            
-            ObDatum &score_datum = score_expr->locate_datum_for_write(*eval_ctx_);
-            score_datum.set_double(score);
-            score_flags.set(i);
-            score_expr->set_evaluated_projected(*eval_ctx_);
-            
-            if (OB_FAIL(cached_doc_ids_.push_back(doc_id))) {
-              break;
-            }
-          }
-          
-          if (OB_FAIL(ret)) {
-            use_bm25s_fast_path = false;
-            break;
-          }
-          
-          if (OB_FAIL(index_proj_rows_.save(true, bm25s_results.count()))) {
-            use_bm25s_fast_path = false;
-            break;
-          }
-          
-          lookup_rowkey_cnt_ = bm25s_results.count();
-          index_end_ = true;
-          bm25s_fast_path_done_ = true;
-          state_ = OUTPUT_ROWS;
-        } while (0);
-        
-        if (use_bm25s_fast_path) {
-          break;
         }
-        // ========== 原路径 ==========
-        int64_t storage_count = 0;
-        int64_t index_capacity = 0;
         
-        // 先收集所有数据，包括 index_proj_rows_
-        while (OB_SUCC(ret) && !index_end_ && lookup_rowkey_cnt_ < default_batch_row_count_) {
-          storage_count = 0;
-          index_capacity = std::min(capacity, std::min(max_size_, default_batch_row_count_ - lookup_rowkey_cnt_));
-          index_table_iter_->clear_evaluated_flag();
-          if (OB_FAIL(index_table_iter_->get_next_rows(storage_count, index_capacity))) {
-            if (OB_UNLIKELY(OB_ITER_END != ret)) {
-              LOG_WARN("failed to get next rows from index table", K(ret));
-            } else {
-              if (storage_count == 0) {
-                index_end_ = true;
-              }
-              ret = OB_SUCCESS;
-            }
-          }
-          if (OB_SUCC(ret) && storage_count > 0) {
-            if (OB_FAIL(add_rowkeys_and_collect(storage_count))) {
-              LOG_WARN("failed to add row keys and collect", K(ret));
-            } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(true, storage_count))) {
-              LOG_WARN("save index proj rows failed", K(ret));
-            } else {
-              lookup_rowkey_cnt_ += storage_count;
-            }
+        if (OB_SUCC(ret) && count > 0) {
+          if (OB_FAIL(add_rowkeys_and_collect(count))) {
+            LOG_WARN("failed to add row keys and collect", K(ret));
+          } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(true, count))) {
+            LOG_WARN("save index proj rows failed", K(ret));
+          } else {
+            lookup_rowkey_cnt_ += count;
           }
         }
 

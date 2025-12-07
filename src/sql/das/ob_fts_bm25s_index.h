@@ -151,12 +151,25 @@ public:
 
   /**
    * @brief 搜索查询（全局数组优化版本，使用锁）
-   * 当 id_limit <= 2000 时使用数组优化，否则 fallback 到哈希表
    */
   int search_with_array(const common::ObIArray<common::ObString> &tokens,
                         int64_t id_limit,
                         int64_t top_k,
                         common::ObIArray<DocScore> &results);
+
+  /**
+   * @brief 获取某个 token 的倒排链（支持 id_limit 过滤）
+   * @param token 查询词
+   * @param id_limit 只返回 doc_id < id_limit 的部分（0 表示不过滤）
+   * @param start 输出：倒排链起始索引
+   * @param end 输出：倒排链结束索引（不包含）
+   * @return true 如果 token 存在
+   */
+  bool get_posting_list(const common::ObString &token, int64_t id_limit, uint64_t &start, uint64_t &end) const;
+  
+  // 直接访问倒排链数据
+  uint32_t get_doc_id(uint64_t idx) const { return doc_ids_.at(idx); }
+  float get_score(uint64_t idx) const { return scores_.at(idx); }
 
   // ========== 并行任务管理 ==========
   /**

@@ -1679,6 +1679,7 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
   if (FAILEDx(create_das_iter(alloc, merge_iter_param, tr_merge_iter))) {
     LOG_WARN("failed to create text retrieval merge iter", K(ret));
   }
+  // BM25S 快速路径：暂时禁用
 
   ObSEArray<ObDASIter *, 16> iters;
   int64_t size = merge_iter_param.taat_mode_ ? 1 : merge_iter_param.query_tokens_.count();
