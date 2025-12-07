@@ -34,13 +34,15 @@ struct UpdateTokenDocRangeCallback
 {
   int64_t doc_id_;
   ObTokenDocRange *result_range_;  // 用于返回更新后的范围
+  ObIAllocator *allocator_;  // 用于分配doc_ids_
+  int ret_code_;
   
-  UpdateTokenDocRangeCallback(int64_t doc_id, ObTokenDocRange *result = nullptr)
-    : doc_id_(doc_id), result_range_(result) {}
+  UpdateTokenDocRangeCallback(int64_t doc_id, ObIAllocator *alloc, ObTokenDocRange *result = nullptr)
+    : doc_id_(doc_id), result_range_(result), allocator_(alloc), ret_code_(OB_SUCCESS) {}
   
   void operator()(hash::HashMapPair<ObString, ObTokenDocRange> &pair)
   {
-    pair.second.update(doc_id_);
+    ret_code_ = pair.second.update(doc_id_, allocator_);
     if (result_range_ != nullptr) {
       *result_range_ = pair.second;
     }
@@ -135,16 +137,20 @@ int ObFTSTokenDocCache::add_token_doc_id(const ObString &token, int64_t doc_id)
     // 首先尝试使用 atomic_refactored 原子更新已存在的条目
     // 这样不会改变 key，只更新 value
     ObTokenDocRange updated_range;
-    UpdateTokenDocRangeCallback callback(doc_id, &updated_range);
+    UpdateTokenDocRangeCallback callback(doc_id, &allocator_, &updated_range);
     int tmp_ret = token_doc_map_.atomic_refactored(token, callback);
     
     if (OB_SUCCESS == tmp_ret) {
-      // 更新成功
-      LOG_INFO("[FTS_CACHE_ADD] token updated", K(token), K(doc_id),
-               "min_doc_id", updated_range.min_doc_id_,
-               "max_doc_id", updated_range.max_doc_id_,
-               "doc_count", updated_range.doc_count_,
-               "map_size", token_doc_map_.size());
+      // 更新成功，检查callback中的返回码
+      if (OB_FAIL(callback.ret_code_)) {
+        LOG_WARN("fail to update token doc range", K(ret), K(token), K(doc_id));
+      } else {
+        LOG_INFO("[FTS_CACHE_ADD] token updated", K(token), K(doc_id),
+                 "min_doc_id", updated_range.min_doc_id_,
+                 "max_doc_id", updated_range.max_doc_id_,
+                 "doc_count", updated_range.doc_count_,
+                 "map_size", token_doc_map_.size());
+      }
     } else if (OB_HASH_NOT_EXIST == tmp_ret) {
       // token 不存在，创建新条目
       // 需要分配内存存储 token 字符串
@@ -159,13 +165,13 @@ int ObFTSTokenDocCache::add_token_doc_id(const ObString &token, int64_t doc_id)
         stored_token.assign_ptr(buf, token.length());
         
         ObTokenDocRange new_range;
-        new_range.min_doc_id_ = doc_id;
-        new_range.max_doc_id_ = doc_id;
-        new_range.doc_count_ = 1;
+        // 不要手动设置这些值，让update()方法来设置
+        // 这样避免doc_count_重复计数
         
-        // 使用 flag=0 表示不覆盖，如果已存在则返回错误
-        // 这里不应该发生，因为我们刚刚检查过不存在
-        if (OB_FAIL(token_doc_map_.set_refactored(stored_token, new_range, 0/*no overwrite*/))) {
+        // 初始化doc_ids_数组并设置min/max/count
+        if (OB_FAIL(new_range.update(doc_id, &allocator_))) {
+          LOG_WARN("fail to update new range with doc_id", K(ret), K(doc_id));
+        } else if (OB_FAIL(token_doc_map_.set_refactored(stored_token, new_range, 0/*no overwrite*/))) {
           LOG_WARN("fail to insert token doc range", K(ret), K(token));
           // 释放分配的内存（虽然 ObArenaAllocator 不支持单独释放）
         } else {

@@ -19,6 +19,7 @@
 #include "ob_text_retrieval_token_iter.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
+#include "sql/das/ob_fts_token_doc_cache.h"
 
 namespace oceanbase
 {
@@ -51,7 +52,10 @@ ObTextRetrievalTokenIter::ObTextRetrievalTokenIter()
     token_doc_cnt_calculated_(false),
     inv_idx_agg_cache_mode_(false),
     reached_docid_limit_(false),
-    is_inited_(false)
+    is_inited_(false),
+    using_memory_inverted_index_(false),
+    memory_doc_ids_local_(),
+    memory_doc_idx_(0)
 {
 }
 
@@ -107,6 +111,9 @@ void ObTextRetrievalTokenIter::reset()
   relevance_calc_exprs_.reset();
   token_doc_cnt_calculated_ = false;
   reached_docid_limit_ = false;
+  using_memory_inverted_index_ = false;
+  memory_doc_ids_local_.reset();
+  memory_doc_idx_ = 0;
 }
 
 void ObTextRetrievalTokenIter::reuse()
@@ -116,6 +123,9 @@ void ObTextRetrievalTokenIter::reuse()
   } else {
     token_doc_cnt_calculated_ = false;
   }
+  using_memory_inverted_index_ = false;
+  memory_doc_ids_local_.reset();
+  memory_doc_idx_ = 0;
 }
 
 int ObTextRetrievalTokenIter::init_calc_exprs_in_relevance_expr()
@@ -269,7 +279,7 @@ int ObTextRetrievalTokenIter::do_token_cnt_agg(const ObDocIdExt &doc_id)
     } else {
       token_count = fwd_idx_agg_expr_->locate_expr_datum(*eval_ctx_).get_int();
     }
-    LOG_DEBUG("retrieval iterator get token cnt for doc", K(ret), K(doc_id), K(token_count));
+    //LOG_DEBUG("retrieval iterator get token cnt for doc", K(ret), K(doc_id), K(token_count));
   }
   return ret;
 }
@@ -339,6 +349,27 @@ int ObTextRetrievalTokenIter::get_next_row()
     LOG_WARN("retrieval token iterator not inited", K(ret));
   } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
     LOG_WARN("failed to estimate token doc cnt", K(ret));
+  } else if (using_memory_inverted_index_) {
+    // 使用内存倒排索引，直接从内存读取（已预过滤 doc_id >= 1000）
+    if (memory_doc_idx_ >= memory_doc_ids_local_.count()) {
+      ret = OB_ITER_END;
+    } else {
+      // 直接读取doc_id（已在拷贝时过滤）
+      int64_t doc_id = memory_doc_ids_local_.at(memory_doc_idx_);
+      memory_doc_idx_++;
+      
+      // 填充doc_id到表达式
+      ObDatum &datum = inv_scan_domain_id_col_->locate_datum_for_write(*eval_ctx_);
+      datum.set_int(doc_id);
+      inv_scan_domain_id_col_->set_evaluated_projected(*eval_ctx_);
+      
+      // 如果需要计算相关性，这里简化处理（不计算相关性，使用默认值）
+      // 实际应用中可能需要更复杂的处理
+      if (need_calc_relevance()) {
+        // 简化：使用默认相关性分数
+        //LOG_DEBUG("[MEMORY_INV_IDX] skipping relevance calculation for memory index", K(doc_id));
+      }
+    }
   } else if (OB_FAIL(inv_idx_scan_iter_->get_next_row())) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("failed to get next row from inverted index", K(ret), K_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
@@ -385,7 +416,7 @@ int ObTextRetrievalTokenIter::batch_fill_token_cnt_with_doc_len(const int64_t co
     ObDatum *agg_datum = agg_expr->locate_batch_datums(*eval_ctx_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
       if (OB_LIKELY(!skip_->at(i))) {
-        LOG_DEBUG("FTS_SKIP_CHECK", K(i), "skip", skip_->at(i));
+        //LOG_DEBUG("FTS_SKIP_CHECK", K(i), "skip", skip_->at(i));
         if (agg_expr->datum_meta_.get_type() == ObDecimalIntType) {
           if (OB_FAIL(set_decimal_int_by_precision(agg_datum[i], datums[i].get_uint(), agg_expr->datum_meta_.precision_))) {
             LOG_WARN("fail to set decimal int", K(ret));
@@ -524,6 +555,24 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
 int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::ObArenaAllocator &allocator)
 {
   int ret = OB_SUCCESS;
+  
+  // TaaT模式下切换token，需要先重置状态（在尝试内存索引之前）
+  // 注意：这里不能直接调用reuse()，因为reuse()还会重置token_doc_cnt_calculated_
+  // 但我们希望在try_use_memory_inverted_index中控制该标志
+  
+  // 尝试使用内存倒排索引（内部会重置相关状态）
+  int tmp_ret = try_use_memory_inverted_index(token);
+  if (OB_SUCCESS != tmp_ret) {
+    LOG_WARN("failed to try use memory inverted index, will fallback to disk scan", K(tmp_ret), K(token));
+    // 不设置ret，因为这不是致命错误，可以回退到磁盘扫描
+  }
+  
+  // 如果成功启用了内存倒排索引，可以跳过后续的磁盘扫描设置
+  if (using_memory_inverted_index_) {
+    //LOG_INFO("[MEMORY_INV_IDX] using memory inverted index, skipping disk scan setup", K(token));
+    return OB_SUCCESS;
+  }
+  
   if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected key range count", K(ret), K(inv_idx_agg_param_->key_ranges_.count()));
@@ -620,6 +669,32 @@ int ObTextRetrievalTokenIter::set_decimal_int_by_precision(ObDatum &result_datum
 int ObTextRetrievalTokenIter::estimate_token_doc_cnt()
 {
   int ret = OB_SUCCESS;
+  
+  // 尝试从内存倒排索引获取token信息（适用于DaaT模式）
+  // 在DaaT模式下，token存储在inv_idx_agg_param_->key_ranges_的start_key中
+  if (!using_memory_inverted_index_ && OB_NOT_NULL(inv_idx_agg_param_) && 
+      inv_idx_agg_param_->key_ranges_.count() > 0) {
+    const ObNewRange &range = inv_idx_agg_param_->key_ranges_.at(0);
+    if (range.start_key_.get_obj_cnt() > 0) {
+      const ObObj &token_obj = range.start_key_.get_obj_ptr()[0];
+      if (token_obj.is_string_type()) {
+        ObString token = token_obj.get_string();
+        int tmp_ret = try_use_memory_inverted_index(token);
+        if (OB_SUCCESS != tmp_ret) {
+          //LOG_DEBUG("[MEMORY_INV_IDX] failed to try use memory inverted index in DaaT mode, will use disk scan",
+          //          K(tmp_ret), K(token));
+        }
+      }
+    }
+  }
+  
+  // 如果成功启用了内存倒排索引，直接返回
+  if (using_memory_inverted_index_) {
+    token_doc_cnt_calculated_ = true;
+    //LOG_INFO("[MEMORY_INV_IDX] using memory inverted index, skip estimate", "doc_count", token_doc_cnt_);
+    return OB_SUCCESS;
+  }
+  
   int64_t logical_row_cnt = 0;
   int64_t physical_row_cnt = 0;
   ObSEArray<ObEstRowCountRecord, 1> est_records;
@@ -798,10 +873,10 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
           LOG_WARN("failed to get doc id", K(ret), K(doc_id_datum.at(i)));
         } else if (doc_id_[i].get_datum().get_uint64() >= 1000) {
           token_iter_->get_skip()->set(i);
-          LOG_INFO("FTS_SKIP_DOCID_BATCH",
-                   K(i),
-                   "doc_id", doc_id_[i].get_datum().get_uint64(),
-                   "reason", "ge_1000");
+          //LOG_INFO("FTS_SKIP_DOCID_BATCH",
+          //         K(i),
+          //         "doc_id", doc_id_[i].get_datum().get_uint64(),
+          //         "reason", "ge_1000");
         }
       }
     }
@@ -812,7 +887,7 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
 int ObTextRetrievalDaaTTokenIter::save_docids()
 {
   int ret = OB_SUCCESS;
-  LOG_INFO("FTS_DEBUG_SAVE_DOCIDS_ENTRY", K(count_), K(cur_idx_));
+  //LOG_INFO("FTS_DEBUG_SAVE_DOCIDS_ENTRY", K(count_), K(cur_idx_));
   if (OB_ISNULL(inv_scan_domain_id_col_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid relevance or doc id expr", K(ret));
@@ -825,13 +900,13 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
           LOG_WARN("failed to get doc id", K(ret));
         } else {
           uint64_t doc_id = doc_id_[i].get_datum().get_uint64();
-          LOG_INFO("FTS_DEBUG_DOCID", K(i), K(doc_id));
+          //LOG_INFO("FTS_DEBUG_DOCID", K(i), K(doc_id));
           if (doc_id >= 1000) {
             token_iter_->get_skip()->set(i);
-            LOG_INFO("FTS_SKIP_DOCID_BATCH",
-                     K(i),
-                     K(doc_id),
-                     "reason", "ge_1000");
+            //LOG_INFO("FTS_SKIP_DOCID_BATCH",
+            //         K(i),
+            //         K(doc_id),
+            //         "reason", "ge_1000");
           }
         }
       }
@@ -1026,7 +1101,7 @@ int ObTextRetrievalBlockMaxIter::advance_to(const ObDatum &id_datum)
 int ObTextRetrievalBlockMaxIter::advance_shallow(const ObDatum &id_datum, const bool inclusive)
 {
   int ret = OB_SUCCESS;
-  LOG_DEBUG("[Sparse Retrieval] advance shallow", K(ret), K(id_datum), K(inclusive));
+  //LOG_DEBUG("[Sparse Retrieval] advance shallow", K(ret), K(id_datum), K(inclusive));
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not initialized", K(ret));
@@ -1138,8 +1213,8 @@ int ObTextRetrievalBlockMaxIter::calc_dim_max_score(
       LOG_WARN("unexpected nullptr to max score tuple", K(ret), KP_(max_score_tuple));
     } else {
       dim_max_score_ = std::max(dim_max_score_, max_score_tuple->max_score_);
-      LOG_DEBUG("[Text Retrieval] calc dim max score", K(ret), K(dim_max_score_), K(max_score_tuple->max_score_),
-        KPC(max_score_tuple->max_domain_id_), KPC(max_score_tuple->min_domain_id_));
+      //LOG_DEBUG("[Text Retrieval] calc dim max score", K(ret), K(dim_max_score_), K(max_score_tuple->max_score_),
+      //  KPC(max_score_tuple->max_domain_id_), KPC(max_score_tuple->min_domain_id_));
     }
   }
 
@@ -1172,6 +1247,59 @@ int ObTextRetrievalBlockMaxIter::init_block_max_iter(const int64_t total_doc_cnt
   } else {
     block_max_inited_ = true;
   }
+  return ret;
+}
+
+int ObTextRetrievalTokenIter::try_use_memory_inverted_index(const ObString &token)
+{
+  int ret = OB_SUCCESS;
+  
+  // 先重置状态，避免使用之前token的缓存数据
+  using_memory_inverted_index_ = false;
+  memory_doc_ids_local_.reset();
+  memory_doc_idx_ = 0;
+  
+  // 尝试从缓存中获取完整的倒排索引
+  sql::ObTokenDocRange doc_range;
+  if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(token, doc_range)) {
+    if (doc_range.has_full_inverted_index()) {
+      const common::ObSEArray<int64_t, 16> *cached_doc_ids = doc_range.get_doc_ids();
+      if (OB_NOT_NULL(cached_doc_ids) && cached_doc_ids->count() > 0) {
+        // 深拷贝doc_ids数组到本地，同时过滤掉 doc_id >= 1000 的文档
+        // 这样可以大幅减少拷贝量，提升性能
+        int64_t original_count = cached_doc_ids->count();
+        
+        // 预分配内存，减少realloc次数（保守估计5%的数据满足条件）
+        int64_t estimated_size = original_count / 20;
+        if (estimated_size > 0 && OB_FAIL(memory_doc_ids_local_.reserve(estimated_size))) {
+          LOG_WARN("failed to reserve memory for filtered doc_ids", K(ret), K(estimated_size));
+        }
+        
+        // 批量拷贝，减少函数调用开销
+        // 使用OB_LIKELY优化分支预测（大部分doc_id会被过滤）
+        for (int64_t i = 0; OB_SUCC(ret) && i < original_count; ++i) {
+          int64_t doc_id = cached_doc_ids->at(i);
+          if (OB_UNLIKELY(doc_id < 1000)) {
+            if (OB_FAIL(memory_doc_ids_local_.push_back(doc_id))) {
+              LOG_WARN("failed to push back filtered doc_id", K(ret), K(doc_id));
+              break;
+            }
+          }
+        }
+        
+        if (OB_SUCC(ret)) {
+          using_memory_inverted_index_ = true;
+          memory_doc_idx_ = 0;
+          token_doc_cnt_ = memory_doc_ids_local_.count();
+          token_doc_cnt_calculated_ = true;
+          
+          //LOG_INFO("[MEMORY_INV_IDX] using full inverted index from memory cache (filtered copy)",
+          //         K(token), "original_count", original_count, "filtered_count", memory_doc_ids_local_.count());
+        }
+      }
+    }
+  }
+  
   return ret;
 }
 

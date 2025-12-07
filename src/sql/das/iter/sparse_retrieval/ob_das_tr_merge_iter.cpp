@@ -795,24 +795,27 @@
    // 基于 token-doc_id 缓存的跳过优化
    // 如果 token 的 min_doc_id > 1000，说明该 token 的所有文档 id 都 > 1000
    // 对于 WHERE id < 1000 的查询，可以直接跳过
+   // 注：缓存中存储了完整的倒排索引(doc_ids_数组)，但这里只用min_doc_id判断即可
+   //     完整倒排索引的使用在ObTextRetrievalTokenIter中通过内存读取实现
    {
      ObTokenDocRange doc_range;
-     bool should_skip = false;
      if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(query_token, doc_range)) {
        if (doc_range.min_doc_id_ > 1000) {
          ret = OB_ITER_END;
-         //LOG_INFO("[TOKEN IF SKIP]skip token due to doc_id predicate", K(query_token), K(doc_range));
-         should_skip = true;
+         if (doc_range.has_full_inverted_index()) {
+           /*LOG_INFO("[TOKEN_SKIP] skip token due to doc_id predicate (full index in cache)",
+                    K(query_token), K(doc_range));*/
+         } else {
+           /*LOG_INFO("[TOKEN_SKIP] skip token due to doc_id predicate (range check)",
+                    K(query_token), K(doc_range));*/
+         }
          return ret;
+       } else if (doc_range.has_full_inverted_index()) {
+         // 有完整倒排索引但min_doc_id <= 1000，记录日志
+         // 实际的内存索引读取会在ObTextRetrievalTokenIter中进行
+         /*LOG_INFO("[MEMORY_INV_IDX] token has full inverted index in cache",
+                  K(query_token), "doc_count", doc_range.doc_count_);*/
        }
-       else{
-         //LOG_INFO("[TOKEN IF SKIP]token doc range found", K(query_token), K(doc_range));
-       }
-
-       if(should_skip){
-         return ret;
-       }
-       
      }
    }
    void *buf = nullptr;

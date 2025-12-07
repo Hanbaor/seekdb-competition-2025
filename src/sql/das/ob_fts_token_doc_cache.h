@@ -30,7 +30,7 @@ namespace sql
 {
 
 /**
- * @brief Token到文档ID范围的映射信息
+ * @brief Token到文档ID范围的映射信息（包含完整倒排索引）
  */
 struct ObTokenDocRange
 {
@@ -38,18 +38,29 @@ public:
   ObTokenDocRange()
     : min_doc_id_(INT64_MAX),
       max_doc_id_(INT64_MIN),
-      doc_count_(0)
+      doc_count_(0),
+      doc_ids_(nullptr),
+      allocator_(nullptr)
   {}
+
+  ~ObTokenDocRange()
+  {
+    // ObArenaAllocator不支持单独释放，所以这里不需要手动释放
+  }
 
   void reset()
   {
     min_doc_id_ = INT64_MAX;
     max_doc_id_ = INT64_MIN;
     doc_count_ = 0;
+    if (doc_ids_ != nullptr) {
+      doc_ids_->reset();
+    }
   }
 
-  void update(int64_t doc_id)
+  int update(int64_t doc_id, common::ObIAllocator *alloc)
   {
+    int ret = common::OB_SUCCESS;
     if (doc_id < min_doc_id_) {
       min_doc_id_ = doc_id;
     }
@@ -57,6 +68,29 @@ public:
       max_doc_id_ = doc_id;
     }
     doc_count_++;
+    
+    // 添加到doc_ids_列表中
+    if (nullptr == doc_ids_) {
+      if (OB_ISNULL(alloc)) {
+        ret = common::OB_INVALID_ARGUMENT;
+      } else {
+        allocator_ = alloc;
+        void *buf = allocator_->alloc(sizeof(common::ObSEArray<int64_t, 16>));
+        if (OB_ISNULL(buf)) {
+          ret = common::OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          doc_ids_ = new (buf) common::ObSEArray<int64_t, 16>();
+        }
+      }
+    }
+    
+    if (common::OB_SUCCESS == ret && doc_ids_ != nullptr) {
+      if (common::OB_SUCCESS != doc_ids_->push_back(doc_id)) {
+        ret = common::OB_ERR_UNEXPECTED;
+      }
+    }
+    
+    return ret;
   }
 
   void merge(const ObTokenDocRange &other)
@@ -68,7 +102,18 @@ public:
       max_doc_id_ = other.max_doc_id_;
     }
     doc_count_ += other.doc_count_;
+    
+    // 合并doc_ids_列表
+    if (other.doc_ids_ != nullptr && doc_ids_ != nullptr) {
+      for (int64_t i = 0; i < other.doc_ids_->count(); ++i) {
+        doc_ids_->push_back(other.doc_ids_->at(i));
+      }
+    }
   }
+
+  // 获取doc_ids数组（只读）
+  const common::ObSEArray<int64_t, 16> *get_doc_ids() const { return doc_ids_; }
+  bool has_full_inverted_index() const { return doc_ids_ != nullptr && doc_ids_->count() > 0; }
 
   TO_STRING_KV(K_(min_doc_id), K_(max_doc_id), K_(doc_count));
 
@@ -76,6 +121,8 @@ public:
   int64_t min_doc_id_;
   int64_t max_doc_id_;
   int64_t doc_count_;
+  common::ObSEArray<int64_t, 16> *doc_ids_;  // 完整的倒排索引：doc_id列表（有序）
+  common::ObIAllocator *allocator_;  // 用于分配doc_ids_
 };
 
 /**

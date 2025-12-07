@@ -81,6 +81,9 @@ public:
   virtual int get_next_batch(const int64_t capacity, int64_t &count) override;
   virtual int advance_to(const ObDatum &id_datum) override;
   virtual int update_scan_param(const ObString &token, common::ObArenaAllocator &allocator);
+  
+  // 尝试使用内存缓存中的倒排索引
+  int try_use_memory_inverted_index(const ObString &token);
 public:
   sql::ObBitVector *get_skip() { return skip_; }
   int get_token_doc_cnt(int64_t &token_doc_cnt) const;
@@ -136,6 +139,12 @@ private:
   // for MLDR competition: hard limit docid/id < 1000 to early stop inverted scan
   bool reached_docid_limit_;
   bool is_inited_;
+  
+  // 内存倒排索引相关
+  bool using_memory_inverted_index_;  // 是否使用内存倒排索引
+  common::ObSEArray<int64_t, 64> memory_doc_ids_local_;  // 深拷贝的doc_id列表（避免悬空指针）
+  int64_t memory_doc_idx_;  // 当前内存doc_id的索引位置
+  
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
 };
 
