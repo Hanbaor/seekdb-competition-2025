@@ -18,6 +18,7 @@
  #include "ob_das_tr_merge_iter.h"
  #include "sql/das/ob_das_ir_define.h"
  #include "sql/das/ob_fts_token_doc_cache.h"
+ #include "sql/das/ob_fts_bm25s_index.h"
   
   namespace oceanbase
   {
@@ -56,7 +57,8 @@
       flags_(0),
       check_rangekey_inited_(false),
       inv_idx_tablet_switched_(false),
-      is_inited_(false)
+      is_inited_(false),
+      bm25s_skip_init_(false)
   {
   }
   
@@ -895,6 +897,14 @@
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
     } else {
+      // BM25S 快速路径：如果索引可用且有 query_tokens，跳过存储层初始化
+      if (g_bm25s_index.is_ready() && query_tokens_.count() > 0) {
+        bm25s_skip_init_ = true;
+        check_rangekey_inited_ = true;  // 假装已初始化
+        // 跳过所有存储层初始化，直接返回
+        return ret;
+      }
+      
       if (function_lookup_mode_) {
         // skip the following, which should have been done
       } else if (OB_FAIL(init_das_iter_scan_params())) {
@@ -1111,6 +1121,11 @@
     if (IS_NOT_INIT) {
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
+    } else if (bm25s_skip_init_) {
+      // BM25S 快速路径：存储层未初始化，直接返回结束
+      // 实际数据由 ObDASCacheLookupIter 中的快速路径提供
+      count = 0;
+      ret = OB_ITER_END;
     } else if (OB_ISNULL(sparse_retrieval_iter_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("sparse retrieval iter is null", K(ret));

@@ -36,32 +36,10 @@ using namespace common;
 namespace sql
 {
 
-// ========== 持久化日志函数 ==========
-static const char* BM25S_LOG_FILE = "/data/obcluster/bm25s_debug.log";
-
+// ========== 持久化日志函数（性能测试时禁用）==========
 void bm25s_log(const char* fmt, ...) {
-  FILE* f = fopen(BM25S_LOG_FILE, "a");
-  if (f) {
-    // 时间戳
-    time_t now = time(nullptr);
-    struct tm* tm_info = localtime(&now);
-    char time_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
-    
-    // 线程ID
-    pthread_t tid = pthread_self();
-    
-    fprintf(f, "[%s][tid=%lu] ", time_buf, (unsigned long)tid);
-    
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(f, fmt, args);
-    va_end(args);
-    
-    fprintf(f, "\n");
-    fflush(f);
-    fclose(f);
-  }
+  // 空函数，不输出任何日志
+  (void)fmt;
 }
 
 // 静态成员定义
@@ -152,7 +130,6 @@ int ObFtsBM25SIndex::init()
         raw_entry_count_ = 0;
         is_inited_ = true;
         LOG_INFO("ObFtsBM25SIndex initialized (bucketed)", K(bucket_dir_path_), K(NUM_BUCKETS));
-        bm25s_log("INIT: bucket_dir=%s, num_buckets=%ld", bucket_dir_path_, NUM_BUCKETS);
       }
     }
   }
@@ -246,14 +223,7 @@ int ObFtsBM25SIndex::collect_raw_data(const common::ObString &token, int64_t doc
       if (OB_SUCC(ret)) {
         // 原子更新计数
         ATOMIC_AAF(&bucket_entry_counts_[bucket_id], 1);
-        int64_t cur_count = ATOMIC_AAF(&raw_entry_count_, 1);
-        
-        // 每 1000000 条记录输出一次日志（减少 IO 开销）
-        if (cur_count % 1000000 == 0) {
-          bm25s_log("COLLECT: raw_entry_count=%ld, unique_docs=%ld, vocab_size=%ld, active_collectors=%ld",
-                    cur_count, unique_docs_.size(), collect_token_to_id_.size(), 
-                    ATOMIC_LOAD(&active_collectors_));
-        }
+        ATOMIC_AAF(&raw_entry_count_, 1);
       }
     }
     
@@ -422,9 +392,6 @@ int ObFtsBM25SIndex::finalize()
       
       LOG_INFO("BM25S finalize starting (bucketed)",
                K_(total_docs), K_(avg_doc_len), K(vocab_size), K_(raw_entry_count), K(NUM_BUCKETS));
-      bm25s_log("FINALIZE_START: total_docs=%ld, avg_doc_len=%.2f, vocab_size=%ld, raw_entry_count=%ld, active_collectors=%ld",
-                total_docs_, avg_doc_len_, vocab_size, raw_entry_count_, ATOMIC_LOAD(&active_collectors_));
-      
       // 关闭所有桶文件准备读取
       for (int i = 0; i < NUM_BUCKETS; i++) {
         if (bucket_files_[i] != nullptr) {
@@ -608,10 +575,11 @@ int ObFtsBM25SIndex::finalize()
         rmdir(bucket_dir_path_);
       }
       
-      // 清理收集阶段的数据
+      // 清理收集阶段的数据（但保留 allocator_，因为 token_to_id_ 中的 token 字符串需要它）
       collect_token_to_id_.reuse();
       unique_docs_.reuse();
-      allocator_.reset();
+      // 注意：不能调用 allocator_.reset()，因为 token_to_id_ 中的 ObString 指向这些内存！
+      // allocator_.reset();
       
       if (OB_SUCC(ret)) {
         is_finalized_ = true;
@@ -625,11 +593,6 @@ int ObFtsBM25SIndex::finalize()
                  "total_entries", scores_.count(),
                  "elapsed_ms", elapsed_ms,
                  K(max_bucket_size));
-        bm25s_log("FINALIZE_DONE: total_docs=%ld, vocab_size=%ld, total_entries=%ld, elapsed_ms=%.2f",
-                  total_docs_, token_to_id_.size(), scores_.count(), elapsed_ms);
-        
-        dump_csc_to_file("./bm25s_csc_index.txt");
-        dump_finalize_time("./bm25s_finalize_time.txt", elapsed_ms, max_bucket_size, sort_mem_increase);
       }
     }
   }
@@ -661,9 +624,8 @@ int ObFtsBM25SIndex::search(const ObIArray<ObString> &tokens,
       const ObString &token = tokens.at(t);
       uint32_t token_id = 0;
       
-      if (token_to_id_.get_refactored(token, token_id) != OB_SUCCESS) {
-        // token 不存在，跳过
-        continue;
+      if (OB_SUCCESS != token_to_id_.get_refactored(token, token_id)) {
+        continue;  // token 不存在，跳过
       }
       
       uint64_t start = token_ptr_.at(token_id);

@@ -94,7 +94,8 @@ public:
       store_allocator_("SqlCacheLookup", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID),
       index_proj_rows_(),
       cached_doc_ids_(store_allocator_),
-      cached_results_(store_allocator_)
+      cached_results_(store_allocator_),
+      bm25s_fast_path_done_(false)
   {}
   virtual ~ObDASCacheLookupIter() {}
 
@@ -116,6 +117,7 @@ private:
   IndexProjRowStore index_proj_rows_;
   common::ObFixedArray<uint64_t, common::ObIAllocator> cached_doc_ids_;
   common::ObFixedArray<ScalarFields, common::ObIAllocator> cached_results_;
+  bool bm25s_fast_path_done_;  // BM25S 快速路径已完成标志
 };
 
 }  // namespace sql

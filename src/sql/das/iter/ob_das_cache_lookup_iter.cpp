@@ -19,6 +19,8 @@
 #include "sql/engine/ob_exec_context.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/das/ob_fts_scalar_cache.h"
+#include "sql/das/ob_fts_bm25s_index.h"
+#include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
 #include "storage/concurrency_control/ob_data_validation_service.h"
 
 namespace oceanbase
@@ -173,6 +175,7 @@ int ObDASCacheLookupIter::inner_reuse()
     LOG_WARN("failed to reuse das lookup iter", K(ret));
   } else {
     index_proj_rows_.reuse();
+    bm25s_fast_path_done_ = false;  // 重置快速路径标志
   }
   return ret;
 }
@@ -343,6 +346,113 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
     switch (state_) {
       case INDEX_SCAN: {
         reset_lookup_state();
+        
+        // ========== BM25S 快速路径 ==========
+        if (bm25s_fast_path_done_) {
+          state_ = FINISHED;
+          break;
+        }
+        
+        bool use_bm25s_fast_path = false;
+        ObSEArray<ObFtsBM25SIndex::DocScore, 256> bm25s_results;
+        
+        // 检查快速路径条件
+        if (g_bm25s_index.is_ready() && need_index_proj && 
+            index_table_iter_ && index_table_iter_->get_type() == DAS_ITER_TEXT_RETRIEVAL_MERGE) {
+          
+          ObDASTRMergeIter *tr_iter = static_cast<ObDASTRMergeIter*>(index_table_iter_);
+          const ObIArray<ObString> &query_tokens = tr_iter->get_query_tokens();
+          
+          // 收集有效 tokens
+          ObSEArray<ObString, 16> tokens;
+          for (int64_t i = 0; OB_SUCC(ret) && i < query_tokens.count(); ++i) {
+            const ObString &token = query_tokens.at(i);
+            if (token.ptr() != nullptr && token.length() > 0) {
+              if (OB_FAIL(tokens.push_back(token))) {
+                break;
+              }
+            }
+          }
+          
+          // 调用 BM25S 搜索
+          if (OB_SUCC(ret) && tokens.count() > 0) {
+            int64_t id_limit = 1000;  // id < 1000 过滤
+            int64_t top_k = tr_iter->get_topk_limit();
+            if (top_k <= 0) top_k = 10;  // 默认值
+            
+            if (OB_SUCCESS == g_bm25s_index.search(tokens, id_limit, top_k, bm25s_results)) {
+              use_bm25s_fast_path = true;
+            }
+          }
+        }
+        
+        // ========== BM25S 快速路径处理 ==========
+        if (use_bm25s_fast_path) do {
+          if (bm25s_results.count() == 0) {
+            lookup_rowkey_cnt_ = 0;
+            index_end_ = true;
+            bm25s_fast_path_done_ = true;
+            state_ = FINISHED;
+            break;
+          }
+          
+          if (index_proj_rows_.index_scan_proj_exprs_.count() < 2) {
+            use_bm25s_fast_path = false;
+            break;
+          }
+          
+          ObExpr *doc_id_expr = index_proj_rows_.index_scan_proj_exprs_.at(0);
+          ObExpr *score_expr = index_proj_rows_.index_scan_proj_exprs_.at(1);
+          if (doc_id_expr == nullptr || score_expr == nullptr) {
+            use_bm25s_fast_path = false;
+            break;
+          }
+          
+          // 填充数据
+          ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx_);
+          sql::ObBitVector &doc_id_flags = doc_id_expr->get_evaluated_flags(*eval_ctx_);
+          sql::ObBitVector &score_flags = score_expr->get_evaluated_flags(*eval_ctx_);
+          
+          for (int64_t i = 0; OB_SUCC(ret) && i < bm25s_results.count(); ++i) {
+            guard.set_batch_idx(i);
+            int64_t doc_id = bm25s_results.at(i).doc_id;
+            double score = bm25s_results.at(i).score;
+            
+            ObDatum &doc_id_datum = doc_id_expr->locate_datum_for_write(*eval_ctx_);
+            doc_id_datum.set_uint(doc_id);
+            doc_id_flags.set(i);
+            doc_id_expr->set_evaluated_projected(*eval_ctx_);
+            
+            ObDatum &score_datum = score_expr->locate_datum_for_write(*eval_ctx_);
+            score_datum.set_double(score);
+            score_flags.set(i);
+            score_expr->set_evaluated_projected(*eval_ctx_);
+            
+            if (OB_FAIL(cached_doc_ids_.push_back(doc_id))) {
+              break;
+            }
+          }
+          
+          if (OB_FAIL(ret)) {
+            use_bm25s_fast_path = false;
+            break;
+          }
+          
+          if (OB_FAIL(index_proj_rows_.save(true, bm25s_results.count()))) {
+            use_bm25s_fast_path = false;
+            break;
+          }
+          
+          lookup_rowkey_cnt_ = bm25s_results.count();
+          index_end_ = true;
+          bm25s_fast_path_done_ = true;
+          state_ = OUTPUT_ROWS;
+        } while (0);
+        
+        if (use_bm25s_fast_path) {
+          break;
+        }
+        // ========== 原路径 ==========
         int64_t storage_count = 0;
         int64_t index_capacity = 0;
         
@@ -362,7 +472,6 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             }
           }
           if (OB_SUCC(ret) && storage_count > 0) {
-            // 在 add_rowkeys 过程中同时收集 doc_ids
             if (OB_FAIL(add_rowkeys_and_collect(storage_count))) {
               LOG_WARN("failed to add row keys and collect", K(ret));
             } else if (need_index_proj && OB_FAIL(index_proj_rows_.save(true, storage_count))) {
@@ -390,7 +499,7 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         if (OB_SUCC(ret)) {
           if (OB_LIKELY(lookup_rowkey_cnt_ > 0)) {
             if (will_cache_hit) {
-              state_ = OUTPUT_ROWS;  // 全部缓存命中，跳过回表
+              state_ = OUTPUT_ROWS;
             } else {
               state_ = DO_LOOKUP;
             }
@@ -427,9 +536,7 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         bool all_cache_hit = false;
         int64_t cache_fill_count = 0;
         
-        if (scan_cache_candidate) {  // 尝试缓存命中路径
-          // 索引扫描已经应用了 WHERE 条件（id < 1000 等），无需再过滤
-          // 直接检查 doc_ids 是否都在缓存中
+        if (scan_cache_candidate) {
           all_cache_hit = (total_doc_ids > 0);
           for (int64_t i = 0; i < total_doc_ids; ++i) {
             uint64_t doc_id = cached_doc_ids_.at(i);
@@ -559,7 +666,6 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         }
         
         // 清理 doc_ids 缓存，准备下一批次
-        // 注意：使用 clear() 而不是 reuse()，因为 reuse() 会重置初始化状态
         cached_doc_ids_.clear();
         
         // === 状态转换 ===

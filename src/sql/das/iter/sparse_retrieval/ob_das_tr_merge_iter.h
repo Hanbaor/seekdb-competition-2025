@@ -121,6 +121,9 @@
    int get_query_max_score(double &score) {
      return sparse_retrieval_iter_->get_query_max_score(score);
    }
+   const common::ObIArray<ObString> &get_query_tokens() const { return query_tokens_; }
+   bool is_bm25s_skip_init() const { return bm25s_skip_init_; }
+   int64_t get_topk_limit() const { return topk_limit_; }
  private:
    int init_das_iter_scan_params();
    static int init_das_iter_scan_param(
@@ -193,6 +196,7 @@
    bool check_rangekey_inited_;
    bool inv_idx_tablet_switched_;
    bool is_inited_;
+   bool bm25s_skip_init_;  // BM25S 快速路径：跳过存储层初始化
    DISALLOW_COPY_AND_ASSIGN(ObDASTRMergeIter);
  };
  
