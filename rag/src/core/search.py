@@ -26,14 +26,13 @@ OCEANBASE_DBNAME = os.getenv("OCEANBASE_DBNAME")
 TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
-# TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 25  # Optimal value for LLM Rerank - 65.29 best score
+TOP_K = 40  # 增加召回数量，提高正确文件命中率
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
 
 
-def _search_with_retry(client, index: str, body: dict, max_retries: int = 30, backoff_base: float = 0.5):
+def _search_with_retry(client, index: str, body: dict, max_retries: int = 10, backoff_base: float = 0.2):
     last_exception = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -154,12 +153,17 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
 候选文档片段（共{len(top_results)}个）：
 {candidates_text}
 
-请仔细分析每个候选片段的内容，判断哪一个最能准确、完整地回答这个问题。或者和问题最相关
+请仔细分析每个候选片段的内容，判断哪一个最能**直接、精确**地回答这个问题。
+
+选择原则（按优先级）：
+1. **内容直接性**：优先选择直接包含问题所问具体信息（如数字、定义、列表）的片段
+2. **信息完整性**：选择能完整回答问题的片段，而非仅提及相关概念的片段
+3. **来源权威性**：如多个片段内容相似，优先选择研报标题与问题主题最匹配的文件
 
 要求：
 1. 必须从上述候选中选择一个
 2. 只返回一个JSON对象：{{"filename": "完整文件名.pdf", "page": 页码数字, "reason": "选择理由（一句话）"}}
-3. filename必须与候选中的文件名完全一致，页码也一致并且是对应的
+3. filename必须与候选中的文件名完全一致，页码也必须是该候选对应的页码
 4. 不要有任何其他解释文字
 
 返回："""
