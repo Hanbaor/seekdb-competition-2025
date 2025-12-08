@@ -31,7 +31,7 @@ def generate_response(
     embedding_text: str,
     model: str = "text-embedding-v4",
     dimensions: int = 2048,  # Default 2048 for highest precision
-    max_retries: int = 20,
+    max_retries: int = 3,  # 最小重试
     initial_backoff: float = 1.0,
 ) -> List[float]:
     """

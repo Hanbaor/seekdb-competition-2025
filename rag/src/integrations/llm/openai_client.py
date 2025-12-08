@@ -26,7 +26,7 @@ llm = OpenAI(
 def generate_response(
     messages: List[Dict[str, str]],
     model="qwen-plus-latest",
-    max_retries: int = 30,
+    max_retries: int = 3,  # 最小重试
     initial_backoff: float = 1.0,
     timeout: float = 300.0,
     temperature: float = 0.0,
