@@ -25,106 +25,56 @@ llm = OpenAI(
 
 def generate_response(
     messages: List[Dict[str, str]],
-    model="qwen-plus-latest",
-    max_retries: int = 30,
-    initial_backoff: float = 1.0,
+    model: str = "qwen-plus",
     timeout: float = 300.0,
     temperature: float = 0.0,
+    wait_seconds: float = 2.0,
 ) -> str:
     """
-    Generate a response from the LLM with error handling and retry logic.
-
+    Call LLM to generate response, retry indefinitely on transient errors.
+    
     Args:
-        messages: List of message dictionaries with 'role' and 'content' keys
-        model: Model name to use for generation (default: read from LLM_MODEL_NAME env var)
-        max_retries: Maximum number of retry attempts
-        initial_backoff: Initial backoff time in seconds (doubles on each retry)
-        timeout: Request timeout in seconds (default: 300.0)
-        temperature: Sampling temperature (0.0 for deterministic, higher for more creative)
-
+        messages: List of message dicts
+        model: Model name
+        timeout: Request timeout in seconds
+        temperature: Sampling temperature
+        wait_seconds: Wait time between retries
+    
     Returns:
-        The generated response content as a string
-
-    Raises:
-        APIError: If the API request fails after all retries
-        ValueError: If the response is empty or invalid
-        TimeoutError: If the request times out
+        Generated response text
     """
-    last_exception = None
-
-    for attempt in range(max_retries + 1):
+    retry_count = 0
+    
+    while True:
+        retry_count += 1
         try:
-            response = llm.chat.completions.create(
+            result = llm.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
                 timeout=timeout,
             )
-
-            if not response.choices or not response.choices[0].message.content:
+            
+            content = result.choices[0].message.content if result.choices else None
+            if not content:
                 raise ValueError("Empty response from API")
-
-            return response.choices[0].message.content
-
-        except RateLimitError as e:
-            last_exception = e
-            if attempt < max_retries:
-                backoff_time = initial_backoff * (2**attempt)
-                print(
-                    f"Rate limit exceeded. Retrying in {backoff_time:.2f} seconds... (attempt {attempt + 1}/{max_retries + 1})"
-                )
-                time.sleep(backoff_time)
+            
+            return content
+            
+        except (RateLimitError, APIConnectionError, TimeoutError) as err:
+            print(f"[Retry {retry_count}] {err.__class__.__name__}: retrying in {wait_seconds}s...")
+            time.sleep(wait_seconds)
+            
+        except APIError as err:
+            # Server errors are retryable, client errors are not
+            if err.status_code and err.status_code >= 500:
+                print(f"[Retry {retry_count}] Server error {err.status_code}: retrying in {wait_seconds}s...")
+                time.sleep(wait_seconds)
             else:
-                print(f"Rate limit error after {max_retries + 1} attempts")
-
-        except APIConnectionError as e:
-            last_exception = e
-            if attempt < max_retries:
-                backoff_time = initial_backoff * (2**attempt)
-                print(
-                    f"Connection error. Retrying in {backoff_time:.2f} seconds... (attempt {attempt + 1}/{max_retries + 1})"
-                )
-                time.sleep(backoff_time)
-            else:
-                print(f"Connection error after {max_retries + 1} attempts")
-
-        except TimeoutError as e:
-            last_exception = e
-            if attempt < max_retries:
-                backoff_time = initial_backoff * (2**attempt)
-                print(
-                    f"Request timeout ({timeout}s). Retrying in {backoff_time:.2f} seconds... (attempt {attempt + 1}/{max_retries + 1})"
-                )
-                time.sleep(backoff_time)
-            else:
-                print(f"Request timeout after {max_retries + 1} attempts")
-
-        except APIError as e:
-            # For other API errors, check if they're retryable
-            if e.status_code and e.status_code >= 500:
-                # Server errors are retryable
-                last_exception = e
-                if attempt < max_retries:
-                    backoff_time = initial_backoff * (2**attempt)
-                    print(
-                        f"Server error ({e.status_code}). Retrying in {backoff_time:.2f} seconds... (attempt {attempt + 1}/{max_retries + 1})"
-                    )
-                    time.sleep(backoff_time)
-                else:
-                    print(f"Server error after {max_retries + 1} attempts")
-            else:
-                # Client errors (4xx) are not retryable
-                raise e
-
-        except Exception as e:
-            # For unexpected errors, don't retry
-            raise e
-
-    # If we've exhausted all retries, raise the last exception
-    if last_exception:
-        raise last_exception
-    else:
-        raise APIError("Failed to generate response after retries")
+                raise
+                
+        except Exception:
+            raise
 
 
 if __name__ == "__main__":

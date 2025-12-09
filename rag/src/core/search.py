@@ -32,7 +32,7 @@ TOP_K = 25  # 原值，平衡速度和准确率
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
 
 
-def _search_with_retry(client, index: str, body: dict, max_retries: int = 10, backoff_base: float = 0.2):
+def _search_with_retry(client, index: str, body: dict, max_retries: int = 10, backoff_base: float = 0.3):
     last_exception = None
     for attempt in range(1, max_retries + 1):
         try:
