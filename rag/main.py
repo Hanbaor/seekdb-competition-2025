@@ -124,12 +124,12 @@ if __name__ == "__main__":
                 logger.error(f"Error processing question {idx + 1}: {e}", exc_info=True)
                 # 失败时添加默认答案，确保答案数量与问题数量一致
                 # 必须使用 Answer 对象，不能用字典！
-                answers_dict[idx] = Answer(
-                    question=question,
-                    answer="处理失败",
-                    filename="",
-                    page=0,
-                )
+                #answers_dict[idx] = Answer(
+                #    question=question,
+                #    answer="处理失败",
+                #    filename="",
+                #    page=0,
+                #)
     
     logger.info(f"Completed processing {len(questions)} questions.")
     
