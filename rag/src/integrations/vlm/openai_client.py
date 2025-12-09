@@ -34,28 +34,21 @@ def generate_response(
     images: Optional[Union[str, List[str]]] = None,
     model: str = "qwen3-vl-flash",
     # model: str = "qwen3-vl-plus",
-    max_retries: int = 3,  # 最小重试次数，快速失败
-    initial_backoff: float = 1.0,
+    retry_interval: float = 2.0,  # 固定重试间隔
 ) -> str:
     """
     Generate a response from the VLM (Vision Language Model) using OpenAI-compatible API
-    with error handling and retry logic.
+    with infinite retry logic.
 
     Args:
         prompt: Text prompt for the model
-        images: Optional image path(s) or base64 encoded image(s). Can be a single path/string or a list
-        model: Model name to use for generation (default: "qwen-vl-plus")
-        max_retries: Maximum number of retry attempts
-        initial_backoff: Initial backoff time in seconds (doubles on each retry)
+        images: Optional image path(s) or base64 encoded image(s)
+        model: Model name to use for generation
+        retry_interval: Fixed interval between retries in seconds
 
     Returns:
         The generated response content as a string
-
-    Raises:
-        Exception: If the API request fails after all retries
-        ValueError: If the response is empty or invalid
     """
-    last_exception = None
 
     # Store original image paths for potential compression on errors
     original_image_paths = []
@@ -84,8 +77,10 @@ def generate_response(
 
     # Track if we've already compressed images for retry
     images_compressed = False
+    attempt = 0
 
-    for attempt in range(max_retries + 1):
+    while True:
+        attempt += 1
         try:
             response = vlm_client.chat.completions.create(
                 model=model,
@@ -105,41 +100,13 @@ def generate_response(
 
             return content
 
-        except RateLimitError as e:
-            last_exception = e
-            if attempt < max_retries:
-                backoff_time = initial_backoff * (2**attempt)
-                logger.warning(
-                    f"Rate limit exceeded. Retrying in {backoff_time:.2f} seconds... "
-                    f"(attempt {attempt + 1}/{max_retries + 1})"
-                )
-                time.sleep(backoff_time)
-            else:
-                logger.error(f"Rate limit error after {max_retries + 1} attempts")
-
-        except APIConnectionError as e:
-            last_exception = e
-            if attempt < max_retries:
-                backoff_time = initial_backoff * (2**attempt)
-                logger.warning(
-                    f"Connection error. Retrying in {backoff_time:.2f} seconds... "
-                    f"(attempt {attempt + 1}/{max_retries + 1})"
-                )
-                time.sleep(backoff_time)
-            else:
-                logger.error(f"Connection error after {max_retries + 1} attempts")
+        except (RateLimitError, APIConnectionError) as e:
+            logger.warning(f"VLM error (attempt {attempt}): {type(e).__name__}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
         except APIError as e:
-            last_exception = e
             error_str = str(e).lower()
-            error_type = type(e).__name__
-
-            # Check HTTP status code if available
-            status_code = None
-            if hasattr(e, "status_code"):
-                status_code = e.status_code
-            elif hasattr(e, "response") and hasattr(e.response, "status_code"):
-                status_code = e.response.status_code
+            status_code = getattr(e, "status_code", None)
 
             # Check for non-retryable format errors
             format_error_keywords = [
@@ -154,66 +121,23 @@ def generate_response(
             )
 
             if is_format_error:
-                # Format errors are not retryable
-                logger.error(
-                    f"Image format error from OpenAI API: {str(e)}. "
-                    f"This is likely due to an unsupported or corrupted image format. "
-                    f"Please check the image file(s)."
-                )
+                logger.error(f"Image format error: {str(e)}")
                 cleanup_temp_files(temp_files_to_cleanup)
                 raise e
 
-            # Check if it's a retryable error (5xx server errors)
-            is_retryable = False
-            if status_code is not None:
-                if 500 <= status_code < 600:
-                    is_retryable = True
-                    logger.warning(
-                        f"HTTP {status_code} error from OpenAI API: {str(e)}. "
-                        f"This is a server error and will be retried."
-                    )
-            else:
-                # Check error message for retryable keywords
-                is_retryable = any(
-                    keyword in error_str
-                    for keyword in [
-                        "connection",
-                        "timeout",
-                        "rate limit",
-                        "server error",
-                        "temporary",
-                        "unavailable",
-                        "502",
-                        "503",
-                        "504",
-                        "bad gateway",
-                        "service unavailable",
-                        "gateway timeout",
-                    ]
-                )
-
-            # Handle 502 errors specifically - try compressing images
+            # Handle 502 errors - try compressing images
             is_502_error = (
                 status_code == 502 or "502" in error_str or "bad gateway" in error_str
             )
 
             if is_502_error and original_image_paths and not images_compressed:
-                # 502 error might be due to large images, try compressing them
-                logger.warning(
-                    f"502 error detected (likely due to large image). "
-                    f"Attempting to compress images and retry..."
-                )
+                logger.warning("502 error detected. Attempting to compress images...")
                 try:
-                    # Clean up previous temp files
                     cleanup_temp_files(temp_files_to_cleanup)
-
-                    # Re-process images with compression
                     processed_images, temp_files_to_cleanup = process_images_to_base64(
                         [img for img in original_image_paths if img is not None],
                         compress_for_retry=True,
                     )
-
-                    # Rebuild messages with compressed images
                     content_blocks = [{"type": "text", "text": prompt}]
                     for img_base64 in processed_images:
                         image_url = f"data:image/png;base64,{img_base64}"
@@ -221,51 +145,23 @@ def generate_response(
                             {"type": "image_url", "image_url": {"url": image_url}}
                         )
                     messages = [{"role": "user", "content": content_blocks}]
-
                     images_compressed = True
-                    logger.info("Images compressed, retrying request...")
-                    # Continue to retry without backoff delay for compression retry
+                    logger.info("Images compressed, retrying...")
                     continue
                 except Exception as compress_error:
-                    logger.error(
-                        f"Failed to compress images for retry: {compress_error}. "
-                        f"Will retry with original images."
-                    )
-                    # Fall through to normal retry logic
+                    logger.error(f"Failed to compress images: {compress_error}")
 
-            if is_retryable and attempt < max_retries:
-                backoff_time = initial_backoff * (2**attempt)
-                logger.warning(
-                    f"Error occurred (type: {error_type}, status: {status_code}): {str(e)}. "
-                    f"Retrying in {backoff_time:.2f} seconds... "
-                    f"(attempt {attempt + 1}/{max_retries + 1})"
-                )
-                time.sleep(backoff_time)
-            elif not is_retryable:
-                # Non-retryable errors should be raised immediately
-                logger.error(
-                    f"Non-retryable error (type: {error_type}, status: {status_code}): {str(e)}"
-                )
+            # Server errors (5xx) - retry
+            if status_code and status_code >= 500:
+                logger.warning(f"VLM server error {status_code} (attempt {attempt}). Retrying in {retry_interval}s...")
+                time.sleep(retry_interval)
+            else:
                 cleanup_temp_files(temp_files_to_cleanup)
                 raise e
-            else:
-                logger.error(
-                    f"Error after {max_retries + 1} attempts (type: {error_type}, status: {status_code}): {str(e)}"
-                )
 
         except Exception as e:
-            # For unexpected errors, don't retry
             cleanup_temp_files(temp_files_to_cleanup)
             raise e
-
-    # Clean up temporary files before returning or raising
-    cleanup_temp_files(temp_files_to_cleanup)
-
-    # If we've exhausted all retries, raise the last exception
-    if last_exception:
-        raise last_exception
-    else:
-        raise Exception("Failed to generate response after retries")
 
 
 if __name__ == "__main__":

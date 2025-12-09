@@ -33,7 +33,7 @@ TOP_K = 25  # Optimal value for LLM Rerank - 65.29 best score
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
 
 
-def _search_with_retry(client, index: str, body: dict, max_retries: int = 30, backoff_base: float = 0.5):
+def _search_with_retry(client, index: str, body: dict, max_retries: int = 3, backoff_base: float = 0.3):
     last_exception = None
     for attempt in range(1, max_retries + 1):
         try:
