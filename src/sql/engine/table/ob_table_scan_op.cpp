@@ -4239,12 +4239,6 @@
         // 添加到 HashMap：用 doc_id_val 作为 key
         if (doc_id_val > 0 && id_found) {
           int cache_ret = g_fts_scalar_cache.add_mapping(doc_id_val, id_val, base_id_val, docid_col_val);
-          LOG_ERROR("FTS Scalar Cache: Filling progress",
-                       K(fts_cache_fill_count),
-                       "cache_size", g_fts_scalar_cache.size(),
-                       K(doc_id_val), K(id_val), 
-                       "doc_id_equals_id", (doc_id_val == id_val),
-                       K(base_id_val), K(docid_col_val));
           if (OB_SUCCESS == cache_ret) {
             ++fts_cache_fill_count;
             // 每 1000 条输出一次日志，减少日志量

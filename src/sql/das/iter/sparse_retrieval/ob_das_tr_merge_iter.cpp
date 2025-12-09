@@ -30,7 +30,7 @@ namespace oceanbase
 namespace sql
 {
 
-// 定义全局过滤上下文
+// 定义全局过滤上下文（POD 结构体，TLS 初始化极快）
 thread_local ObFtsFilterCtx g_fts_filter_ctx;
 
 ObDASTRMergeIter::ObDASTRMergeIter()
@@ -75,7 +75,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
   
   int ObDASTRMergeIter::inner_init(ObDASIterParam &param)
   {
-    LOG_INFO("DEBUG: ObDASTRMergeIter::inner_init called!");
+    // LOG_INFO("DEBUG: ObDASTRMergeIter::inner_init called!");
     int ret = OB_SUCCESS;
     if (IS_INIT) {
       ret = OB_INIT_TWICE;
@@ -92,26 +92,26 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       boolean_compute_node_ = merge_param.boolean_compute_node_;
       flags_ = merge_param.flags_;
       
-      // 初始化过滤上下文（仅设置条件，不预构建位图）
+      // 初始化过滤上下文（POD 结构体，仅需 reset）
       g_fts_filter_ctx.reset();
       
-      // 1. 设置 id < 1000
+      // 1. 设置 id < 1000（测试值，后续由下推层设置）
       g_fts_filter_ctx.id_limit_ = 1000;
       g_fts_filter_ctx.has_id_filter_ = true;
       
-      // 2. 设置 base_id IN 过滤条件（实际检查在 do_bm25s_search 中按需进行）
+      // 2. 设置 base_id IN 过滤条件（测试值，后续由下推层设置）
       g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_1"));
       g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_2"));
       g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_3"));
 
       if (ir_ctdef_ != nullptr) {
         const ObDASScanCtDef* inv_scan = ir_ctdef_->get_inv_idx_scan_ctdef();
-        LOG_INFO("DEBUG: inv_idx_scan_ctdef pointer", KP(inv_scan));
+        // LOG_INFO("DEBUG: inv_idx_scan_ctdef pointer", KP(inv_scan));
         if (inv_scan != nullptr) {
-          LOG_INFO("DEBUG: inv scan filters count", K(inv_scan->pd_expr_spec_.pushdown_filters_.count()));
+          // LOG_INFO("DEBUG: inv scan filters count", K(inv_scan->pd_expr_spec_.pushdown_filters_.count()));
         }
       } else {
-        LOG_INFO("DEBUG: ir_ctdef_ is NULL");
+        // LOG_INFO("DEBUG: ir_ctdef_ is NULL");
       }
 
       for (int64_t i = 0; OB_SUCC(ret) && i < merge_param.query_tokens_.count(); ++i) {
@@ -1143,15 +1143,23 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       return OB_ITER_END;
     }
     
-    // 模拟延迟，降低 QPS（目标 1000 QPS）
-    struct timeval start, end;
-    gettimeofday(&start, NULL);
-    usleep(620);  // 620 微秒
-    gettimeofday(&end, NULL);
-    int64_t actual = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
-    LOG_INFO("usleep(620) actual delay", K(actual));
+    // // 模拟延迟，降低 QPS（目标 1000 QPS）
+    // struct timeval start, end;
+    // gettimeofday(&start, NULL);
+    // usleep(620);  // 620 微秒
+    // gettimeofday(&end, NULL);
+    // int64_t actual = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+    // LOG_INFO("usleep(620) actual delay", K(actual));
     
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
+    // 确保 scalar cache 已加载到内存
+    if (!g_fts_scalar_cache.is_loaded()) {
+      int load_ret = g_fts_scalar_cache.load_to_memory();
+      if (OB_SUCCESS != load_ret) {
+        LOG_WARN("failed to load scalar cache to memory", K(load_ret));
+      }
+    }
+    
     // scores_array 需要按 doc_id 直接索引，手动管理
     // touched_docs 使用 ObArray 自动扩容
     static thread_local double *scores_array = nullptr;
