@@ -8,7 +8,7 @@ from typing import List
 
 from src.core.add import add
 from src.core.search import search
-from src.util import read_questions_json, write_answers
+from src.util import Answer, read_questions_json, write_answers
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     logger.info(f"Created log directory: {log_dir}")
 
     # Process questions in parallel with max workers
-    max_qa_workers = 5  # 线上环境串行处理
+    max_qa_workers = 20  # 线上环境串行处理
     answers_dict = {}  # Store answers with their original index
     
     with ThreadPoolExecutor(max_workers=max_qa_workers) as executor:
@@ -122,6 +122,14 @@ if __name__ == "__main__":
                 logger.info(f"Completed question {idx + 1}/{len(questions)}: {question[:50]}...")
             except Exception as e:
                 logger.error(f"Error processing question {idx + 1}: {e}", exc_info=True)
+                # 失败时添加默认答案，确保答案数量与问题数量一致
+                # 必须使用 Answer 对象，不能用字典！
+                answers_dict[idx] = Answer(
+                    question=question,
+                    answer="处理失败",
+                    filename="",
+                    page=0,
+                )
     
     logger.info(f"Completed processing {len(questions)} questions.")
     
