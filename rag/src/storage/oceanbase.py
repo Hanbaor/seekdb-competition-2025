@@ -49,12 +49,7 @@ if __name__ == "__main__":
     password = os.getenv("OCEANBASE_PASSWORD")
     db_name = os.getenv("OCEANBASE_DBNAME")
 
-    client = HybridSearch(
-        uri=os.getenv("OCEANBASE_URI"),
-        user=os.getenv("OCEANBASE_USER"),
-        password=os.getenv("OCEANBASE_PASSWORD"),
-        db_name=os.getenv("OCEANBASE_DBNAME"),
-    )
+    client = get_or_create_client()
 
     test_table_name = "hybrid_search_test"
 
