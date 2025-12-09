@@ -4061,10 +4061,10 @@
    static int64_t fts_cache_fill_count = 0;
    static int64_t fts_row_process_count = 0;  // 处理的行数
    if (!fts_cache_initialized) {
-     int init_ret = g_fts_scalar_cache.init(1000000);
+     int init_ret = g_fts_scalar_cache.init(200000);  // 使用默认容量，需要时自动扩容
      if (OB_SUCCESS == init_ret || OB_INIT_TWICE == init_ret) {
        fts_cache_initialized = true;
-       LOG_INFO("FTS Scalar Cache: HashMap initialized in fetch_next_fts_index_rows");
+       LOG_INFO("FTS Scalar Cache: initialized in fetch_next_fts_index_rows");
      } else {
        LOG_WARN("FTS Scalar Cache: Failed to initialize HashMap", K(init_ret));
      }

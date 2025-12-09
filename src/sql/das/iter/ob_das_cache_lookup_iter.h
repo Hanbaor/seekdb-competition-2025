@@ -95,7 +95,8 @@ public:
       index_proj_rows_(),
       cached_doc_ids_(store_allocator_),
       cached_results_(store_allocator_),
-      bm25s_fast_path_done_(false)
+      bm25s_fast_path_done_(false),
+      cache_verified_(false)
   {}
   virtual ~ObDASCacheLookupIter() {}
 
@@ -118,6 +119,7 @@ private:
   common::ObFixedArray<uint64_t, common::ObIAllocator> cached_doc_ids_;
   common::ObFixedArray<ScalarFields, common::ObIAllocator> cached_results_;
   bool bm25s_fast_path_done_;  // BM25S 快速路径已完成标志
+  bool cache_verified_;        // INDEX_SCAN 阶段已验证缓存命中
 };
 
 }  // namespace sql

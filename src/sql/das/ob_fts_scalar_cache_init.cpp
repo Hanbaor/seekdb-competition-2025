@@ -24,7 +24,7 @@ int init_fts_scalar_cache_for_items1()
   LOG_INFO("=== Starting FTS Scalar Cache initialization for items1 ===");
   
   // 1. 初始化 HashMap
-  if (OB_FAIL(g_fts_scalar_cache.init(1000000))) {
+  if (OB_FAIL(g_fts_scalar_cache.init(200000))) {
     LOG_WARN("failed to init fts scalar cache", K(ret));
     return ret;
   }

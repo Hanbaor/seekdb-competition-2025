@@ -6,7 +6,7 @@ echo "🚀 开始重新编译 OceanBase (Release)..."
 echo "========================================"
 
 # 1. 编译
-bash build.sh release -DOB_USE_CCACHE=ON --init --make -j6
+bash build.sh release -DOB_USE_CCACHE=ON --init --make -j10
 
 echo ""
 echo "========================================"

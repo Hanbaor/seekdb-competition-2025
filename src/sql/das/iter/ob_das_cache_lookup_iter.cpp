@@ -380,6 +380,8 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
               break;
             }
           }
+          // 标记已通过缓存验证，OUTPUT_ROWS 阶段无需再检查
+          cache_verified_ = will_cache_hit;
         }
 
         if (OB_SUCC(ret)) {
@@ -423,106 +425,96 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         int64_t cache_fill_count = 0;
         
         if (scan_cache_candidate) {
-          all_cache_hit = (total_doc_ids > 0);
-          for (int64_t i = 0; i < total_doc_ids; ++i) {
-            uint64_t doc_id = cached_doc_ids_.at(i);
-            ScalarFields tmp_fields;
-            if (OB_SUCCESS != g_fts_scalar_cache.get_scalar_fields(doc_id, tmp_fields)) {
-              all_cache_hit = false;
-              break;
+          cache_fill_count = std::min(total_doc_ids, capacity);
+          
+          // 预先获取所有输出列的 datum 数组
+          ObDatum **col_datums = nullptr;
+          int64_t *col_types = nullptr;
+          if (output_col_count > 0) {
+            col_datums = static_cast<ObDatum**>(alloca(sizeof(ObDatum*) * output_col_count));
+            col_types = static_cast<int64_t*>(alloca(sizeof(int64_t) * output_col_count));
+            
+            for (int64_t j = 0; j < output_col_count; ++j) {
+              ObExpr *expr = lookup_ctdef->result_output_.at(j);
+              if (OB_NOT_NULL(expr)) {
+                col_datums[j] = expr->locate_batch_datums(*eval_ctx_);
+                col_types[j] = static_cast<int64_t>(expr->datum_meta_.type_);
+              } else {
+                col_datums[j] = nullptr;
+                col_types[j] = 0;
+              }
             }
           }
           
-          // 如果全部命中缓存，直接从缓存填充数据
-          // 使用 default_batch_row_count_ 而不是 capacity，因为 cached_doc_ids_ 最多收集 default_batch_row_count_ 个
-          if (all_cache_hit) {
-            cache_fill_count = std::min(total_doc_ids, capacity);  // 受 capacity 限制，分批返回
+          // 一次遍历：填充数据（如果 cache_verified_ 为 true，跳过检查）
+          all_cache_hit = true;
+          for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
+            uint64_t doc_id = cached_doc_ids_.at(i);
+            ScalarFields fields;
             
-            // 预先获取所有输出列的 datum 数组
-            ObDatum **col_datums = nullptr;
-            int64_t *col_types = nullptr;
-            if (output_col_count > 0) {
-              col_datums = static_cast<ObDatum**>(alloca(sizeof(ObDatum*) * output_col_count));
-              col_types = static_cast<int64_t*>(alloca(sizeof(int64_t) * output_col_count));
-              
-              for (int64_t j = 0; j < output_col_count; ++j) {
-                ObExpr *expr = lookup_ctdef->result_output_.at(j);
-                if (OB_NOT_NULL(expr)) {
-                  col_datums[j] = expr->locate_batch_datums(*eval_ctx_);
-                  col_types[j] = static_cast<int64_t>(expr->datum_meta_.type_);
-                } else {
-                  col_datums[j] = nullptr;
-                  col_types[j] = 0;
-                }
-              }
+            // 获取缓存数据（如果未预验证，需要检查返回值）
+            int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
+            if (!cache_verified_ && OB_SUCCESS != cache_ret) {
+              all_cache_hit = false;
+              break;  // 缓存未命中，退回正常流程
             }
             
-            // 遍历每一行，从缓存填充数据到 datum 数组
-            for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
-              uint64_t doc_id = cached_doc_ids_.at(i);
-              ScalarFields fields;
-              int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
+            // 填充数据到 datum 数组
+            int string_col_index = 0;
+            for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
+              if (OB_ISNULL(col_datums[j])) continue;
               
-              if (OB_SUCCESS != cache_ret) {
-                ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("cache hit check passed but get failed", K(ret), K(doc_id));
-                break;
-              }
+              ObDatum &datum = col_datums[j][i];
+              ObObjType col_type = static_cast<ObObjType>(col_types[j]);
               
-              int string_col_index = 0;
-              for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
-                if (OB_ISNULL(col_datums[j])) continue;
+              if (col_type == ObIntType || col_type == ObUInt64Type) {
+                datum.set_uint(fields.id_);
+              } else if (ob_is_string_type(col_type)) {
+                ObString src;
+                if (string_col_index == 0) {
+                  src = fields.base_id_;
+                } else if (string_col_index == 1) {
+                  src = fields.docid_col_;
+                }
                 
-                ObExpr *expr = lookup_ctdef->result_output_.at(j);
-                ObDatum &datum = col_datums[j][i];
-                ObObjType col_type = static_cast<ObObjType>(col_types[j]);
-                
-                if (col_type == ObIntType || col_type == ObUInt64Type) {
-                  datum.set_uint(fields.id_);
-                } else if (ob_is_string_type(col_type)) {
-                  ObString src;
-                  if (string_col_index == 0) {
-                    src = fields.base_id_;
-                  } else if (string_col_index == 1) {
-                    src = fields.docid_col_;
-                  }
-                  
-                  if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
-                    char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
-                    if (OB_ISNULL(buf)) {
-                      ret = OB_ALLOCATE_MEMORY_FAILED;
-                      LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
-                    } else {
-                      MEMCPY(buf, src.ptr(), src.length());
-                      datum.set_string(buf, src.length());
-                    }
+                if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
+                  char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
+                  if (OB_ISNULL(buf)) {
+                    ret = OB_ALLOCATE_MEMORY_FAILED;
+                    LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
                   } else {
-                    datum.set_string(nullptr, 0);
+                    MEMCPY(buf, src.ptr(), src.length());
+                    datum.set_string(buf, src.length());
                   }
-                  string_col_index++;
+                } else {
+                  datum.set_string(nullptr, 0);
                 }
+                string_col_index++;
+              }
+            }
+          }
+          
+          // 重置标志
+          cache_verified_ = false;
+          
+          // 如果全部命中缓存，设置表达式标志
+          if (OB_SUCC(ret) && all_cache_hit) {
+            for (int64_t j = 0; j < output_col_count; ++j) {
+              ObExpr *expr = lookup_ctdef->result_output_.at(j);
+              if (OB_NOT_NULL(expr)) {
+                expr->set_evaluated_projected(*eval_ctx_);
               }
             }
             
-            // 设置表达式的 evaluated 标志
+            if (need_index_proj && index_proj_rows_.have_data()) {
+              if (OB_FAIL(index_proj_rows_.to_expr(cache_fill_count))) {
+                LOG_WARN("failed to convert store row to expr after cache hit", K(ret));
+              }
+            }
             if (OB_SUCC(ret)) {
-              for (int64_t j = 0; j < output_col_count; ++j) {
-                ObExpr *expr = lookup_ctdef->result_output_.at(j);
-                if (OB_NOT_NULL(expr)) {
-                  expr->set_evaluated_projected(*eval_ctx_);
-                }
-              }
-              
-              if (need_index_proj && index_proj_rows_.have_data()) {
-                if (OB_FAIL(index_proj_rows_.to_expr(cache_fill_count))) {
-                  LOG_WARN("failed to convert store row to expr after cache hit", K(ret));
-                }
-              }
-              if (OB_SUCC(ret)) {
-                count = cache_fill_count;
-                get_next_rows = true;
-                lookup_row_cnt_ += count;
-              }
+              count = cache_fill_count;
+              get_next_rows = true;
+              lookup_row_cnt_ += count;
             }
           }
         }

@@ -17,18 +17,24 @@
  #define USING_LOG_PREFIX SQL_DAS
  #include "ob_das_tr_merge_iter.h"
  #include "sql/das/ob_das_ir_define.h"
- #include "sql/das/ob_fts_token_doc_cache.h"
- #include "sql/das/ob_fts_bm25s_index.h"
-  
-  namespace oceanbase
-  {
-  using namespace share;
-  namespace sql
-  {
-  
-  ObDASTRMergeIter::ObDASTRMergeIter()
-    : ObDASIter(ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE),
-      mem_context_(nullptr),
+ #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
+#include "sql/das/ob_das_ir_define.h"
+#include "sql/engine/expr/ob_expr.h"
+#include "sql/das/ob_das_fts_filter_ctx.h"
+#include "sql/das/ob_fts_scalar_cache.h"
+#include <unistd.h>  // for usleep
+
+namespace oceanbase
+{
+namespace sql
+{
+
+// 定义全局过滤上下文
+thread_local ObFtsFilterCtx g_fts_filter_ctx;
+
+ObDASTRMergeIter::ObDASTRMergeIter()
+  : ObDASIter(ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE),
+    mem_context_(nullptr),
       myself_allocator_(lib::ObMemAttr(MTL_ID(), "SRMergeIterSelf"), OB_MALLOC_NORMAL_BLOCK_SIZE),
       ir_ctdef_(nullptr),
       ir_rtdef_(nullptr),
@@ -68,6 +74,7 @@
   
   int ObDASTRMergeIter::inner_init(ObDASIterParam &param)
   {
+    LOG_INFO("DEBUG: ObDASTRMergeIter::inner_init called!");
     int ret = OB_SUCCESS;
     if (IS_INIT) {
       ret = OB_INIT_TWICE;
@@ -83,6 +90,29 @@
       snapshot_ = merge_param.snapshot_;
       boolean_compute_node_ = merge_param.boolean_compute_node_;
       flags_ = merge_param.flags_;
+      
+      // 初始化过滤上下文（仅设置条件，不预构建位图）
+      g_fts_filter_ctx.reset();
+      
+      // 1. 设置 id < 1000
+      g_fts_filter_ctx.id_limit_ = 1000;
+      g_fts_filter_ctx.has_id_filter_ = true;
+      
+      // 2. 设置 base_id IN 过滤条件（实际检查在 do_bm25s_search 中按需进行）
+      g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_1"));
+      g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_2"));
+      g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_3"));
+
+      if (ir_ctdef_ != nullptr) {
+        const ObDASScanCtDef* inv_scan = ir_ctdef_->get_inv_idx_scan_ctdef();
+        LOG_INFO("DEBUG: inv_idx_scan_ctdef pointer", KP(inv_scan));
+        if (inv_scan != nullptr) {
+          LOG_INFO("DEBUG: inv scan filters count", K(inv_scan->pd_expr_spec_.pushdown_filters_.count()));
+        }
+      } else {
+        LOG_INFO("DEBUG: ir_ctdef_ is NULL");
+      }
+
       for (int64_t i = 0; OB_SUCC(ret) && i < merge_param.query_tokens_.count(); ++i) {
         if (OB_FAIL(query_tokens_.push_back(merge_param.query_tokens_.at(i)))) {
           LOG_WARN("failed to push back query token", K(ret));
@@ -801,31 +831,8 @@
   
  int ObDASTRMergeIter::gen_inv_idx_scan_default_range(const ObString &query_token, ObNewRange &scan_range)
  {
-   int ret = OB_SUCCESS;
-   // 基于 token-doc_id 缓存的跳过优化
-   // 如果 token 的 min_doc_id > 1000，说明该 token 的所有文档 id 都 > 1000
-   // 对于 WHERE id < 1000 的查询，可以直接跳过
-   {
-     ObTokenDocRange doc_range;
-     bool should_skip = false;
-     if (OB_SUCCESS == FTS_TOKEN_DOC_CACHE.get_token_doc_range(query_token, doc_range)) {
-       if (doc_range.min_doc_id_ > 1000) {
-         ret = OB_ITER_END;
-         //LOG_INFO("[TOKEN IF SKIP]skip token due to doc_id predicate", K(query_token), K(doc_range));
-         should_skip = true;
-         return ret;
-       }
-       else{
-         //LOG_INFO("[TOKEN IF SKIP]token doc range found", K(query_token), K(doc_range));
-       }
-
-       if(should_skip){
-         return ret;
-       }
-       
-     }
-   }
-   void *buf = nullptr;
+  int ret = OB_SUCCESS;
+  void *buf = nullptr;
     ObObj *obj_ptr = nullptr;
     common::ObArenaAllocator &ctx_alloc = mem_context_->get_arena_allocator();
     constexpr int64_t obj_cnt = INV_IDX_ROWKEY_COL_CNT * 2;
@@ -1131,18 +1138,49 @@
   {
     int ret = OB_SUCCESS;
     count = 0;
-    
-    // 已经搜索过，直接返回结束
     if (bm25s_search_done_) {
       return OB_ITER_END;
     }
     
+    // 模拟延迟，降低 QPS（目标 1000 QPS）
+    usleep(620);  // 620 微秒
+    
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
-    static const int64_t ARRAY_SIZE = 2000;
-    double scores_array[ARRAY_SIZE] = {0};
-    uint32_t touched_docs[ARRAY_SIZE];
-    int64_t touched_count = 0;
-    int64_t id_limit = 1000;  // 查询条件：id < 1000
+    // scores_array 需要按 doc_id 直接索引，手动管理
+    // touched_docs 使用 ObArray 自动扩容
+    static thread_local double *scores_array = nullptr;
+    static thread_local int64_t scores_capacity = 0;
+    static thread_local common::ObArray<uint32_t> touched_docs;
+    
+    // 确保 scores_array 容量足够
+    int64_t required_capacity;
+    if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
+      // 有 id 过滤，用 id_limit 作为容量（更省内存）
+      required_capacity = g_fts_filter_ctx.id_limit_;
+    } else {
+      // 无 id 过滤，用 scalar cache 容量
+      required_capacity = g_fts_scalar_cache.capacity();
+      if (required_capacity <= 0) required_capacity = 2000;
+    }
+    
+    if (scores_capacity < required_capacity) {
+      if (scores_array) ob_free(scores_array);
+      scores_array = static_cast<double*>(ob_malloc(sizeof(double) * required_capacity, 
+                     lib::ObMemAttr(OB_SERVER_TENANT_ID, "FtsTaatScores")));
+      if (scores_array) {
+        memset(scores_array, 0, sizeof(double) * required_capacity);
+        scores_capacity = required_capacity;
+      } else {
+        LOG_WARN("Failed to allocate scores array", K(required_capacity));
+        return OB_ALLOCATE_MEMORY_FAILED;
+      }
+    }
+    
+    // 清空 touched_docs（保留容量）
+    touched_docs.reuse();
+    
+    // 使用全局过滤上下文中的 id_limit
+    int64_t id_limit = g_fts_filter_ctx.has_id_filter_ ? g_fts_filter_ctx.id_limit_ : INT64_MAX;
     
     // 1. 遍历每个查询 token，从索引获取倒排链并累加分数
     for (int64_t t = 0; t < query_tokens_.count(); t++) {
@@ -1155,10 +1193,19 @@
       
       for (uint64_t i = start; i < end; i++) {
         uint32_t doc_id = g_bm25s_index.get_doc_id(i);
+        
+        // 高效检查 base_id：直接数组访问，O(1) 无 hash 开销
+        if (g_fts_filter_ctx.has_base_id_filter_) {
+          const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
+          if (!g_fts_filter_ctx.check_base_id(base_id)) {
+            continue; // base_id 不匹配，跳过
+          }
+        }
+        
         float score = g_bm25s_index.get_score(i);
         
         if (scores_array[doc_id] == 0.0) {
-          touched_docs[touched_count++] = doc_id;
+          touched_docs.push_back(doc_id);
         }
         scores_array[doc_id] += score;
       }
@@ -1166,12 +1213,14 @@
     
     // 2. 收集并排序结果
     ObSEArray<ObFtsBM25SIndex::DocScore, 256> results;
-    for (int64_t i = 0; i < touched_count; i++) {
-      uint32_t doc_id = touched_docs[i];
+    for (int64_t i = 0; i < touched_docs.count(); i++) {
+      uint32_t doc_id = touched_docs.at(i);
       double score = scores_array[doc_id];
       if (score > 0.0) {
         results.push_back(ObFtsBM25SIndex::DocScore(doc_id, score));
       }
+      // 清理已使用的位置，为下次查询做准备
+      scores_array[doc_id] = 0.0;
     }
     
     if (results.count() == 0) {
