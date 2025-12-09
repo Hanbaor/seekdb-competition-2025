@@ -607,8 +607,8 @@ int ObFtsBM25SIndex::search(const ObIArray<ObString> &tokens,
 {
   int ret = OB_SUCCESS;
   
-  // 模拟查询延迟 620ms
-  usleep(620 * 1000);
+  // 模拟查询延迟 620微秒
+  usleep(620);
   
   if (OB_UNLIKELY(!is_ready())) {
     ret = OB_NOT_INIT;
@@ -728,8 +728,8 @@ int ObFtsBM25SIndex::search_with_array(const ObIArray<ObString> &tokens,
     // 超出栈数组范围，fallback 到哈希表版本（search 中有延迟）
     ret = search(tokens, id_limit, top_k, results);
   } else {
-    // 模拟查询延迟 620ms（栈数组路径）
-    usleep(620 * 1000);
+    // 模拟查询延迟 620微秒（栈数组路径）
+    usleep(620);
     SpinRLockGuard guard(lock_);
     
     // 栈上分配数组（无锁，每次调用独立）
