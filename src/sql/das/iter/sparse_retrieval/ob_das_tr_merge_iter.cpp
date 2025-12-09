@@ -23,6 +23,7 @@
 #include "sql/das/ob_das_fts_filter_ctx.h"
 #include "sql/das/ob_fts_scalar_cache.h"
 #include <unistd.h>  // for usleep
+#include <sys/time.h>  // for gettimeofday
 
 namespace oceanbase
 {
@@ -1143,7 +1144,12 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     }
     
     // 模拟延迟，降低 QPS（目标 1000 QPS）
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
     usleep(620);  // 620 微秒
+    gettimeofday(&end, NULL);
+    int64_t actual = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+    LOG_INFO("usleep(620) actual delay", K(actual));
     
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
     // scores_array 需要按 doc_id 直接索引，手动管理
