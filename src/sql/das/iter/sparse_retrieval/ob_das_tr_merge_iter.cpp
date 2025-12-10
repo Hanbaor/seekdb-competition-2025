@@ -90,17 +90,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       boolean_compute_node_ = merge_param.boolean_compute_node_;
       flags_ = merge_param.flags_;
       
-      // 初始化过滤上下文（POD 结构体，仅需 reset）
-      g_fts_filter_ctx.reset();
-      
-      // 1. 设置 id < 1000（测试值，后续由下推层设置）
-      // g_fts_filter_ctx.id_limit_ = 1000;
-      // g_fts_filter_ctx.has_id_filter_ = true;
-      
-      // 2. 设置 base_id IN 过滤条件（测试值，后续由下推层设置）
-      // g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_1"));
-      // g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_2"));
-      // g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_3"));
+      // 注意：过滤上下文已在 ob_table_scan_op.cpp 中设置，这里不能 reset！
+      // reset() 会清除上层设置的过滤条件
 
       if (ir_ctdef_ != nullptr) {
         const ObDASScanCtDef* inv_scan = ir_ctdef_->get_inv_idx_scan_ctdef();
@@ -1159,18 +1150,15 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     // 确保 scores_array 容量足够
     int64_t required_capacity;
     
-    // 打印当前的过滤上下文状态 (Debug)
-    /*
-    if (g_fts_filter_ctx.has_limit_ || g_fts_filter_ctx.has_id_filter_ || g_fts_filter_ctx.has_base_id_filter_) {
-       LOG_INFO("FTS Execution Context", 
-                "has_limit", g_fts_filter_ctx.has_limit_, 
-                "limit", g_fts_filter_ctx.limit_count_,
-                "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
-                "id_limit", g_fts_filter_ctx.id_limit_,
-                "has_base_id", g_fts_filter_ctx.has_base_id_filter_, 
-                "base_id_cnt", g_fts_filter_ctx.base_id_count_);
-    }
-    */
+    // 验证过滤上下文是否正确传递（从 ob_table_scan_op.cpp）
+    LOG_INFO("FTS filter context in do_bm25s_search", 
+             "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
+             "id_limit", g_fts_filter_ctx.id_limit_,
+             "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
+             "base_id_list-1", g_fts_filter_ctx.base_id_list_[0],
+             "base_id_list-2", g_fts_filter_ctx.base_id_list_[1],
+             "base_id_list-3", g_fts_filter_ctx.base_id_list_[2],
+             "base_id_count", g_fts_filter_ctx.base_id_count_);
 
     if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
       // 有 id 过滤，用 id_limit 作为容量（更省内存）

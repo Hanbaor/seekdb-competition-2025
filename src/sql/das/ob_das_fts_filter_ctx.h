@@ -20,7 +20,9 @@ namespace sql
 // POD 结构体，TLS 初始化极快（仅内存清零）
 struct ObFtsFilterCtx
 {
-  static constexpr int64_t MAX_BASE_IDS = 16;  // 固定大小，避免动态分配
+  static constexpr int64_t MAX_BASE_IDS = 16;        // 最大 base_id 数量
+  static constexpr int64_t MAX_BASE_ID_LEN = 256;    // 单个 base_id 最大长度
+  static constexpr int64_t STR_BUF_SIZE = MAX_BASE_IDS * MAX_BASE_ID_LEN;  // 字符串缓冲区大小
   
   // id 过滤条件 (例如 id < 1000)
   int64_t id_limit_;
@@ -35,6 +37,10 @@ struct ObFtsFilterCtx
   int64_t limit_count_;
   bool has_limit_;
   
+  // 字符串数据存储区（深拷贝用）
+  char str_buf_[STR_BUF_SIZE];
+  int64_t str_buf_pos_;  // 当前写入位置
+  
   // POD：不需要构造函数，使用 reset() 初始化
   
   int add_base_id(const common::ObString &base_id)
@@ -42,7 +48,15 @@ struct ObFtsFilterCtx
     if (base_id_count_ >= MAX_BASE_IDS) {
       return common::OB_SIZE_OVERFLOW;
     }
-    base_id_list_[base_id_count_++] = base_id;
+    // 检查缓冲区空间
+    if (str_buf_pos_ + base_id.length() > STR_BUF_SIZE) {
+      return common::OB_SIZE_OVERFLOW;
+    }
+    // 深拷贝字符串数据到内部缓冲区
+    MEMCPY(str_buf_ + str_buf_pos_, base_id.ptr(), base_id.length());
+    base_id_list_[base_id_count_].assign_ptr(str_buf_ + str_buf_pos_, base_id.length());
+    str_buf_pos_ += base_id.length();
+    base_id_count_++;
     has_base_id_filter_ = true;
     return common::OB_SUCCESS;
   }
@@ -53,6 +67,9 @@ struct ObFtsFilterCtx
     has_id_filter_ = false;
     base_id_count_ = 0;
     has_base_id_filter_ = false;
+    limit_count_ = 0;
+    has_limit_ = false;
+    str_buf_pos_ = 0;
   }
   
   // 检查 id 是否满足条件
