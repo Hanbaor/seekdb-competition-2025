@@ -43,10 +43,9 @@ def generate_response(
     Returns:
         Generated response text
     """
-    retry_count = 0
+    max_retries = 30
     
-    while True:
-        retry_count += 1
+    for retry_count in range(1, max_retries + 1):
         try:
             result = llm.chat.completions.create(
                 model=model,
@@ -62,13 +61,19 @@ def generate_response(
             return content
             
         except (RateLimitError, APIConnectionError, TimeoutError) as err:
-            print(f"[Retry {retry_count}] {err.__class__.__name__}: retrying in {wait_seconds}s...")
+            if retry_count >= max_retries:
+                print(f"[LLM] Failed after {max_retries} retries: {err}")
+                raise
+            print(f"[LLM retry {retry_count}/{max_retries}] {err.__class__.__name__}: retrying in {wait_seconds}s...")
             time.sleep(wait_seconds)
             
         except APIError as err:
             # Server errors are retryable, client errors are not
             if err.status_code and err.status_code >= 500:
-                print(f"[Retry {retry_count}] Server error {err.status_code}: retrying in {wait_seconds}s...")
+                if retry_count >= max_retries:
+                    print(f"[LLM] Failed after {max_retries} retries: {err}")
+                    raise
+                print(f"[LLM retry {retry_count}/{max_retries}] Server error {err.status_code}: retrying in {wait_seconds}s...")
                 time.sleep(wait_seconds)
             else:
                 raise

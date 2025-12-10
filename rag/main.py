@@ -8,7 +8,7 @@ from typing import List
 
 from src.core.add import add
 from src.core.search import search
-from src.util import read_questions_json, write_answers
+from src.util import Answer, read_questions_json, write_answers
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ if __name__ == "__main__":
     logger.info("Starting data preparation...")
     add(
         dataset_dir=args.dataset,
-        max_worker=50,  
+        max_worker=20,  
     )
     logger.info("Data preparation completed.")
 
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     logger.info(f"Created log directory: {log_dir}")
 
     # Process questions in parallel with max workers
-    max_qa_workers = 5  
+    max_qa_workers = 3  
     answers_dict = {}  # Store answers with their original index
     
     with ThreadPoolExecutor(max_workers=max_qa_workers) as executor:

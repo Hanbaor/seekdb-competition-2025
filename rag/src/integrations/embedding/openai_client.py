@@ -45,10 +45,9 @@ def generate_response(
     Returns:
         Embedding vector as list of floats
     """
-    retry_count = 0
+    max_retries = 30
     
-    while True:
-        retry_count += 1
+    for retry_count in range(1, max_retries + 1):
         try:
             resp = embedding_client.embeddings.create(
                 model=model,
@@ -66,13 +65,19 @@ def generate_response(
             return vector
             
         except (RateLimitError, APIConnectionError) as err:
-            logger.warning(f"[Embedding retry {retry_count}] {err.__class__.__name__}, retrying in {wait_seconds}s")
+            if retry_count >= max_retries:
+                logger.error(f"[Embedding] Failed after {max_retries} retries: {err}")
+                raise
+            logger.warning(f"[Embedding retry {retry_count}/{max_retries}] {err.__class__.__name__}, retrying in {wait_seconds}s")
             time.sleep(wait_seconds)
             
         except APIError as err:
             code = getattr(err, "status_code", None)
             if code and code >= 500:
-                logger.warning(f"[Embedding retry {retry_count}] Server error {code}, retrying in {wait_seconds}s")
+                if retry_count >= max_retries:
+                    logger.error(f"[Embedding] Failed after {max_retries} retries: {err}")
+                    raise
+                logger.warning(f"[Embedding retry {retry_count}/{max_retries}] Server error {code}, retrying in {wait_seconds}s")
                 time.sleep(wait_seconds)
             else:
                 raise

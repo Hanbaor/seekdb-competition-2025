@@ -34,7 +34,7 @@ def get_or_create_client() -> HybridSearch:
             db_name=OCEANBASE_DBNAME,
             # Increase connection pool for multi-threaded operations
             pool_size=50,  # 增加连接池大小（默认5）
-            max_overflow=10000,  # 允许超出pool_size的额外连接数
+            max_overflow=1000,  # 允许超出pool_size的额外连接数
             pool_timeout=30,  # 等待可用连接的超时时间（秒）
             pool_recycle=3600,  # 连接回收时间（秒），防止长时间连接失效
             pool_pre_ping=True,  # 使用前检查连接是否有效
@@ -49,12 +49,7 @@ if __name__ == "__main__":
     password = os.getenv("OCEANBASE_PASSWORD")
     db_name = os.getenv("OCEANBASE_DBNAME")
 
-    client = HybridSearch(
-        uri=os.getenv("OCEANBASE_URI"),
-        user=os.getenv("OCEANBASE_USER"),
-        password=os.getenv("OCEANBASE_PASSWORD"),
-        db_name=os.getenv("OCEANBASE_DBNAME"),
-    )
+    client = get_or_create_client()
 
     test_table_name = "hybrid_search_test"
 

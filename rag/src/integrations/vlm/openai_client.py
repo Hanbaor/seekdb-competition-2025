@@ -68,10 +68,9 @@ def generate_response(
     
     request_messages = [{"role": "user", "content": msg_content}]
     already_compressed = False
-    retry_count = 0
+    max_retries = 30
     
-    while True:
-        retry_count += 1
+    for retry_count in range(1, max_retries + 1):
         try:
             resp = vlm_client.chat.completions.create(
                 model=model,
@@ -87,7 +86,11 @@ def generate_response(
             return text
             
         except (RateLimitError, APIConnectionError) as err:
-            logger.warning(f"[VLM retry {retry_count}] {err.__class__.__name__}, retrying in {wait_seconds}s")
+            if retry_count >= max_retries:
+                logger.error(f"[VLM] Failed after {max_retries} retries: {err}")
+                cleanup_temp_files(temp_files)
+                raise
+            logger.warning(f"[VLM retry {retry_count}/{max_retries}] {err.__class__.__name__}, retrying in {wait_seconds}s")
             time.sleep(wait_seconds)
             
         except APIError as err:
@@ -122,8 +125,12 @@ def generate_response(
                     logger.error(f"Failed to compress images: {compress_err}")
             
             # 5xx server errors are retryable
-            if http_code and http_code >= 500:
-                logger.warning(f"[VLM retry {retry_count}] Server error {http_code}, retrying in {wait_seconds}s")
+            if http_code and http_code >= 429:
+                if retry_count >= max_retries:
+                    logger.error(f"[VLM] Failed after {max_retries} retries: {err}")
+                    cleanup_temp_files(temp_files)
+                    raise
+                logger.warning(f"[VLM retry {retry_count}/{max_retries}] Server error {http_code}, retrying in {wait_seconds}s")
                 time.sleep(wait_seconds)
             else:
                 cleanup_temp_files(temp_files)
