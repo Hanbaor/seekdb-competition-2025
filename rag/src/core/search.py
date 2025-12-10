@@ -26,31 +26,38 @@ OCEANBASE_DBNAME = os.getenv("OCEANBASE_DBNAME")
 TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
-TOP_K = 25  # 原值，平衡速度和准确率
+# TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
+TOP_K = 25  # Optimal value for LLM Rerank - 65.29 best score
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
 
 
-def _search_with_retry(client, index: str, body: dict, wait_seconds: float = 2.0, max_retries: int = 30):
-    """
-    Execute database search with limited retry (max 30 times = 60 seconds).
-    """
-    for retry_count in range(1, max_retries + 1):
+def _search_with_retry(client, index: str, body: dict, max_retries: int = 3, backoff_base: float = 0.3):
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
         try:
             return client.search(index=index, body=body)
         except Exception as e:
-            if retry_count >= max_retries:
-                logger.error("[DB] Search failed after %d retries: %s", max_retries, e)
+            last_exception = e
+            if attempt >= max_retries:
+                logger.error(
+                    "Hybrid search failed after %d attempts: %s", attempt, e, exc_info=True
+                )
                 raise
+
+            sleep_time = backoff_base * (2 ** (attempt - 1))
             logger.warning(
-                "[DB retry %d/%d] Search error: %s, retrying in %.1fs",
-                retry_count,
+                "Hybrid search error on attempt %d/%d: %s, retrying in %.1fs",
+                attempt,
                 max_retries,
                 e,
-                wait_seconds,
+                sleep_time,
             )
-            time.sleep(wait_seconds)
+            time.sleep(sleep_time)
+
+    if last_exception is not None:
+        raise last_exception
 
 
 def apply_rrf_reranking(search_results, k=60, score_weight=0.5):

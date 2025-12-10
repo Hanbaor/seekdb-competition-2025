@@ -25,61 +25,44 @@ llm = OpenAI(
 
 def generate_response(
     messages: List[Dict[str, str]],
-    model: str = "qwen-plus",
+    model="qwen-plus",
+    retry_interval: float = 2.0,  # 固定重试间隔
     timeout: float = 300.0,
     temperature: float = 0.0,
-    wait_seconds: float = 2.0,
 ) -> str:
     """
-    Call LLM to generate response, retry indefinitely on transient errors.
-    
+    Generate a response from the LLM with error handling and infinite retry logic.
+
     Args:
-        messages: List of message dicts
-        model: Model name
+        messages: List of message dictionaries with 'role' and 'content' keys
+        model: Model name to use for generation
+        retry_interval: Fixed interval between retries in seconds
         timeout: Request timeout in seconds
         temperature: Sampling temperature
-        wait_seconds: Wait time between retries
-    
+
     Returns:
-        Generated response text
+        The generated response content as a string
     """
-    max_retries = 30
-    
-    for retry_count in range(1, max_retries + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            result = llm.chat.completions.create(
+            response = llm.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
                 timeout=timeout,
             )
-            
-            content = result.choices[0].message.content if result.choices else None
-            if not content:
+
+            if not response.choices or not response.choices[0].message.content:
                 raise ValueError("Empty response from API")
-            
-            return content
-            
-        except (RateLimitError, APIConnectionError, TimeoutError) as err:
-            if retry_count >= max_retries:
-                print(f"[LLM] Failed after {max_retries} retries: {err}")
-                raise
-            print(f"[LLM retry {retry_count}/{max_retries}] {err.__class__.__name__}: retrying in {wait_seconds}s...")
-            time.sleep(wait_seconds)
-            
-        except APIError as err:
-            # Server errors are retryable, client errors are not
-            if err.status_code and err.status_code >= 500:
-                if retry_count >= max_retries:
-                    print(f"[LLM] Failed after {max_retries} retries: {err}")
-                    raise
-                print(f"[LLM retry {retry_count}/{max_retries}] Server error {err.status_code}: retrying in {wait_seconds}s...")
-                time.sleep(wait_seconds)
-            else:
-                raise
-                
-        except Exception:
-            raise
+
+            return response.choices[0].message.content
+
+        except Exception as e:
+            # Retry indefinitely on any error until successful
+            print(f"LLM error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
 
 if __name__ == "__main__":

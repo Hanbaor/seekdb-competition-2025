@@ -85,14 +85,11 @@ if __name__ == "__main__":
     logger.info(f"Output file: {args.output}")
 
     logger.info("Starting data preparation...")
-    logger.info(f"[CONFIG] max_worker=20, max_qa_workers=3")
-    import time as _time
-    start_time = _time.time()
     add(
         dataset_dir=args.dataset,
-        max_worker=20,  
+        max_worker=50,  
     )
-    logger.info(f"Data preparation completed in {_time.time() - start_time:.1f}s")
+    logger.info("Data preparation completed.")
 
     logger.info("Starting question answering...")
     questions: List[str] = read_questions_json(args.questions)
@@ -105,7 +102,7 @@ if __name__ == "__main__":
     logger.info(f"Created log directory: {log_dir}")
 
     # Process questions in parallel with max workers
-    max_qa_workers = 3  
+    max_qa_workers = 5  
     answers_dict = {}  # Store answers with their original index
     
     with ThreadPoolExecutor(max_workers=max_qa_workers) as executor:
@@ -125,14 +122,6 @@ if __name__ == "__main__":
                 logger.info(f"Completed question {idx + 1}/{len(questions)}: {question[:50]}...")
             except Exception as e:
                 logger.error(f"Error processing question {idx + 1}: {e}", exc_info=True)
-                # 失败时添加空答案占位，确保答案数量与问题数量一致
-                from src.util import Answer
-                answers_dict[idx] = Answer(
-                    question=question,
-                    answer="无法生成答案",
-                    filename="",
-                    page=0
-                )
     
     logger.info(f"Completed processing {len(questions)} questions.")
     

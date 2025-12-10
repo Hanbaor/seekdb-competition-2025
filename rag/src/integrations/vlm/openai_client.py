@@ -4,7 +4,7 @@ import time
 from typing import List, Optional, Union
 
 import dotenv
-from openai import APIConnectionError, APIError, OpenAI, RateLimitError
+from openai import OpenAI
 
 from .image_utils import cleanup_temp_files, process_images_to_base64
 
@@ -32,113 +32,103 @@ vlm_client = OpenAI(
 def generate_response(
     prompt: str,
     images: Optional[Union[str, List[str]]] = None,
-    model: str = "qwen3-vl-flash",
-    wait_seconds: float = 2.0,
+    model: str = "qwen3-vl-plus",
+    # model: str = "qwen3-vl-plus",
+    retry_interval: float = 2.0,  
 ) -> str:
     """
-    Call VLM to process text and images, retry indefinitely on transient errors.
-    
+    Generate a response from the VLM (Vision Language Model) using OpenAI-compatible API
+    with infinite retry logic.
+
     Args:
-        prompt: Text prompt
-        images: Image path(s) or base64 encoded string(s), optional
-        model: VLM model name
-        wait_seconds: Wait time between retries
-    
+        prompt: Text prompt for the model
+        images: Optional image path(s) or base64 encoded image(s)
+        model: Model name to use for generation
+        retry_interval: Fixed interval between retries in seconds
+
     Returns:
-        Generated text response
+        The generated response content as a string
     """
-    # Store original image paths for compression retry on 502 errors
-    src_image_paths = []
+
+    # Store original image paths for potential compression on errors
+    original_image_paths = []
     if images:
-        img_list = [images] if isinstance(images, str) else images
-        src_image_paths = [p for p in img_list if os.path.isfile(p)]
-    
-    # Convert images to base64
-    base64_images, temp_files = process_images_to_base64(
+        if isinstance(images, str):
+            images = [images]
+        original_image_paths = [img if os.path.isfile(img) else None for img in images]
+
+    # Process images - convert file paths to base64 if needed
+    processed_images, temp_files_to_cleanup = process_images_to_base64(
         images if images else [], compress_for_retry=False
     )
-    
-    # Build message content
-    msg_content = [{"type": "text", "text": prompt}]
-    for b64 in base64_images:
-        msg_content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"}
-        })
-    
-    request_messages = [{"role": "user", "content": msg_content}]
-    already_compressed = False
-    max_retries = 30
-    
-    for retry_count in range(1, max_retries + 1):
+
+    # Build messages in OpenAI format
+    # OpenAI format: content is a list of content blocks
+    content_blocks = [{"type": "text", "text": prompt}]
+
+    # Add images to content blocks
+    for img_base64 in processed_images:
+        # OpenAI format: data:image/{format};base64,{base64_string}
+        # We'll use PNG as default format since we normalize to PNG
+        image_url = f"data:image/png;base64,{img_base64}"
+        content_blocks.append({"type": "image_url", "image_url": {"url": image_url}})
+
+    messages = [{"role": "user", "content": content_blocks}]
+
+    # Track if we've already compressed images for retry
+    images_compressed = False
+    attempt = 0
+
+    while True:
+        attempt += 1
         try:
-            resp = vlm_client.chat.completions.create(
+            response = vlm_client.chat.completions.create(
                 model=model,
-                messages=request_messages,
+                messages=messages,
                 temperature=0.2,
             )
+
+            if not response.choices or not response.choices[0].message.content:
+                raise ValueError("Empty response from API")
+
+            content = response.choices[0].message.content
+            if not content or len(content.strip()) == 0:
+                raise ValueError("Empty response content from API")
+
+            # Clean up temporary files before returning
+            cleanup_temp_files(temp_files_to_cleanup)
+
+            return content
+
+        except Exception as e:
+            # Retry indefinitely on any error until successful
+            error_str = str(e).lower()
             
-            text = resp.choices[0].message.content if resp.choices else None
-            if not text or not text.strip():
-                raise ValueError("Empty response from VLM")
-            
-            cleanup_temp_files(temp_files)
-            return text
-            
-        except (RateLimitError, APIConnectionError) as err:
-            if retry_count >= max_retries:
-                logger.error(f"[VLM] Failed after {max_retries} retries: {err}")
-                cleanup_temp_files(temp_files)
-                raise
-            logger.warning(f"[VLM retry {retry_count}/{max_retries}] {err.__class__.__name__}, retrying in {wait_seconds}s")
-            time.sleep(wait_seconds)
-            
-        except APIError as err:
-            err_msg = str(err).lower()
-            http_code = getattr(err, "status_code", None)
-            
-            # Image format errors are not retryable
-            bad_format_hints = ["unknown format", "unsupported format", "invalid format", "image format", "failed to process"]
-            if any(hint in err_msg for hint in bad_format_hints):
-                logger.error(f"Image format error: {err}")
-                cleanup_temp_files(temp_files)
-                raise
-            
-            # Try compressing images on 502 errors
-            is_gateway_err = (http_code == 502 or "502" in err_msg or "bad gateway" in err_msg)
-            if is_gateway_err and src_image_paths and not already_compressed:
-                logger.warning("502 error detected, attempting to compress images...")
+            # Handle 502 errors - try compressing images
+            is_502_error = "502" in error_str or "bad gateway" in error_str
+            if is_502_error and original_image_paths and not images_compressed:
+                logger.warning("502 error detected. Attempting to compress images...")
                 try:
-                    cleanup_temp_files(temp_files)
-                    base64_images, temp_files = process_images_to_base64(src_image_paths, compress_for_retry=True)
-                    msg_content = [{"type": "text", "text": prompt}]
-                    for b64 in base64_images:
-                        msg_content.append({
-                            "type": "image_url", 
-                            "image_url": {"url": f"data:image/png;base64,{b64}"}
-                        })
-                    request_messages = [{"role": "user", "content": msg_content}]
-                    already_compressed = True
+                    cleanup_temp_files(temp_files_to_cleanup)
+                    processed_images, temp_files_to_cleanup = process_images_to_base64(
+                        [img for img in original_image_paths if img is not None],
+                        compress_for_retry=True,
+                    )
+                    content_blocks = [{"type": "text", "text": prompt}]
+                    for img_base64 in processed_images:
+                        image_url = f"data:image/png;base64,{img_base64}"
+                        content_blocks.append(
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        )
+                    messages = [{"role": "user", "content": content_blocks}]
+                    images_compressed = True
                     logger.info("Images compressed, retrying...")
                     continue
-                except Exception as compress_err:
-                    logger.error(f"Failed to compress images: {compress_err}")
+                except Exception as compress_error:
+                    logger.error(f"Failed to compress images: {compress_error}")
             
-            # 5xx server errors are retryable
-            if http_code and http_code >= 429:
-                if retry_count >= max_retries:
-                    logger.error(f"[VLM] Failed after {max_retries} retries: {err}")
-                    cleanup_temp_files(temp_files)
-                    raise
-                logger.warning(f"[VLM retry {retry_count}/{max_retries}] Server error {http_code}, retrying in {wait_seconds}s")
-                time.sleep(wait_seconds)
-            else:
-                cleanup_temp_files(temp_files)
-                raise
-                
-        except Exception:
-            cleanup_temp_files(temp_files)
-            raise
+            logger.warning(f"VLM error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
 
 if __name__ == "__main__":

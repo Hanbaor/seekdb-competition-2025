@@ -31,59 +31,43 @@ def generate_response(
     embedding_text: str,
     model: str = "text-embedding-v4",
     dimensions: int = 2048,  # Default 2048 for highest precision
-    wait_seconds: float = 2.0,
+    retry_interval: float = 2.0,  # 固定重试间隔
 ) -> List[float]:
     """
-    Generate text embeddings, retry indefinitely on transient errors.
-    
+    Generate embeddings from text using OpenAI-compatible API with infinite retry logic.
+
     Args:
-        embedding_text: Text to embed
-        model: Embedding model name
-        dimensions: Vector dimensions (supports 512/768/1024/1536/2048)
-        wait_seconds: Wait time between retries
-    
+        embedding_text: Text to generate embeddings for
+        model: Model name to use for embedding generation
+        dimensions: Output dimension size
+        retry_interval: Fixed interval between retries in seconds
+
     Returns:
-        Embedding vector as list of floats
+        The embedding vector as a list of floats
     """
-    max_retries = 30
-    
-    for retry_count in range(1, max_retries + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            resp = embedding_client.embeddings.create(
+            response = embedding_client.embeddings.create(
                 model=model,
                 input=embedding_text,
                 dimensions=dimensions,
             )
-            
-            if not resp.data or len(resp.data) == 0:
-                raise ValueError("Empty response from embedding API")
-            
-            vector = resp.data[0].embedding
-            if not vector:
-                raise ValueError("Empty embedding vector")
-                
-            return vector
-            
-        except (RateLimitError, APIConnectionError) as err:
-            if retry_count >= max_retries:
-                logger.error(f"[Embedding] Failed after {max_retries} retries: {err}")
-                raise
-            logger.warning(f"[Embedding retry {retry_count}/{max_retries}] {err.__class__.__name__}, retrying in {wait_seconds}s")
-            time.sleep(wait_seconds)
-            
-        except APIError as err:
-            code = getattr(err, "status_code", None)
-            if code and code >= 500:
-                if retry_count >= max_retries:
-                    logger.error(f"[Embedding] Failed after {max_retries} retries: {err}")
-                    raise
-                logger.warning(f"[Embedding retry {retry_count}/{max_retries}] Server error {code}, retrying in {wait_seconds}s")
-                time.sleep(wait_seconds)
-            else:
-                raise
-                
-        except Exception:
-            raise
+
+            if not response or not response.data or len(response.data) == 0:
+                raise ValueError("Empty or invalid response from OpenAI API")
+
+            embedding_vector = response.data[0].embedding
+            if not embedding_vector or len(embedding_vector) == 0:
+                raise ValueError("Empty embedding vector from API")
+
+            return embedding_vector
+
+        except Exception as e:
+            # Retry indefinitely on any error until successful
+            logger.warning(f"Embedding error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
 
 if __name__ == "__main__":
