@@ -4,7 +4,7 @@ import time
 from typing import List, Optional, Union
 
 import dotenv
-from openai import APIConnectionError, APIError, OpenAI, RateLimitError
+from openai import OpenAI
 
 from .image_utils import cleanup_temp_files, process_images_to_base64
 
@@ -100,36 +100,12 @@ def generate_response(
 
             return content
 
-        except (RateLimitError, APIConnectionError) as e:
-            logger.warning(f"VLM error (attempt {attempt}): {type(e).__name__}. Retrying in {retry_interval}s...")
-            time.sleep(retry_interval)
-
-        except APIError as e:
+        except Exception as e:
+            # 任何错误都无限重试，直到成功
             error_str = str(e).lower()
-            status_code = getattr(e, "status_code", None)
-
-            # Check for non-retryable format errors
-            format_error_keywords = [
-                "unknown format",
-                "unsupported format",
-                "invalid format",
-                "image format",
-                "failed to process inputs",
-            ]
-            is_format_error = any(
-                keyword in error_str for keyword in format_error_keywords
-            )
-
-            if is_format_error:
-                logger.error(f"Image format error: {str(e)}")
-                cleanup_temp_files(temp_files_to_cleanup)
-                raise e
-
-            # Handle 502 errors - try compressing images
-            is_502_error = (
-                status_code == 502 or "502" in error_str or "bad gateway" in error_str
-            )
-
+            
+            # Handle 502 errors - try compressing images (保留图片压缩优化)
+            is_502_error = "502" in error_str or "bad gateway" in error_str
             if is_502_error and original_image_paths and not images_compressed:
                 logger.warning("502 error detected. Attempting to compress images...")
                 try:
@@ -150,18 +126,9 @@ def generate_response(
                     continue
                 except Exception as compress_error:
                     logger.error(f"Failed to compress images: {compress_error}")
-
-            # Server errors (5xx) - retry
-            if status_code and status_code >= 500:
-                logger.warning(f"VLM server error {status_code} (attempt {attempt}). Retrying in {retry_interval}s...")
-                time.sleep(retry_interval)
-            else:
-                cleanup_temp_files(temp_files_to_cleanup)
-                raise e
-
-        except Exception as e:
-            cleanup_temp_files(temp_files_to_cleanup)
-            raise e
+            
+            logger.warning(f"VLM error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
 
 if __name__ == "__main__":

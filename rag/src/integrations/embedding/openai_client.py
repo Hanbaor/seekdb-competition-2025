@@ -64,20 +64,10 @@ def generate_response(
 
             return embedding_vector
 
-        except (RateLimitError, APIConnectionError) as e:
-            logger.warning(f"Embedding error (attempt {attempt}): {type(e).__name__}. Retrying in {retry_interval}s...")
-            time.sleep(retry_interval)
-
-        except APIError as e:
-            status_code = getattr(e, "status_code", None)
-            if status_code and status_code >= 500:
-                logger.warning(f"Embedding server error {status_code} (attempt {attempt}). Retrying in {retry_interval}s...")
-                time.sleep(retry_interval)
-            else:
-                raise e
-
         except Exception as e:
-            raise e
+            # 任何错误都无限重试，直到成功
+            logger.warning(f"Embedding error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
 
 if __name__ == "__main__":
