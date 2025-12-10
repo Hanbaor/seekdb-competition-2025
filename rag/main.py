@@ -85,11 +85,14 @@ if __name__ == "__main__":
     logger.info(f"Output file: {args.output}")
 
     logger.info("Starting data preparation...")
+    logger.info(f"[CONFIG] max_worker=20, max_qa_workers=3")
+    import time as _time
+    start_time = _time.time()
     add(
         dataset_dir=args.dataset,
         max_worker=20,  
     )
-    logger.info("Data preparation completed.")
+    logger.info(f"Data preparation completed in {_time.time() - start_time:.1f}s")
 
     logger.info("Starting question answering...")
     questions: List[str] = read_questions_json(args.questions)

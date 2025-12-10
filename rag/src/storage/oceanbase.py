@@ -27,18 +27,26 @@ def get_or_create_client() -> HybridSearch:
     global _client
 
     if _client is None:
-        _client = HybridSearch(
-            uri=OCEANBASE_URI,
-            user=OCEANBASE_USER,
-            password=OCEANBASE_PASSWORD,
-            db_name=OCEANBASE_DBNAME,
-            # Increase connection pool for multi-threaded operations
-            pool_size=50,  # 增加连接池大小（默认5）
-            max_overflow=1000,  # 允许超出pool_size的额外连接数
-            pool_timeout=30,  # 等待可用连接的超时时间（秒）
-            pool_recycle=3600,  # 连接回收时间（秒），防止长时间连接失效
-            pool_pre_ping=True,  # 使用前检查连接是否有效
-        )
+        # Log connection parameters (hide password)
+        logger.info(f"[DB] Connecting to OceanBase: URI={OCEANBASE_URI}, USER={OCEANBASE_USER}, DB={OCEANBASE_DBNAME}")
+        
+        try:
+            _client = HybridSearch(
+                uri=OCEANBASE_URI,
+                user=OCEANBASE_USER,
+                password=OCEANBASE_PASSWORD,
+                db_name=OCEANBASE_DBNAME,
+                # Increase connection pool for multi-threaded operations
+                pool_size=50,  # 增加连接池大小（默认5）
+                max_overflow=1000,  # 允许超出pool_size的额外连接数
+                pool_timeout=30,  # 等待可用连接的超时时间（秒）
+                pool_recycle=3600,  # 连接回收时间（秒），防止长时间连接失效
+                pool_pre_ping=True,  # 使用前检查连接是否有效
+            )
+            logger.info("[DB] OceanBase connection established successfully")
+        except Exception as e:
+            logger.error(f"[DB] Failed to connect to OceanBase: {e}")
+            raise
 
     return _client
 
