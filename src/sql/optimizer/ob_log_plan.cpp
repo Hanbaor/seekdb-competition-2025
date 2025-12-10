@@ -15694,14 +15694,13 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
   } else if (OB_FALSE_IT(table_scan = static_cast<ObLogTableScan*>(top))) {
   } else if (!table_scan->is_text_retrieval_scan() || table_scan->use_index_merge()) {
     // do nothing
-  } else if (table_scan->get_filter_exprs().count() != 0 ||
-             table_scan->get_pushdown_filter_exprs().count() != 0) {
-    // do nothing, topn pushdown requires that only match filter exists on the base table.
   } else if (sort_keys.count() >= 1 && OB_NOT_NULL(sort_keys.at(0).expr_) &&
              sort_keys.at(0).expr_ == table_scan->get_text_retrieval_info().match_expr_) {
     // only accept match expr as prefix sort key.
+    // 允许有 filter 时也下推 topn（用于 BM25S 优化）
+    // BM25S 在存储层已完成排序，单分区情况下不需要进一步排序
     has_multi_sort_keys = sort_keys.count() == 1 ? false : true;
-    need_further_sort = has_multi_sort_keys || table_scan->use_das() || need_exchange;
+    need_further_sort = has_multi_sort_keys || need_exchange;
     pushed_limit_expr = need_further_sort ? topn_expr : limit_expr;
     pushed_offset_expr = need_further_sort ? NULL : offset_expr;
     ObSEArray<OrderItem, 1> tmp_sort_keys;

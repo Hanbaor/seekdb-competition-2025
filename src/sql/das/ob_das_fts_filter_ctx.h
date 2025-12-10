@@ -31,6 +31,10 @@ struct ObFtsFilterCtx
   int64_t base_id_count_;
   bool has_base_id_filter_;
   
+  // LIMIT 条件 (例如 LIMIT 10)
+  int64_t limit_count_;
+  bool has_limit_;
+  
   // POD：不需要构造函数，使用 reset() 初始化
   
   int add_base_id(const common::ObString &base_id)

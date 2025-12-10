@@ -22,8 +22,6 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/das/ob_das_fts_filter_ctx.h"
 #include "sql/das/ob_fts_scalar_cache.h"
-#include <unistd.h>  // for usleep
-#include <sys/time.h>  // for gettimeofday
 
 namespace oceanbase
 {
@@ -96,13 +94,13 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       g_fts_filter_ctx.reset();
       
       // 1. 设置 id < 1000（测试值，后续由下推层设置）
-      g_fts_filter_ctx.id_limit_ = 1000;
-      g_fts_filter_ctx.has_id_filter_ = true;
+      // g_fts_filter_ctx.id_limit_ = 1000;
+      // g_fts_filter_ctx.has_id_filter_ = true;
       
       // 2. 设置 base_id IN 过滤条件（测试值，后续由下推层设置）
-      g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_1"));
-      g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_2"));
-      g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_3"));
+      // g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_1"));
+      // g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_2"));
+      // g_fts_filter_ctx.add_base_id(common::ObString::make_string("base_id_3"));
 
       if (ir_ctdef_ != nullptr) {
         const ObDASScanCtDef* inv_scan = ir_ctdef_->get_inv_idx_scan_ctdef();
@@ -1142,15 +1140,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     if (bm25s_search_done_) {
       return OB_ITER_END;
     }
-    
-    // // 模拟延迟，降低 QPS（目标 1000 QPS）
-    // struct timeval start, end;
-    // gettimeofday(&start, NULL);
-    // usleep(620);  // 620 微秒
-    // gettimeofday(&end, NULL);
-    // int64_t actual = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
-    // LOG_INFO("usleep(620) actual delay", K(actual));
-    
+
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
     // 确保 scalar cache 已加载到内存
     if (!g_fts_scalar_cache.is_loaded()) {
@@ -1168,6 +1158,20 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 确保 scores_array 容量足够
     int64_t required_capacity;
+    
+    // 打印当前的过滤上下文状态 (Debug)
+    /*
+    if (g_fts_filter_ctx.has_limit_ || g_fts_filter_ctx.has_id_filter_ || g_fts_filter_ctx.has_base_id_filter_) {
+       LOG_INFO("FTS Execution Context", 
+                "has_limit", g_fts_filter_ctx.has_limit_, 
+                "limit", g_fts_filter_ctx.limit_count_,
+                "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
+                "id_limit", g_fts_filter_ctx.id_limit_,
+                "has_base_id", g_fts_filter_ctx.has_base_id_filter_, 
+                "base_id_cnt", g_fts_filter_ctx.base_id_count_);
+    }
+    */
+
     if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
       // 有 id 过滤，用 id_limit 作为容量（更省内存）
       required_capacity = g_fts_filter_ctx.id_limit_;
@@ -1242,10 +1246,37 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       return ret;
     }
     
-    int64_t effective_topk = (topk_limit_ > 0) ? topk_limit_ : 10;  
+    // 直接从 IR 层获取 LIMIT 值（不依赖 topk_mode_）
+    int64_t effective_topk = 10; // 默认值
+    bool limit_from_expr = false;
+    if (topk_limit_ > 0) {
+      effective_topk = topk_limit_;
+    } else if (OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_) && OB_NOT_NULL(ir_rtdef_)) {
+      // 直接计算 topk_limit_expr_
+      ObDatum *limit_datum = nullptr;
+      if (OB_SUCCESS == ir_ctdef_->topk_limit_expr_->eval(*ir_rtdef_->eval_ctx_, limit_datum) && 
+          OB_NOT_NULL(limit_datum) && !limit_datum->is_null() && limit_datum->get_int() > 0) {
+        effective_topk = limit_datum->get_int();
+        limit_from_expr = true;
+        // 如果有 offset，也要加上
+        if (OB_NOT_NULL(ir_ctdef_->topk_offset_expr_)) {
+          ObDatum *offset_datum = nullptr;
+          if (OB_SUCCESS == ir_ctdef_->topk_offset_expr_->eval(*ir_rtdef_->eval_ctx_, offset_datum) &&
+              OB_NOT_NULL(offset_datum) && !offset_datum->is_null() && offset_datum->get_int() > 0) {
+            effective_topk += offset_datum->get_int();
+          }
+        }
+      }
+    }
+    // LOG_INFO("FTS BM25S topk", K(topk_limit_), K(effective_topk), K(limit_from_expr),
+    //          "ir_ctdef", OB_NOT_NULL(ir_ctdef_), 
+    //          "topk_expr", OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_),
+    //          K(results.count()), K(capacity));
+    
     int64_t k = std::min(effective_topk, (int64_t)results.count());
     k = std::min(k, capacity);
     
+    // partial_sort 只排序前 k 个，比完整排序更高效
     if (results.count() > 1) {
       std::partial_sort(&results.at(0), 
                         &results.at(0) + k,

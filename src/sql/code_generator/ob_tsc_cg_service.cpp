@@ -3882,6 +3882,16 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
     }
   }
 
+  // 无论是否进入 block_max 分支，都设置 topk_limit_expr_（用于 BM25S 优化）
+  if (OB_SUCC(ret) && nullptr != tr_info.topk_limit_expr_ && nullptr == text_ir_scan_ctdef.topk_limit_expr_) {
+    if (OB_FAIL(cg_.generate_rt_expr(*tr_info.topk_limit_expr_, text_ir_scan_ctdef.topk_limit_expr_))) {
+      LOG_WARN("cg rt expr for topk limit expr failed", K(ret));
+    } else if (nullptr != tr_info.topk_offset_expr_ &&
+        OB_FAIL(cg_.generate_rt_expr(*tr_info.topk_offset_expr_, text_ir_scan_ctdef.topk_offset_expr_))) {
+      LOG_WARN("cg rt expr for topk offset expr failed", K(ret));
+    }
+  }
+
   if (FAILEDx(text_ir_scan_ctdef.result_output_.assign(result_output))) {
     LOG_WARN("failed to assign result output", K(ret), K(result_output));
   }
