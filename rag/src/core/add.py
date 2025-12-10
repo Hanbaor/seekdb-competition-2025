@@ -38,98 +38,64 @@ TABLE_NAME = "rag_documents"
 
 
 
-from sqlalchemy import VARCHAR, Column, Integer, create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import VARCHAR, Column, Integer
 
-# ... existing imports ...
 
-def get_db_engine():
-    """Create SQLAlchemy engine for OceanBase."""
-    uri = os.getenv("OCEANBASE_URI")
-    user = os.getenv("OCEANBASE_USER")
-    password = os.getenv("OCEANBASE_PASSWORD")
-    db_name = os.getenv("OCEANBASE_DBNAME")
+def recreate_table(client: HybridSearch, vector_dim: int, retry_interval: float = 2.0):
+    """Drop and recreate the documents table with infinite retry."""
     
-    # Parse URI (host:port)
-    if ":" in uri:
-        host, port = uri.split(":")
-    else:
-        host = uri
-        port = "2881"
-        
-    connection_string = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4"
-    return create_engine(connection_string)
+    # Step 1: Drop existing table (with retry)
+    logger.info(f"Dropping table '{TABLE_NAME}' if exists...")
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            client.drop_table_if_exist(table_name=TABLE_NAME)
+            logger.info(f"Table '{TABLE_NAME}' dropped (or didn't exist).")
+            break
+        except Exception as e:
+            logger.warning(f"Failed to drop table (attempt {attempt}): {e}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
-def get_processed_files(table_name: str) -> set:
-    """Get set of filenames already in the database."""
-    try:
-        engine = get_db_engine()
-        with engine.connect() as conn:
-            # Check if table exists first
-            result = conn.execute(text(f"SHOW TABLES LIKE '{table_name}'"))
-            if not result.fetchone():
-                return set()
+    # Step 2: Create new table (with retry)
+    logger.info(f"Creating table '{TABLE_NAME}'...")
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            client.create_table(
+                table_name=TABLE_NAME,
+                columns=[
+                    Column("id", Integer, primary_key=True, autoincrement=True),
+                    Column("source_id", VARCHAR(64)),  # Unique identifier for each chunk
+                    Column("filename", VARCHAR(512)),  # PDF filename
+                    Column("page", Integer),  # Page number (1-indexed)
+                    Column("content", VARCHAR(8192)),  # Text content
+                    Column("vector", VECTOR(vector_dim)),  # Embedding vector
+                ],
+                indexes=[
+                    VectorIndex("vec_idx", "vector", params="distance=l2, type=hnsw, lib=vsag"),
+                ],
+                mysql_charset="utf8mb4",
+                mysql_collate="utf8mb4_unicode_ci",
+                mysql_organization="heap",
+            )
             
-            # Get distinct filenames
-            result = conn.execute(text(f"SELECT DISTINCT filename FROM {table_name}"))
-            return {row[0] for row in result}
-    except Exception as e:
-        logger.warning(f"Failed to get processed files from DB: {e}")
-        return set()
-
-def create_table_if_not_exists(client: HybridSearch, vector_dim: int):
-    """Create the documents table if it doesn't exist."""
-    logger.info(f"Checking table '{TABLE_NAME}'...")
-    
-    # Check if table exists using SQLAlchemy
-    try:
-        engine = get_db_engine()
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SHOW TABLES LIKE '{TABLE_NAME}'"))
-            if result.fetchone():
-                logger.info(f"Table '{TABLE_NAME}' already exists. Skipping creation.")
-                return
-    except Exception as e:
-        logger.warning(f"Failed to check table existence: {e}")
-        # Continue to try creating it if check fails
-
-    try:
-        # Create table
-        client.create_table(
-            table_name=TABLE_NAME,
-            columns=[
-                Column("id", Integer, primary_key=True, autoincrement=True),
-                Column("source_id", VARCHAR(64)),  # Unique identifier for each chunk
-                Column("filename", VARCHAR(512)),  # PDF filename
-                Column("page", Integer),  # Page number (1-indexed)
-                Column("content", VARCHAR(8192)),  # Text content
-                Column("vector", VECTOR(vector_dim)),  # Embedding vector
-            ],
-            indexes=[
-                VectorIndex("vec_idx", "vector", params="distance=l2, type=hnsw, lib=vsag"),
-            ],
-            mysql_charset="utf8mb4",
-            mysql_collate="utf8mb4_unicode_ci",
-            mysql_organization="heap",
-        )
-        
-        # Create full-text search index on content
-        client.create_fts_idx_with_fts_index_param(
-            table_name=TABLE_NAME,
-            fts_idx_param=FtsIndexParam(
-                index_name="fts_idx_content",
-                field_names=["content"],
-                parser_type=FtsParser.IK,
-            ),
-        )
-        logger.info(f"Table '{TABLE_NAME}' created.")
-        
-    except Exception as e:
-        # If table exists, it might throw an error. We ignore "Table '...' already exists"
-        if "already exists" in str(e):
-            logger.info(f"Table '{TABLE_NAME}' already exists, skipping creation.")
-        else:
-            logger.warning(f"Error creating table (might already exist): {e}")
+            # Create full-text search index on content
+            client.create_fts_idx_with_fts_index_param(
+                table_name=TABLE_NAME,
+                fts_idx_param=FtsIndexParam(
+                    index_name="fts_idx_content",
+                    field_names=["content"],
+                    parser_type=FtsParser.IK,
+                ),
+            )
+            logger.info(f"Table '{TABLE_NAME}' created successfully.")
+            return
+            
+        except Exception as e:
+            logger.warning(f"Error creating table (attempt {attempt}): {e}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
 
 # ... process_pdf_file ...
 
@@ -156,32 +122,12 @@ def add(dataset_dir: str, max_worker: int):
     # Use embedding dimension from environment variable
     vector_dim = EMBEDDING_DIM
     
-    # Ensure table exists (idempotent)
-    create_table_if_not_exists(client, vector_dim)
+    # 每次运行都重新创建表，从头开始
+    recreate_table(client, vector_dim)
 
-    # Get list of already processed files
-    processed_files = get_processed_files(TABLE_NAME)
-    logger.info(f"Found {len(processed_files)} files already in database.")
-
-    # Filter PDF files
-    files_to_process = []
-    skipped_count = 0
-    for pdf_file in pdf_files:
-        filename = os.path.basename(pdf_file)
-        if filename not in processed_files:
-            files_to_process.append(pdf_file)
-        else:
-            skipped_count += 1
-            logger.info(f"✓ Skipping {filename} (already processed)")
-    
-    if skipped_count > 0:
-        logger.info(f"Skipped {skipped_count} already processed files.")
-
-    if not files_to_process:
-        logger.info("All files already processed. Skipping data preparation.")
-        return
-
-    logger.info(f"Processing {len(files_to_process)} new PDF files...")
+    # 处理所有 PDF 文件
+    files_to_process = pdf_files
+    logger.info(f"Processing {len(files_to_process)} PDF files...")
     
     # [Modified] Create page-level task queue for finer-grained parallelism
     page_tasks = []  # List of (pdf_path, page_num, total_pages)
