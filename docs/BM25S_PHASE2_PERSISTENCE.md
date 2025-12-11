@@ -38,7 +38,7 @@
 - `ObIODeviceLocalFileOp` - 本地文件操作（open/write/read/close）
 - 位于 `src/share/ob_io_device_helper.h`
 
-### 1.3 持久化内容
+### 1.4 持久化内容
 | 数据 | 说明 |
 |-----|------|
 | Header | 元数据：total_docs, avg_doc_len, vocab_size 等 |
@@ -895,7 +895,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
     }
     
     // 3. 第一次遍历所有桶：统计 df（不需要排序）
-    for (int64_t bucket_id = 0; OB_SUCC(ret) && bucket_id < num_buckets_; ++bucket_id) {
+    for (int64_t bucket_id = 0; OB_SUCC(ret) && bucket_id < NUM_BUCKETS; ++bucket_id) {
         ObArray<FileRecord> records;
         if (OB_FAIL(read_bucket(bucket_id, records))) {
             break;
@@ -963,7 +963,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
     }
     
     // 9. 第二次遍历所有桶：计算 BM25 并写入 Posting Data
-    for (int64_t bucket_id = 0; OB_SUCC(ret) && bucket_id < num_buckets_; ++bucket_id) {
+    for (int64_t bucket_id = 0; OB_SUCC(ret) && bucket_id < NUM_BUCKETS; ++bucket_id) {
         ObArray<FileRecord> records;
         if (OB_FAIL(read_bucket(bucket_id, records))) {
             break;
@@ -1225,10 +1225,175 @@ float ObFtsBM25SIndex::calc_bm25_score(int32_t tf, int32_t doc_len, int64_t df)
 
 ---
 
-## 11. 相关文件
+## 11. 扩展计划：外部排序（处理超大桶）
+
+### 11.1 问题场景
+
+基础方案使用固定 1024 桶，配合停用词过滤可覆盖大多数场景。但在以下情况可能需要外部排序：
+
+- 某个非停用词出现在极多文档中
+- 数据量远超预期（如 20 亿文档）
+- 单桶数据 > 可用内存
+
+### 11.2 外部排序方案
+
+```
+桶数据（可能 4 GB）
+        │
+        ▼
+┌───────────────────────────────────────┐
+│ Phase 1: 分批排序                      │
+│   读取 200 MB → 内存排序 → 写入临时文件  │
+│   重复 N 次，产生 N 个有序临时文件       │
+└───────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────┐
+│ Phase 2: K 路归并                      │
+│   打开 N 个临时文件                    │
+│   用最小堆归并                         │
+│   边归并边计算 BM25 边写入              │
+└───────────────────────────────────────┘
+```
+
+### 11.3 实现要点
+
+```cpp
+int finalize_bucket_with_external_sort(int64_t bucket_id) {
+    int64_t bucket_size = get_bucket_size(bucket_id);
+    const int64_t MAX_MEMORY = 200 * 1024 * 1024;  // 200 MB
+    
+    if (bucket_size <= MAX_MEMORY) {
+        // 小桶：直接内存排序
+        return finalize_bucket_in_memory(bucket_id);
+    }
+    
+    // 大桶：外部排序
+    ObArray<int64_t> sorted_chunk_fds;
+    
+    // Phase 1: 分批读取 + 排序 + 写入临时文件
+    const int64_t BATCH_SIZE = 10 * 1000 * 1000;  // 每批 1000 万条
+    int64_t offset = 0;
+    while (offset < bucket_record_count) {
+        ObArray<FileRecord> batch;
+        read_batch(bucket_id, offset, BATCH_SIZE, batch);
+        std::sort(batch.begin(), batch.end());
+        
+        int64_t chunk_fd;
+        write_sorted_chunk(batch, chunk_fd);
+        sorted_chunk_fds.push_back(chunk_fd);
+        
+        offset += BATCH_SIZE;
+    }
+    
+    // Phase 2: K 路归并
+    merge_sorted_chunks_and_write(bucket_id, sorted_chunk_fds);
+    
+    // 清理临时文件
+    cleanup_sorted_chunks(sorted_chunk_fds);
+    return OB_SUCCESS;
+}
+```
+
+### 11.4 K 路归并核心逻辑
+
+```cpp
+int merge_sorted_chunks_and_write(int64_t bucket_id,
+                                   const ObArray<int64_t> &chunk_fds) {
+    // 最小堆：<FileRecord, chunk_idx>
+    auto cmp = [](auto &a, auto &b) { return !(a.first < b.first); };
+    std::priority_queue<...> heap(cmp);
+    
+    // 初始化：每个 chunk 的第一条记录入堆
+    ObArray<ChunkReader> readers;
+    for (int i = 0; i < chunk_fds.count(); i++) {
+        readers[i].init(chunk_fds[i]);
+        if (readers[i].read_next()) {
+            heap.push({readers[i].current(), i});
+        }
+    }
+    
+    // 归并输出
+    uint32_t current_token_id = UINT32_MAX;
+    int64_t current_offset = posting_data_start_;
+    
+    while (!heap.empty()) {
+        auto [record, idx] = heap.top();
+        heap.pop();
+        
+        // Token 切换时记录元信息
+        if (record.token_id != current_token_id) {
+            if (current_token_id != UINT32_MAX) {
+                token_metas_[current_token_id].count = ...;
+            }
+            current_token_id = record.token_id;
+            token_metas_[current_token_id].offset = current_offset;
+        }
+        
+        // 计算 BM25 并写入
+        float score = calc_bm25(record.tf, record.doc_len, 
+                                 token_df_[record.token_id]);
+        pwrite(fd_, &record.doc_id, 4, current_offset);
+        pwrite(fd_, &score, 4, current_offset + 4);
+        current_offset += 8;
+        
+        // 从同一 chunk 读取下一条
+        if (readers[idx].read_next()) {
+            heap.push({readers[idx].current(), idx});
+        }
+    }
+    
+    // 回填 Vocab 和 Header
+    write_vocab_and_header(token_metas_);
+}
+```
+
+### 11.5 内存占用
+
+| 组件 | 大小 |
+|-----|------|
+| token_df_[vocab_size] | ~40 MB（1000 万词） |
+| token_metas_[vocab_size] | ~160 MB |
+| 排序批次缓冲区 | ~200 MB |
+| 归并堆 + 读取缓冲 | ~10 MB |
+| **总计** | **~410 MB** |
+
+### 11.6 查询时按需加载
+
+外部排序保证 doc_id 有序，查询时可利用 id_limit 精确加载：
+
+```cpp
+int get_posting_with_limit(token, id_limit, posting, handle) {
+    // 1. 获取 posting 元信息
+    int64_t offset, count;
+    get_posting_info(token, offset, count);
+    
+    // 2. 在文件中二分查找（不加载全部数据）
+    int64_t actual_count = binary_search_in_file(offset, count, id_limit);
+    
+    // 3. 只读取需要的部分
+    // 如果 count = 1 亿，但 actual_count = 1000
+    // 只读取 8 KB 而不是 800 MB！
+    return load_partial_posting(offset, actual_count, posting, handle);
+}
+```
+
+### 11.7 实现优先级
+
+| 优先级 | 方案 | 说明 |
+|-------|------|------|
+| **基础方案** | 固定 1024 桶 + 内存排序 + 按需加载 | 覆盖大多数场景 |
+| **扩展方案** | 外部排序兜底 | 处理超大桶，内存可控 |
+
+**注**：按需加载（KVCache + id_limit 精确读取）是 Phase 3 的基础设计，不是扩展优化。
+
+---
+
+## 12. 相关文件
 
 - `src/sql/das/ob_fts_bm25s_index.h` - 结构体定义
 - `src/sql/das/ob_fts_bm25s_index.cpp` - 实现
 - `src/share/ob_io_device_helper.h` - 文件操作接口
+- `src/storage/fts/ob_fts_stop_word.h` - 停用词过滤（已有）
 - `BM25S_PHASE1_TMPFILE_BUCKET.md` - TmpFile 分桶设计
 - `BM25S_PHASE3_KVCACHE_QUERY.md` - KVCache 查询设计

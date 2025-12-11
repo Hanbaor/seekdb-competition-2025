@@ -1,44 +1,41 @@
-# BM25S 索引查询 - Phase 3: 两级 KVCache 动态加载
+# BM25S 索引查询 - Phase 3: KVCache 动态加载
 
 ## 1. 概述
 
 ### 1.1 目标
-实现基于 KVCache 的两级缓存查询机制，支持大规模索引的动态加载和自动淘汰。
+实现基于 KVCache 的一级缓存查询机制，支持大规模索引的动态加载和自动淘汰。
 
 ### 1.2 缓存策略
 
 | 场景 | 策略 | 说明 |
 |-----|------|------|
-| **冷数据** | 全量加载 | 从文件读取整个 posting list，放入 KVCache |
+| **冷数据** | 按需加载 | 从文件读取 posting list，放入 KVCache |
 | **热数据** | 缓存命中 | 直接从 KVCache 获取 |
 | **id_limit 过滤** | 二分查找 | 在内存中二分查找，O(log n) |
 
-### 1.3 架构
+### 1.3 架构（一级 KVCache）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ 常驻内存（启动时加载）                                        │
 │   - file_header_: 元数据                                    │
-│   - bucket_directory_: 桶目录（64 KB）                       │
+│   - bucket_directory_: 桶目录（用于从文件查找 token）          │
 │   - index_fd_: 文件描述符                                    │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Level 1: VocabCache (ObKVCache)                             │
-│   Key:   (tenant_id, table_id, token_hash)                  │
-│   Value: (token_str, token_id, posting_offset, posting_cnt) │
-│   作用:  token 字符串 → token 元信息                         │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Level 2: PostingCache (ObKVCache)                           │
-│   Key:   (tenant_id, table_id, token_id)                    │
-│   Value: (doc_ids[], scores[])                              │
-│   作用:  token_id → 倒排链数据                               │
+│ PostingCache (ObKVCache)                                    │
+│   Key:   (token_str)  ← 全局单例，无需 tenant/table         │
+│   Value: (count, doc_ids[], scores[])                       │
+│   作用:  token 字符串 → 倒排链数据                           │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**简化说明**：
+- 一级缓存足够，直接 token → posting
+- Key 使用 token 字符串，避免 hash 碰撞
+- 查询逻辑与当前代码一致
 
 ### 1.4 使用的 SeekDB 接口
 - `ObKVCache<Key, Value>` - KV 缓存
@@ -47,7 +44,7 @@
 
 ---
 
-## 2. KVCache Key/Value 定义
+## 2. KVCache Key/Value 定义（一级缓存）
 
 ### 2.1 需要引入的头文件
 
@@ -56,7 +53,7 @@
 #include "share/cache/ob_kvcache_struct.h"
 ```
 
-### 2.2 VocabCache Key
+### 2.2 PostingCache Key（使用 token 字符串）
 
 ```cpp
 // ob_fts_bm25s_cache.h
@@ -74,110 +71,49 @@ namespace sql
 {
 
 // ========================================================================
-// Level 1: VocabCache - 词汇表缓存
+// 一级缓存：PostingCache - 直接 token → posting
+// 注意：当前比赛场景为全局单例，无需 tenant_id/table_id
 // ========================================================================
 
-class ObBM25SVocabKey : public common::ObIKVCacheKey
+class ObBM25SPostingKey : public common::ObIKVCacheKey
 {
 public:
-    ObBM25SVocabKey() 
-        : tenant_id_(0), table_id_(0), token_hash_(0) {}
+    ObBM25SPostingKey()
+        : token_len_(0), token_data_(nullptr) {}
     
-    ObBM25SVocabKey(uint64_t tenant_id, uint64_t table_id, uint64_t token_hash)
-        : tenant_id_(tenant_id), table_id_(table_id), token_hash_(token_hash) {}
+    ObBM25SPostingKey(const common::ObString &token)
+        : token_len_(token.length()), token_data_(const_cast<char*>(token.ptr())) {}
     
-    // 比较操作符
+    // 比较操作符（完整比较 token 字符串，避免 hash 碰撞）
     virtual bool operator==(const ObIKVCacheKey &other) const override
     {
-        const ObBM25SVocabKey &o = static_cast<const ObBM25SVocabKey&>(other);
-        return tenant_id_ == o.tenant_id_ 
-            && table_id_ == o.table_id_ 
-            && token_hash_ == o.token_hash_;
+        const ObBM25SPostingKey &o = static_cast<const ObBM25SPostingKey&>(other);
+        if (token_len_ != o.token_len_) {
+            return false;
+        }
+        return 0 == MEMCMP(token_data_, o.token_data_, token_len_);
     }
     
     // Hash 函数
     virtual uint64_t hash() const override
     {
-        uint64_t h = tenant_id_;
-        h = common::murmurhash(&table_id_, sizeof(table_id_), h);
-        h = common::murmurhash(&token_hash_, sizeof(token_hash_), h);
-        return h;
+        if (token_len_ > 0 && OB_NOT_NULL(token_data_)) {
+            return common::murmurhash(token_data_, token_len_, 0);
+        }
+        return 0;
     }
     
-    // 获取租户 ID（KVCache 用于内存管理）
-    virtual uint64_t get_tenant_id() const override 
-    { 
-        return tenant_id_; 
-    }
+    // 返回系统租户（全局单例模式）
+    virtual uint64_t get_tenant_id() const override { return OB_SYS_TENANT_ID; }
     
-    // 获取 Key 大小
     virtual int64_t size() const override 
     { 
-        return sizeof(*this); 
+        return sizeof(*this) + token_len_; 
     }
     
-    // 深拷贝（KVCache 内部调用）
-    virtual int deep_copy(char *buf, const int64_t buf_len, 
-                          ObIKVCacheKey *&key) const override
-    {
-        int ret = OB_SUCCESS;
-        if (OB_ISNULL(buf) || buf_len < static_cast<int64_t>(sizeof(*this))) {
-            ret = OB_INVALID_ARGUMENT;
-        } else {
-            ObBM25SVocabKey *new_key = new (buf) ObBM25SVocabKey();
-            new_key->tenant_id_ = tenant_id_;
-            new_key->table_id_ = table_id_;
-            new_key->token_hash_ = token_hash_;
-            key = new_key;
-        }
-        return ret;
-    }
-    
-    TO_STRING_KV(K_(tenant_id), K_(table_id), K_(token_hash));
-    
-public:
-    uint64_t tenant_id_;
-    uint64_t table_id_;
-    uint64_t token_hash_;
-};
-```
-
-### 2.3 VocabCache Value
-
-```cpp
-class ObBM25SVocabValue : public common::ObIKVCacheValue
-{
-public:
-    ObBM25SVocabValue() 
-        : token_len_(0), token_data_(nullptr), token_id_(0),
-          posting_offset_(0), posting_count_(0) {}
-    
-    // 设置数据
-    void set(const common::ObString &token, uint32_t token_id,
-             int64_t posting_offset, int32_t posting_count)
-    {
-        token_len_ = token.length();
-        token_data_ = const_cast<char*>(token.ptr());
-        token_id_ = token_id;
-        posting_offset_ = posting_offset;
-        posting_count_ = posting_count;
-    }
-    
-    // 获取 token 字符串
-    common::ObString get_token() const 
-    { 
-        return common::ObString(token_len_, token_data_); 
-    }
-    
-    // 获取 Value 大小（包括 token 字符串）
-    virtual int64_t size() const override
-    {
-        return sizeof(*this) + token_len_;
-    }
-    
-    // 深拷贝
+    // 深拷贝（包括 token 字符串）
     virtual int deep_copy(char *buf, const int64_t buf_len,
-                          ObIKVCacheValue *&value) const override
+                          ObIKVCacheKey *&key) const override
     {
         int ret = OB_SUCCESS;
         int64_t need_size = size();
@@ -185,97 +121,35 @@ public:
         if (OB_ISNULL(buf) || buf_len < need_size) {
             ret = OB_INVALID_ARGUMENT;
         } else {
-            // 在 buf 中构造对象
-            ObBM25SVocabValue *new_val = new (buf) ObBM25SVocabValue();
-            new_val->token_len_ = token_len_;
-            new_val->token_id_ = token_id_;
-            new_val->posting_offset_ = posting_offset_;
-            new_val->posting_count_ = posting_count_;
+            ObBM25SPostingKey *new_key = new (buf) ObBM25SPostingKey();
+            new_key->token_len_ = token_len_;
             
             // token 数据紧随对象之后
-            char *token_buf = buf + sizeof(ObBM25SVocabValue);
+            char *token_buf = buf + sizeof(ObBM25SPostingKey);
             if (token_len_ > 0 && OB_NOT_NULL(token_data_)) {
                 MEMCPY(token_buf, token_data_, token_len_);
             }
-            new_val->token_data_ = token_buf;
+            new_key->token_data_ = token_buf;
             
-            value = new_val;
-        }
-        return ret;
-    }
-    
-    TO_STRING_KV(K_(token_len), K_(token_id), K_(posting_offset), K_(posting_count));
-    
-public:
-    int32_t token_len_;
-    char *token_data_;      // 指向 token 字符串
-    uint32_t token_id_;
-    int64_t posting_offset_;
-    int32_t posting_count_;
-};
-```
-
-### 2.4 PostingCache Key
-
-```cpp
-// ========================================================================
-// Level 2: PostingCache - 倒排链缓存
-// ========================================================================
-
-class ObBM25SPostingKey : public common::ObIKVCacheKey
-{
-public:
-    ObBM25SPostingKey()
-        : tenant_id_(0), table_id_(0), token_id_(0) {}
-    
-    ObBM25SPostingKey(uint64_t tenant_id, uint64_t table_id, uint32_t token_id)
-        : tenant_id_(tenant_id), table_id_(table_id), token_id_(token_id) {}
-    
-    virtual bool operator==(const ObIKVCacheKey &other) const override
-    {
-        const ObBM25SPostingKey &o = static_cast<const ObBM25SPostingKey&>(other);
-        return tenant_id_ == o.tenant_id_ 
-            && table_id_ == o.table_id_ 
-            && token_id_ == o.token_id_;
-    }
-    
-    virtual uint64_t hash() const override
-    {
-        uint64_t h = tenant_id_;
-        h = common::murmurhash(&table_id_, sizeof(table_id_), h);
-        h = common::murmurhash(&token_id_, sizeof(token_id_), h);
-        return h;
-    }
-    
-    virtual uint64_t get_tenant_id() const override { return tenant_id_; }
-    virtual int64_t size() const override { return sizeof(*this); }
-    
-    virtual int deep_copy(char *buf, const int64_t buf_len,
-                          ObIKVCacheKey *&key) const override
-    {
-        int ret = OB_SUCCESS;
-        if (OB_ISNULL(buf) || buf_len < static_cast<int64_t>(sizeof(*this))) {
-            ret = OB_INVALID_ARGUMENT;
-        } else {
-            ObBM25SPostingKey *new_key = new (buf) ObBM25SPostingKey();
-            new_key->tenant_id_ = tenant_id_;
-            new_key->table_id_ = table_id_;
-            new_key->token_id_ = token_id_;
             key = new_key;
         }
         return ret;
     }
     
-    TO_STRING_KV(K_(tenant_id), K_(table_id), K_(token_id));
+    common::ObString get_token() const 
+    { 
+        return common::ObString(token_len_, token_data_); 
+    }
+    
+    TO_STRING_KV(K_(token_len));
     
 public:
-    uint64_t tenant_id_;
-    uint64_t table_id_;
-    uint32_t token_id_;
+    int32_t token_len_;
+    char *token_data_;
 };
 ```
 
-### 2.5 PostingCache Value
+### 2.3 PostingCache Value
 
 ```cpp
 class ObBM25SPostingValue : public common::ObIKVCacheValue
@@ -398,10 +272,9 @@ public:
 };
 
 // ========================================================================
-// KVCache 类型定义
+// KVCache 类型定义（一级缓存）
 // ========================================================================
 
-typedef common::ObKVCache<ObBM25SVocabKey, ObBM25SVocabValue> ObBM25SVocabCache;
 typedef common::ObKVCache<ObBM25SPostingKey, ObBM25SPostingValue> ObBM25SPostingCache;
 
 } // namespace sql
@@ -414,7 +287,7 @@ typedef common::ObKVCache<ObBM25SPostingKey, ObBM25SPostingValue> ObBM25SPosting
 
 ## 3. 缓存管理
 
-### 3.1 全局缓存实例
+### 3.1 全局缓存实例（一级）
 
 ```cpp
 // ob_fts_bm25s_index.cpp
@@ -426,8 +299,7 @@ namespace oceanbase
 namespace sql
 {
 
-// 全局缓存实例（单例）
-static ObBM25SVocabCache *g_vocab_cache = nullptr;
+// 全局缓存实例（单例，一级）
 static ObBM25SPostingCache *g_posting_cache = nullptr;
 static bool g_cache_inited = false;
 
@@ -440,45 +312,30 @@ int init_bm25s_cache()
     }
     
     // 分配缓存对象
-    void *vocab_buf = ob_malloc(sizeof(ObBM25SVocabCache), "BM25SCache");
     void *posting_buf = ob_malloc(sizeof(ObBM25SPostingCache), "BM25SCache");
     
-    if (OB_ISNULL(vocab_buf) || OB_ISNULL(posting_buf)) {
+    if (OB_ISNULL(posting_buf)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        if (vocab_buf) ob_free(vocab_buf);
-        if (posting_buf) ob_free(posting_buf);
         return ret;
     }
     
-    g_vocab_cache = new (vocab_buf) ObBM25SVocabCache();
     g_posting_cache = new (posting_buf) ObBM25SPostingCache();
     
     // 初始化缓存
     // 参数：cache_name, priority (1-10, 越高优先级越高)
-    if (OB_FAIL(g_vocab_cache->init("bm25s_vocab_cache", 1))) {
-        LOG_WARN("fail to init vocab cache", K(ret));
-        return ret;
-    }
-    
     if (OB_FAIL(g_posting_cache->init("bm25s_posting_cache", 1))) {
         LOG_WARN("fail to init posting cache", K(ret));
         return ret;
     }
     
     g_cache_inited = true;
-    LOG_INFO("BM25S cache initialized");
+    LOG_INFO("BM25S posting cache initialized");
     
     return ret;
 }
 
 void destroy_bm25s_cache()
 {
-    if (g_vocab_cache) {
-        g_vocab_cache->destroy();
-        g_vocab_cache->~ObBM25SVocabCache();
-        ob_free(g_vocab_cache);
-        g_vocab_cache = nullptr;
-    }
     if (g_posting_cache) {
         g_posting_cache->destroy();
         g_posting_cache->~ObBM25SPostingCache();
@@ -492,38 +349,21 @@ void destroy_bm25s_cache()
 } // namespace oceanbase
 ```
 
-### 3.2 缓存操作封装
+### 3.2 缓存操作封装（一级）
 
 ```cpp
 // 在 ObFtsBM25SIndex 类中添加
 
 class ObFtsBM25SIndex {
 public:
-    // 从 VocabCache 获取 token 信息
-    int get_vocab_from_cache(const common::ObString &token,
-                             uint32_t &token_id,
-                             int64_t &posting_offset,
-                             int32_t &posting_count);
-    
-    // 从 PostingCache 获取倒排链
-    int get_posting_from_cache(uint32_t token_id,
-                               int64_t posting_offset,
-                               int32_t posting_count,
+    // 从 PostingCache 获取倒排链（一级缓存，直接 token → posting）
+    int get_posting_from_cache(const common::ObString &token,
                                const ObBM25SPostingValue *&posting,
                                common::ObKVCacheHandle &handle);
     
 private:
-    // 从文件加载 Vocab 并放入缓存
-    int load_vocab_to_cache(uint64_t token_hash,
-                            const common::ObString &token,
-                            uint32_t &token_id,
-                            int64_t &posting_offset,
-                            int32_t &posting_count);
-    
     // 从文件加载 Posting 并放入缓存
-    int load_posting_to_cache(uint32_t token_id,
-                              int64_t posting_offset,
-                              int32_t posting_count,
+    int load_posting_to_cache(const common::ObString &token,
                               const ObBM25SPostingValue *&posting,
                               common::ObKVCacheHandle &handle);
 };
@@ -531,180 +371,24 @@ private:
 
 ---
 
-## 4. Level 1: VocabCache 查询实现
+## 4. PostingCache 查询实现（一级）
 
-### 4.1 获取 Token 信息
-
-```cpp
-int ObFtsBM25SIndex::get_vocab_from_cache(const common::ObString &token,
-                                           uint32_t &token_id,
-                                           int64_t &posting_offset,
-                                           int32_t &posting_count)
-{
-    int ret = OB_SUCCESS;
-    
-    if (!index_file_opened_) {
-        ret = OB_NOT_INIT;
-        LOG_WARN("index file not opened", K(ret));
-        return ret;
-    }
-    
-    uint64_t token_hash = token.hash();
-    
-    // 1. 尝试从缓存获取
-    ObBM25SVocabKey key(tenant_id_, table_id_, token_hash);
-    const ObBM25SVocabValue *value = nullptr;
-    common::ObKVCacheHandle handle;
-    
-    ret = g_vocab_cache->get(key, value, handle);
-    
-    if (OB_SUCCESS == ret) {
-        // 缓存命中，验证 token 字符串（处理 hash 冲突）
-        if (value->get_token() == token) {
-            token_id = value->token_id_;
-            posting_offset = value->posting_offset_;
-            posting_count = value->posting_count_;
-            return OB_SUCCESS;
-        }
-        // Hash 冲突，需要从文件查找
-        ret = OB_HASH_NOT_EXIST;
-    }
-    
-    if (OB_HASH_NOT_EXIST == ret || OB_ENTRY_NOT_EXIST == ret) {
-        // 2. 缓存未命中，从文件加载
-        ret = load_vocab_to_cache(token_hash, token, token_id, posting_offset, posting_count);
-    }
-    
-    return ret;
-}
-```
-
-### 4.2 从文件加载 Vocab
+### 4.1 获取 Posting
 
 ```cpp
-int ObFtsBM25SIndex::load_vocab_to_cache(uint64_t token_hash,
-                                          const common::ObString &token,
-                                          uint32_t &token_id,
-                                          int64_t &posting_offset,
-                                          int32_t &posting_count)
-{
-    int ret = OB_SUCCESS;
-    
-    // 1. 计算桶 ID
-    int32_t bucket_id = token_hash % file_header_.bucket_num;
-    BucketDirectoryEntry &bucket = bucket_directory_[bucket_id];
-    
-    if (bucket.entry_count == 0) {
-        ret = OB_ENTRY_NOT_EXIST;
-        return ret;
-    }
-    
-    // 2. 读取整个桶的数据
-    int64_t bucket_offset = file_header_.vocab_buckets_offset + bucket.offset;
-    char *bucket_buf = static_cast<char*>(allocator_.alloc(bucket.size));
-    if (OB_ISNULL(bucket_buf)) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        return ret;
-    }
-    
-    int64_t read_size = 0;
-    ret = ObIODeviceLocalFileOp::pread_impl(index_fd_.second_id_, bucket_buf,
-                                            bucket.size, bucket_offset, read_size);
-    if (OB_FAIL(ret)) {
-        LOG_WARN("fail to read vocab bucket", K(ret), K(bucket_id));
-        allocator_.free(bucket_buf);
-        return ret;
-    }
-    
-    // 3. 在桶内查找 token
-    bool found = false;
-    char *p = bucket_buf;
-    char *end = bucket_buf + bucket.size;
-    
-    while (p < end) {
-        // 读取 entry
-        uint64_t entry_hash;
-        int32_t entry_token_len;
-        
-        memcpy(&entry_hash, p, 8); p += 8;
-        memcpy(&entry_token_len, p, 4); p += 4;
-        
-        char *entry_token_data = p;
-        p += entry_token_len;
-        
-        uint32_t entry_token_id;
-        int64_t entry_posting_offset;
-        int32_t entry_posting_count;
-        int32_t reserved;
-        
-        memcpy(&entry_token_id, p, 4); p += 4;
-        memcpy(&entry_posting_offset, p, 8); p += 8;
-        memcpy(&entry_posting_count, p, 4); p += 4;
-        memcpy(&reserved, p, 4); p += 4;
-        
-        // 比较 hash 和 token 字符串
-        if (entry_hash == token_hash) {
-            common::ObString entry_token(entry_token_len, entry_token_data);
-            if (entry_token == token) {
-                // 找到了
-                token_id = entry_token_id;
-                posting_offset = entry_posting_offset;
-                posting_count = entry_posting_count;
-                found = true;
-                
-                // 放入缓存
-                ObBM25SVocabKey cache_key(tenant_id_, table_id_, token_hash);
-                ObBM25SVocabValue cache_value;
-                cache_value.set(token, token_id, posting_offset, posting_count);
-                
-                int cache_ret = g_vocab_cache->put(cache_key, cache_value);
-                if (OB_FAIL(cache_ret)) {
-                    LOG_WARN("fail to put vocab to cache", K(cache_ret), K(token));
-                    // 缓存失败不影响查询结果
-                }
-                
-                break;
-            }
-        }
-        
-        // 桶内按 hash 排序，如果当前 hash > token_hash，可以提前退出
-        if (entry_hash > token_hash) {
-            break;
-        }
-    }
-    
-    allocator_.free(bucket_buf);
-    
-    if (!found) {
-        ret = OB_ENTRY_NOT_EXIST;
-    }
-    
-    return ret;
-}
-```
-
----
-
-## 5. Level 2: PostingCache 查询实现
-
-### 5.1 获取 Posting
-
-```cpp
-int ObFtsBM25SIndex::get_posting_from_cache(uint32_t token_id,
-                                             int64_t posting_offset,
-                                             int32_t posting_count,
+int ObFtsBM25SIndex::get_posting_from_cache(const common::ObString &token,
                                              const ObBM25SPostingValue *&posting,
                                              common::ObKVCacheHandle &handle)
 {
     int ret = OB_SUCCESS;
     
-    if (posting_count == 0) {
-        ret = OB_ENTRY_NOT_EXIST;
+    if (!index_file_opened_) {
+        ret = OB_NOT_INIT;
         return ret;
     }
     
-    // 1. 尝试从缓存获取
-    ObBM25SPostingKey key(tenant_id_, table_id_, token_id);
+    // 1. 尝试从缓存获取（Key 使用 token 字符串）
+    ObBM25SPostingKey key(token);
     
     ret = g_posting_cache->get(key, posting, handle);
     
@@ -715,63 +399,100 @@ int ObFtsBM25SIndex::get_posting_from_cache(uint32_t token_id,
     
     if (OB_HASH_NOT_EXIST == ret || OB_ENTRY_NOT_EXIST == ret) {
         // 2. 缓存未命中，从文件加载
-        ret = load_posting_to_cache(token_id, posting_offset, posting_count, posting, handle);
+        ret = load_posting_to_cache(token, posting, handle);
     }
     
     return ret;
 }
 ```
 
-### 5.2 从文件加载 Posting
+### 4.2 从文件加载 Posting
 
 ```cpp
-int ObFtsBM25SIndex::load_posting_to_cache(uint32_t token_id,
-                                            int64_t posting_offset,
-                                            int32_t posting_count,
+int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
                                             const ObBM25SPostingValue *&posting,
                                             common::ObKVCacheHandle &handle)
 {
     int ret = OB_SUCCESS;
     
-    // 1. 计算数据大小和文件偏移
+    // 1. 从文件查找 token 的 posting 信息
+    int64_t posting_offset = 0;
+    int64_t posting_count = 0;
+    
+    if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count))) {
+        return ret;
+    }
+    
+    if (posting_count == 0) {
+        ret = OB_ENTRY_NOT_EXIST;
+        return ret;
+    }
+    
+    // 2. 计算数据大小和文件偏移
     int64_t doc_ids_size = posting_count * sizeof(uint32_t);
     int64_t scores_size = posting_count * sizeof(float);
     int64_t total_size = doc_ids_size + scores_size;
     int64_t file_offset = file_header_.posting_data_offset + posting_offset;
     
-    // 2. 分配临时缓冲区
+    // 3. 分配临时缓冲区
     char *buf = static_cast<char*>(allocator_.alloc(total_size));
     if (OB_ISNULL(buf)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         return ret;
     }
     
-    // 3. 从文件读取
+    // 4. 从文件读取
     int64_t read_size = 0;
     ret = ObIODeviceLocalFileOp::pread_impl(index_fd_.second_id_, buf, total_size,
                                             file_offset, read_size);
     if (OB_FAIL(ret)) {
-        LOG_WARN("fail to read posting", K(ret), K(token_id), K(file_offset));
+        LOG_WARN("fail to read posting", K(ret), K(token), K(file_offset));
         allocator_.free(buf);
         return ret;
     }
     
-    // 4. 构建临时 Value
+    // 5. 构建临时 Value
     ObBM25SPostingValue tmp_value;
     uint32_t *doc_ids = reinterpret_cast<uint32_t*>(buf);
     float *scores = reinterpret_cast<float*>(buf + doc_ids_size);
     tmp_value.set(posting_count, doc_ids, scores);
     
-    // 5. 放入缓存（put_and_fetch 会调用 deep_copy 并返回缓存中的指针）
-    ObBM25SPostingKey key(tenant_id_, table_id_, token_id);
+    // 6. 放入缓存（put_and_fetch 会调用 deep_copy 并返回缓存中的指针）
+    ObBM25SPostingKey key(token);
     
     ret = g_posting_cache->put_and_fetch(key, tmp_value, posting, handle);
     if (OB_FAIL(ret)) {
-        LOG_WARN("fail to put posting to cache", K(ret), K(token_id));
+        LOG_WARN("fail to put posting to cache", K(ret), K(token));
     }
     
-    // 6. 释放临时缓冲区（数据已被 deep_copy 到 KVCache）
+    // 7. 释放临时缓冲区（数据已被 deep_copy 到 KVCache）
     allocator_.free(buf);
+    
+    return ret;
+}
+```
+
+### 4.3 从文件查找 Token
+
+```cpp
+int ObFtsBM25SIndex::find_token_in_file(const common::ObString &token,
+                                         int64_t &posting_offset,
+                                         int64_t &posting_count)
+{
+    int ret = OB_SUCCESS;
+    uint64_t token_hash = token.hash();
+    
+    // 1. 计算桶 ID
+    int32_t bucket_id = token_hash % file_header_.bucket_num;
+    BucketDirectoryEntry &bucket = bucket_directory_[bucket_id];
+    
+    if (bucket.entry_count == 0) {
+        ret = OB_ENTRY_NOT_EXIST;
+        return ret;
+    }
+    
+    // 2. 读取桶数据并查找
+    // ... 省略具体实现，参见 Phase 2 文件格式
     
     return ret;
 }
@@ -779,9 +500,9 @@ int ObFtsBM25SIndex::load_posting_to_cache(uint32_t token_id,
 
 ---
 
-## 6. 完整查询接口
+## 5. 完整查询接口
 
-### 6.1 搜索主函数
+### 5.1 搜索主函数（一级缓存版）
 
 ```cpp
 int ObFtsBM25SIndex::search_with_cache(const common::ObIArray<common::ObString> &tokens,
@@ -816,7 +537,7 @@ int ObFtsBM25SIndex::search_with_cache(const common::ObIArray<common::ObString> 
         return ret;
     }
     
-    // 3. 遍历每个 token
+    // 3. 遍历每个 token（一级缓存：直接 token → posting）
     for (int64_t i = 0; OB_SUCC(ret) && i < tokens.count(); ++i) {
         const common::ObString &token = tokens.at(i);
         
@@ -824,36 +545,20 @@ int ObFtsBM25SIndex::search_with_cache(const common::ObIArray<common::ObString> 
             continue;
         }
         
-        // 3.1 Level 1: 获取 token 信息
-        uint32_t token_id = 0;
-        int64_t posting_offset = 0;
-        int32_t posting_count = 0;
-        
-        int vocab_ret = get_vocab_from_cache(token, token_id, posting_offset, posting_count);
-        if (OB_ENTRY_NOT_EXIST == vocab_ret) {
-            // 未知词，跳过
-            continue;
-        } else if (OB_FAIL(vocab_ret)) {
-            LOG_WARN("fail to get vocab", K(vocab_ret), K(token));
-            continue;  // 继续处理其他 token
-        }
-        
-        if (posting_count == 0) {
-            continue;
-        }
-        
-        // 3.2 Level 2: 获取 posting list
+        // 获取 posting（从缓存或文件）
         const ObBM25SPostingValue *posting = nullptr;
         common::ObKVCacheHandle handle;
         
-        int posting_ret = get_posting_from_cache(token_id, posting_offset, posting_count,
-                                                  posting, handle);
-        if (OB_FAIL(posting_ret)) {
-            LOG_WARN("fail to get posting", K(posting_ret), K(token_id));
+        int posting_ret = get_posting_from_cache(token, posting, handle);
+        if (OB_ENTRY_NOT_EXIST == posting_ret) {
+            // 未知词，跳过
+            continue;
+        } else if (OB_FAIL(posting_ret)) {
+            LOG_WARN("fail to get posting", K(posting_ret), K(token));
             continue;
         }
         
-        // 3.3 累加得分
+        // 累加得分
         int64_t valid_count = posting->get_valid_count(id_limit);
         for (int64_t j = 0; j < valid_count; ++j) {
             int64_t doc_id = posting->get_doc_id(j);
@@ -952,19 +657,14 @@ int ObFtsBM25SIndex::warmup_cache(int64_t max_entries)
 ```cpp
 void ObFtsBM25SIndex::print_cache_stats()
 {
-    if (g_vocab_cache) {
-        LOG_INFO("VocabCache stats",
-                 K(g_vocab_cache->size(tenant_id_)),
-                 K(g_vocab_cache->get_hit_cnt(tenant_id_)),
-                 K(g_vocab_cache->get_miss_cnt(tenant_id_)),
-                 K(g_vocab_cache->get_hit_rate(tenant_id_)));
-    }
     if (g_posting_cache) {
+        // 使用系统租户 ID（全局单例模式）
+        uint64_t tenant_id = OB_SYS_TENANT_ID;
         LOG_INFO("PostingCache stats",
-                 K(g_posting_cache->size(tenant_id_)),
-                 K(g_posting_cache->get_hit_cnt(tenant_id_)),
-                 K(g_posting_cache->get_miss_cnt(tenant_id_)),
-                 K(g_posting_cache->get_hit_rate(tenant_id_)));
+                 K(g_posting_cache->size(tenant_id)),
+                 K(g_posting_cache->get_hit_cnt(tenant_id)),
+                 K(g_posting_cache->get_miss_cnt(tenant_id)),
+                 K(g_posting_cache->get_hit_rate(tenant_id)));
     }
 }
 ```
@@ -989,9 +689,9 @@ void ObFtsBM25SIndex::print_cache_stats()
 - 临时缓冲区使用 `allocator_`，用完立即释放
 - 不需要手动释放 KVCache 中的对象
 
-### 8.4 Hash 冲突
-- VocabCache 的 key 使用 `token_hash`，可能有冲突
-- 获取到 value 后需要验证 `token_str` 是否匹配
+### 8.4 Key 设计
+- PostingCache 的 key 直接使用 token 字符串
+- `operator==` 完整比较字符串，无 hash 冲突问题
 - 不匹配时需要从文件重新加载
 
 ---
@@ -1008,9 +708,137 @@ void ObFtsBM25SIndex::print_cache_stats()
 
 ---
 
-## 10. 相关文件
+## 10. 扩展计划：按需加载（id_limit 精确读取）
+
+### 10.1 基础方案 vs 扩展方案
+
+| 方案 | 说明 | 内存使用 |
+|-----|------|---------|
+| **基础方案** | 缓存完整 posting，内存二分过滤 | 较大 |
+| **扩展方案** | 只加载 id_limit 范围内的数据 | 更小 |
+
+### 10.2 扩展方案设计
+
+```cpp
+class ObBM25SPostingValue : public ObIKVCacheValue {
+public:
+    int64_t loaded_limit_;   // 已加载的边界（doc_id < loaded_limit_）
+    int64_t count_;          // 已加载的数量
+    uint32_t *doc_ids_;
+    float *scores_;
+};
+```
+
+### 10.3 查询流程
+
+```cpp
+int get_posting(const ObString &token,
+                 int64_t id_limit,
+                 const ObBM25SPostingValue *&posting,
+                 ObKVCacheHandle &handle)
+{
+    ObBM25SPostingKey key(token);
+    
+    // 1. 尝试从缓存获取
+    if (OB_SUCCESS == posting_cache_->get(key, posting, handle)) {
+        if (id_limit <= 0 || id_limit <= posting->loaded_limit_) {
+            // 已加载的数据足够
+            return OB_SUCCESS;
+        }
+        // id_limit 变大了，删除旧缓存，重新加载
+        posting_cache_->erase(key);
+    }
+    
+    // 2. 从文件加载需要的范围
+    return load_posting(token, id_limit, posting, handle);
+}
+```
+
+### 10.4 从文件按需加载
+
+```cpp
+int load_posting(const ObString &token,
+                  int64_t id_limit,
+                  const ObBM25SPostingValue *&posting,
+                  ObKVCacheHandle &handle)
+{
+    // 1. 获取元信息
+    int64_t offset, total_count;
+    get_posting_info(token, offset, total_count);
+    
+    // 2. 确定加载数量
+    int64_t load_count, load_limit;
+    if (id_limit <= 0) {
+        load_count = total_count;
+        load_limit = INT64_MAX;
+    } else {
+        // 在文件中二分查找，确定需要加载多少条
+        load_count = binary_search_in_file(offset, total_count, id_limit);
+        load_limit = id_limit;
+    }
+    
+    // 3. 只读取需要的部分
+    int64_t data_size = load_count * (sizeof(uint32_t) + sizeof(float));
+    pread(fd_, buf, data_size, offset);
+    
+    // 4. 构造 Value 并放入缓存
+    ObBM25SPostingValue value;
+    value.loaded_limit_ = load_limit;
+    value.count_ = load_count;
+    // ...
+    
+    return posting_cache_->put_and_fetch(key, value, posting, handle);
+}
+```
+
+### 10.5 文件中二分查找
+
+```cpp
+int64_t binary_search_in_file(int64_t offset, int64_t count, int64_t id_limit)
+{
+    int64_t lo = 0, hi = count;
+    
+    while (lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        
+        // 只读取一个 doc_id（4 bytes）
+        uint32_t doc_id;
+        pread(fd_, &doc_id, sizeof(doc_id), offset + mid * sizeof(uint32_t));
+        
+        if (doc_id < id_limit) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    
+    return lo;  // 返回 doc_id < id_limit 的数量
+}
+```
+
+### 10.6 场景分析
+
+| 场景 | 操作 | 性能 |
+|-----|------|-----|
+| 首次查询 id_limit=1000 | 加载 1000 条 | 快（少量 IO） |
+| 再次查询 id_limit=500 | 用缓存，二分取前 500 | ⚡ 极快 |
+| 查询 id_limit=2000 | 删除旧缓存，重新加载 | 稍慢 |
+| 热数据重复查询 | 缓存命中 | ⚡ 极快 |
+
+### 10.7 实现优先级
+
+| 优先级 | 方案 | 说明 |
+|-------|------|------|
+| **基础** | 缓存完整 posting | 简单，先实现 |
+| **扩展** | 按需加载 + id_limit 精确读取 | 内存优化 |
+
+---
+
+## 11. 相关文件
 
 - `src/sql/das/ob_fts_bm25s_cache.h` - KVCache Key/Value 定义（新建）
 - `src/sql/das/ob_fts_bm25s_index.h` - 类定义修改
 - `src/sql/das/ob_fts_bm25s_index.cpp` - 实现修改
 - `src/share/cache/ob_kv_storecache.h` - KVCache 接口参考
+- `BM25S_PHASE1_TMPFILE_BUCKET.md` - TmpFile 分桶设计
+- `BM25S_PHASE2_PERSISTENCE.md` - 持久化设计

@@ -17,34 +17,26 @@ char bucket_dir_path_[256];        // 桶文件目录路径
 
 ### 1.3 约束
 - 必须使用 `ObTenantTmpFileManager` 接口
-- 桶数量根据数据量动态计算，保证单桶 < 200 MB
+- 基础方案：固定 1024 桶（配合停用词过滤）
 - 保持并发安全（多线程写入不同桶）
+- 如果单桶过大，参见 Phase 2 的"扩展计划：外部排序"
 
 ---
 
 ## 2. 数据结构
 
-### 2.1 动态桶数量计算
+### 2.1 固定桶数量（基础方案）
 
 ```cpp
-// 目标：单桶内存 < 200 MB
-static const int64_t TARGET_BUCKET_SIZE_MB = 200;
-static const int64_t RECORD_SIZE = sizeof(FileRecord);  // 20 bytes
+// 基础方案：固定 1024 桶
+// 配合停用词过滤，适用于大多数场景
+static const int64_t NUM_BUCKETS = 1024;
 
-// 根据预估数据量计算桶数量
-int64_t calc_bucket_num(int64_t estimated_postings) {
-    // 每桶最多容纳的记录数
-    int64_t max_records_per_bucket = TARGET_BUCKET_SIZE_MB * 1024 * 1024 / RECORD_SIZE;
-    // 需要的桶数量
-    int64_t num = (estimated_postings + max_records_per_bucket - 1) / max_records_per_bucket;
-    // 取 2 的幂次方，最小 128
-    return next_power_of_2(std::max(128L, num));
-}
-
-// 不同数据规模的桶数量参考：
-// - 1 亿文档（100 亿 posting）: ~1024 桶，单桶 ~100 MB
-// - 10 亿文档（1000 亿 posting）: ~8192 桶，单桶 ~120 MB
-// - 20 亿文档（2000 亿 posting）: ~16384 桶，单桶 ~120 MB
+// 估算：
+// - 停用词过滤后，高频词（如 "the"）不会被索引
+// - 普通词的 posting 数量相对均匀
+// - 1 亿文档（约 100 亿 posting）：每桶 ~1000 万条 = 200 MB
+// - 如果单桶仍然过大，参见"扩展计划：外部排序"
 ```
 
 ### 2.2 新增成员变量
@@ -57,11 +49,11 @@ private:
     // char bucket_dir_path_[256];             // 删除
     
     // ========== 新增 TmpFile ==========
-    int64_t num_buckets_;                      // 动态计算的桶数量
+    static const int64_t NUM_BUCKETS = 1024;   // 固定桶数量
     int64_t tmp_dir_id_;                       // TmpFile 目录 ID
-    int64_t *bucket_fds_;                      // TmpFile 文件描述符数组（动态分配）
-    int64_t *bucket_write_offsets_;            // 每个桶的当前写入偏移
-    ObSpinLock *bucket_locks_;                 // 桶锁数组（动态分配）
+    int64_t bucket_fds_[NUM_BUCKETS];          // TmpFile 文件描述符数组
+    int64_t bucket_write_offsets_[NUM_BUCKETS];// 每个桶的当前写入偏移
+    ObSpinLock bucket_locks_[NUM_BUCKETS];     // 桶锁数组
     bool tmp_files_inited_;                    // TmpFile 是否已初始化
 };
 ```
@@ -109,7 +101,7 @@ struct FileRecord {
 ### 4.1 初始化 TmpFile
 
 ```cpp
-int ObFtsBM25SIndex::init_tmp_files(int64_t estimated_postings)
+int ObFtsBM25SIndex::init_tmp_files()
 {
     int ret = OB_SUCCESS;
     
@@ -118,28 +110,14 @@ int ObFtsBM25SIndex::init_tmp_files(int64_t estimated_postings)
         return OB_SUCCESS;
     }
     
-    // 1. 动态计算桶数量
-    num_buckets_ = calc_bucket_num(estimated_postings);
-    
-    // 2. 动态分配数组
-    bucket_fds_ = static_cast<int64_t*>(allocator_.alloc(num_buckets_ * sizeof(int64_t)));
-    bucket_write_offsets_ = static_cast<int64_t*>(allocator_.alloc(num_buckets_ * sizeof(int64_t)));
-    bucket_locks_ = static_cast<ObSpinLock*>(allocator_.alloc(num_buckets_ * sizeof(ObSpinLock)));
-    
-    if (OB_ISNULL(bucket_fds_) || OB_ISNULL(bucket_write_offsets_) || OB_ISNULL(bucket_locks_)) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("fail to alloc bucket arrays", K(ret), K(num_buckets_));
-        return ret;
-    }
-    
-    // 初始化数组
-    for (int64_t i = 0; i < num_buckets_; ++i) {
+    // 初始化固定数组（NUM_BUCKETS = 1024）
+    for (int64_t i = 0; i < NUM_BUCKETS; ++i) {
         bucket_fds_[i] = -1;
         bucket_write_offsets_[i] = 0;
         new (&bucket_locks_[i]) ObSpinLock();
     }
     
-    // 3. 分配 TmpFile 目录
+    // 分配 TmpFile 目录
     ObTenantTmpFileManager *tmp_mgr = MTL(ObTenantTmpFileManager*);
     if (OB_ISNULL(tmp_mgr)) {
         ret = OB_ERR_UNEXPECTED;
@@ -152,8 +130,8 @@ int ObFtsBM25SIndex::init_tmp_files(int64_t estimated_postings)
         return ret;
     }
     
-    // 4. 打开 num_buckets_ 个临时文件
-    for (int64_t i = 0; OB_SUCC(ret) && i < num_buckets_; ++i) {
+    // 打开 NUM_BUCKETS 个临时文件
+    for (int64_t i = 0; OB_SUCC(ret) && i < NUM_BUCKETS; ++i) {
         if (OB_FAIL(tmp_mgr->open(bucket_fds_[i], tmp_dir_id_, "bm25s_bucket"))) {
             LOG_WARN("fail to open tmp file", K(ret), K(i));
             // 清理已打开的文件
@@ -167,8 +145,7 @@ int ObFtsBM25SIndex::init_tmp_files(int64_t estimated_postings)
     
     if (OB_SUCC(ret)) {
         tmp_files_inited_ = true;
-        LOG_INFO("BM25S tmp files initialized", K(tmp_dir_id_), K(num_buckets_),
-                 K(estimated_postings));
+        LOG_INFO("BM25S tmp files initialized", K(tmp_dir_id_), K(NUM_BUCKETS));
     }
     
     return ret;
@@ -183,9 +160,9 @@ int ObFtsBM25SIndex::write_to_bucket(int64_t bucket_id, const FileRecord &record
     int ret = OB_SUCCESS;
     
     // 参数检查
-    if (bucket_id < 0 || bucket_id >= num_buckets_) {
+    if (bucket_id < 0 || bucket_id >= NUM_BUCKETS) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid bucket id", K(ret), K(bucket_id), K(num_buckets_));
+        LOG_WARN("invalid bucket id", K(ret), K(bucket_id), K(NUM_BUCKETS));
         return ret;
     }
     
@@ -255,7 +232,7 @@ int ObFtsBM25SIndex::read_bucket(int64_t bucket_id, common::ObIArray<FileRecord>
 {
     int ret = OB_SUCCESS;
     
-    if (bucket_id < 0 || bucket_id >= num_buckets_) {
+    if (bucket_id < 0 || bucket_id >= NUM_BUCKETS) {
         ret = OB_INVALID_ARGUMENT;
         return ret;
     }
@@ -357,8 +334,8 @@ void ObFtsBM25SIndex::cleanup_tmp_files()
         return;
     }
     
-    // 删除所有桶文件
-    for (int64_t i = 0; i < num_buckets_; ++i) {
+    // 删除所有桶文件（固定 NUM_BUCKETS 个）
+    for (int64_t i = 0; i < NUM_BUCKETS; ++i) {
         if (bucket_fds_[i] >= 0) {
             int ret = tmp_mgr->remove(bucket_fds_[i]);
             if (OB_FAIL(ret)) {
@@ -369,23 +346,8 @@ void ObFtsBM25SIndex::cleanup_tmp_files()
         }
     }
     
-    // 释放动态分配的数组
-    if (OB_NOT_NULL(bucket_fds_)) {
-        allocator_.free(bucket_fds_);
-        bucket_fds_ = nullptr;
-    }
-    if (OB_NOT_NULL(bucket_write_offsets_)) {
-        allocator_.free(bucket_write_offsets_);
-        bucket_write_offsets_ = nullptr;
-    }
-    if (OB_NOT_NULL(bucket_locks_)) {
-        allocator_.free(bucket_locks_);
-        bucket_locks_ = nullptr;
-    }
-    
     tmp_files_inited_ = false;
     tmp_dir_id_ = -1;
-    num_buckets_ = 0;
     
     LOG_INFO("BM25S tmp files cleaned up");
 }
@@ -411,7 +373,7 @@ int ObFtsBM25SIndex::collect_raw_data(const ObString &token, int64_t doc_id,
     record.tf = tf;
     record.doc_len = doc_len;
     
-    int64_t bucket_id = token_id % num_buckets_;
+    int64_t bucket_id = token_id % NUM_BUCKETS;
     
     // 旧代码：
     // ObSpinLockGuard guard(bucket_locks_[bucket_id]);
@@ -482,7 +444,7 @@ int ObFtsBM25SIndex::collect_raw_data(const ObString &token, int64_t doc_id,
     record.tf = tf;
     record.doc_len = doc_len;
     
-    int64_t bucket_id = token_id % num_buckets_;
+    int64_t bucket_id = token_id % NUM_BUCKETS;
     
     // 使用桶锁保护写入（TmpFile 的 write 可能不是线程安全的）
     {
@@ -518,7 +480,7 @@ Finalize 阶段与持久化合并，详见 `BM25S_PHASE2_PERSISTENCE.md`。
 ```
 
 **关键点**：
-- 同一个 token 的所有记录都在同一个桶中（因为按 `token_id % num_buckets_` 分桶）
+- 同一个 token 的所有记录都在同一个桶中（因为按 `token_id % NUM_BUCKETS` 分桶）
 - 两次遍历都是内存中的数据，不需要重新读取文件
 - 不需要构建完整的内存 CSC 结构，直接写入持久化文件
 
@@ -543,15 +505,16 @@ Finalize 阶段与持久化合并，详见 `BM25S_PHASE2_PERSISTENCE.md`。
 - 使用 `allocator_` 分配的内存，需要在适当时候释放
 - `read_bucket()` 返回的数据存储在 `records` 数组中，由调用者管理
 
-### 7.5 桶数量与内存占用
+### 7.5 固定桶数量（1024 桶）
 
-| 数据规模 | 桶数量 | 单桶内存 |
-|---------|-------|----------|
-| 1 亿文档 | 1024 | ~100 MB |
-| 10 亿文档 | 8192 | ~120 MB |
-| 20 亿文档 | 16384 | ~120 MB |
+基础方案使用固定 1024 桶，配合停用词过滤：
 
-内存峰值 = 单桶数据 + 元数据数组（~200 MB for 10M vocab）
+| 数据规模 | 桶数量 | 单桶内存（估算） |
+|---------|-------|-----------------|
+| 1 亿文档 | 1024 | ~200 MB |
+| 10 亿文档 | 1024 | ~2 GB |
+
+**注意**：如果单桶过大，参见 Phase 2 的"扩展计划：外部排序"。
 
 ---
 
