@@ -1155,10 +1155,10 @@ ObDASTRMergeIter::ObDASTRMergeIter()
              "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
              "id_limit", g_fts_filter_ctx.id_limit_,
              "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
-             "base_id_list-1", g_fts_filter_ctx.base_id_list_[0],
-             "base_id_list-2", g_fts_filter_ctx.base_id_list_[1],
-             "base_id_list-3", g_fts_filter_ctx.base_id_list_[2],
-             "base_id_count", g_fts_filter_ctx.base_id_count_);
+             "base_id_count", g_fts_filter_ctx.base_id_count(),
+             "base_id_list-1", g_fts_filter_ctx.base_id_count() > 0 ? g_fts_filter_ctx.base_id_list_.at(0) : common::ObString(),
+             "base_id_list-2", g_fts_filter_ctx.base_id_count() > 1 ? g_fts_filter_ctx.base_id_list_.at(1) : common::ObString(),
+             "base_id_list-3", g_fts_filter_ctx.base_id_count() > 2 ? g_fts_filter_ctx.base_id_list_.at(2) : common::ObString());
 
     if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
       // 有 id 过滤，用 id_limit 作为容量（更省内存）

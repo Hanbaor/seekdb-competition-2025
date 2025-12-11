@@ -1689,10 +1689,10 @@
        LOG_WARN("fail to determine whether need check outrow lob", K(ret));
      }
    }
-  if (OB_SUCC(ret)) {
-    // here need add plan batch_size, because in vectorized execution,
-    // left batch may greater than OB_MAX_BULK_JOIN_ROWS
-    tsc_rtdef_.max_group_size_ = OB_MAX_BULK_JOIN_ROWS + MY_SPEC.plan_->get_batch_size();
+   if (OB_SUCC(ret)) {
+     // here need add plan batch_size, because in vectorized execution,
+     // left batch may greater than OB_MAX_BULK_JOIN_ROWS
+     tsc_rtdef_.max_group_size_ = OB_MAX_BULK_JOIN_ROWS + MY_SPEC.plan_->get_batch_size();
     
     // FTS Optimization: 仅在 FTS 相关查询中执行过滤提取
     // 检查是否有 attach_ctdef（FTS 查询通常有 DOC_ID_MERGE 或类似的 attach）
@@ -1700,38 +1700,38 @@
     bool is_fts_query = (attach_ctdef != nullptr);
     
     if (is_fts_query) {
-      g_fts_filter_ctx.reset();
+     g_fts_filter_ctx.reset();
       // Filter Extraction
-      const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
-      for (int64_t i = 0; i < filters.count(); ++i) {
-        ObExpr *expr = filters.at(i);
-        if (OB_ISNULL(expr)) continue;
-        
-        // id < N (LE/LT)
-        if (expr->type_ == T_OP_LE || expr->type_ == T_OP_LT) {
-          // 安全检查：参数个数为2，且参数1是常量
+     const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
+     for (int64_t i = 0; i < filters.count(); ++i) {
+       ObExpr *expr = filters.at(i);
+       if (OB_ISNULL(expr)) continue;
+       
+       // id < N (LE/LT)
+       if (expr->type_ == T_OP_LE || expr->type_ == T_OP_LT) {
+         // 安全检查：参数个数为2，且参数1是常量
           if (expr->arg_cnt_ == 2 && OB_NOT_NULL(expr->args_[1]) && expr->args_[1]->is_const_expr()) {
-             // 类型检查：左值必须是整数（排除非 id 列），右值必须是整数
-             if (ob_is_integer_type(expr->args_[0]->datum_meta_.type_) && 
-                 ob_is_integer_type(expr->args_[1]->datum_meta_.type_)) {
-                ObDatum &datum = expr->args_[1]->locate_expr_datum(eval_ctx_);
-                int64_t val = datum.get_int();
-                g_fts_filter_ctx.id_limit_ = val;
-                g_fts_filter_ctx.has_id_filter_ = true;
+            // 类型检查：左值必须是整数（排除非 id 列），右值必须是整数
+            if (ob_is_integer_type(expr->args_[0]->datum_meta_.type_) && 
+                ob_is_integer_type(expr->args_[1]->datum_meta_.type_)) {
+               ObDatum &datum = expr->args_[1]->locate_expr_datum(eval_ctx_);
+               int64_t val = datum.get_int();
+               g_fts_filter_ctx.id_limit_ = val;
+               g_fts_filter_ctx.has_id_filter_ = true;
                 LOG_INFO("FTS optimizer: id limit extracted", K(val));
-             }
-          }
-        }
-        // base_id IN (...)
-        else if (expr->type_ == T_OP_IN) {
-          // 安全检查：参数大于1，且左值必须是字符串（排除非 base_id 列）
+            }
+         }
+       }
+       // base_id IN (...)
+       else if (expr->type_ == T_OP_IN) {
+         // 安全检查：参数大于1，且左值必须是字符串（排除非 base_id 列）
           if (expr->arg_cnt_ > 1 && OB_NOT_NULL(expr->args_[0]) && ob_is_string_type(expr->args_[0]->datum_meta_.type_)) {
-            for (int64_t k = 1; k < expr->arg_cnt_; ++k) {
+           for (int64_t k = 1; k < expr->arg_cnt_; ++k) {
               if (OB_ISNULL(expr->args_[k])) continue;
-              if (expr->args_[k]->type_ == T_OP_ROW) {
-                // Handle Row wrapper if present
-                ObExpr *row = expr->args_[k];
-                for (int64_t m = 0; m < row->arg_cnt_; ++m) {
+             if (expr->args_[k]->type_ == T_OP_ROW) {
+               // Handle Row wrapper if present
+               ObExpr *row = expr->args_[k];
+               for (int64_t m = 0; m < row->arg_cnt_; ++m) {
                   if (OB_NOT_NULL(row->args_[m]) && row->args_[m]->is_const_expr() && ob_is_string_type(row->args_[m]->datum_meta_.type_)) {
                     // 字符串常量需要先 eval 计算值
                     ObDatum *datum = nullptr;
@@ -1739,20 +1739,20 @@
                       LOG_INFO("FTS optimizer: add_base_id", K(datum->get_string()));
                       g_fts_filter_ctx.add_base_id(datum->get_string());
                     }
-                  }
-                }
-              } else if (expr->args_[k]->is_const_expr() && ob_is_string_type(expr->args_[k]->datum_meta_.type_)) {
+                 }
+               }
+             } else if (expr->args_[k]->is_const_expr() && ob_is_string_type(expr->args_[k]->datum_meta_.type_)) {
                 // 字符串常量需要先 eval 计算值
                 ObDatum *datum = nullptr;
                 if (OB_SUCCESS == expr->args_[k]->eval(eval_ctx_, datum) && OB_NOT_NULL(datum)) {
                   g_fts_filter_ctx.add_base_id(datum->get_string());
                 }
-              }
-            }
-            if (g_fts_filter_ctx.has_base_id_filter_) {
-              LOG_INFO("FTS optimizer: base_id filter extracted", K(g_fts_filter_ctx.base_id_count_));
-            }
-          }
+             }
+           }
+           if (g_fts_filter_ctx.has_base_id_filter_) {
+              LOG_INFO("FTS optimizer: base_id filter extracted", "base_id_count", g_fts_filter_ctx.base_id_count());
+           }
+         }
         }
       }
       
@@ -1762,11 +1762,11 @@
                  "has_id_filter", g_fts_filter_ctx.has_id_filter_,
                  "id_limit", g_fts_filter_ctx.id_limit_,
                  "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
-                 "base_id_count", g_fts_filter_ctx.base_id_count_);
-      }
-    }
+                 "base_id_count", g_fts_filter_ctx.base_id_count());
+       }
+     }
 
-    if (MY_CTDEF.get_query_range_provider().is_fast_nlj_range()) {
+     if (MY_CTDEF.get_query_range_provider().is_fast_nlj_range()) {
        int64_t column_count = MY_CTDEF.get_query_range_provider().get_column_count();
        size_t range_size = sizeof(ObNewRange) + sizeof(ObObj) * column_count * 2;
        tsc_rtdef_.fast_final_nlj_range_ctx_.max_group_size_ = tsc_rtdef_.max_group_size_;
@@ -4130,19 +4130,16 @@
    int ret = OB_SUCCESS;
    bool has_segment_word = false;
    
-   // ========== FTS Scalar Cache: 初始化 HashMap（仅一次）==========
+   // ========== FTS Scalar Cache: 通用初始化 ==========
+   // 状态变量
    static bool fts_cache_initialized = false;
+   static bool fts_cache_columns_registered = false;  // 列是否已注册
    static int64_t fts_cache_fill_count = 0;
-   static int64_t fts_row_process_count = 0;  // 处理的行数
-   if (!fts_cache_initialized) {
-     int init_ret = g_fts_scalar_cache.init(200000);  // 使用默认容量，需要时自动扩容
-     if (OB_SUCCESS == init_ret || OB_INIT_TWICE == init_ret) {
-       fts_cache_initialized = true;
-       LOG_INFO("FTS Scalar Cache: initialized in fetch_next_fts_index_rows");
-     } else {
-       LOG_WARN("FTS Scalar Cache: Failed to initialize HashMap", K(init_ret));
-     }
-   }
+   static int64_t fts_row_process_count = 0;
+   
+   // 缓存每列在 output_exprs 中的索引（避免每行都遍历）
+   static thread_local int64_t cached_col_indices[16];  // 最多 16 列
+   static thread_local int64_t cached_col_count = 0;
    // ==========================================================
   
   // ========== BM25S 索引：标记一个并行任务开始 ==========
