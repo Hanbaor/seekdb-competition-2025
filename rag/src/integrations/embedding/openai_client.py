@@ -30,20 +30,21 @@ embedding_client = OpenAI(
 def generate_response(
     embedding_text: str,
     model: str = "text-embedding-v4",
-    dimensions: int = 2048,  # Default 2048 for highest precision
-    retry_interval: float = 2.0,  # 固定重试间隔
+    dimensions: int = 2048,  # 2048 dims for best accuracy
+    retry_interval: float = 2.0,  # wait time between retries
 ) -> List[float]:
     """
-    Generate embeddings from text using OpenAI-compatible API with infinite retry logic.
+    Convert input text into vector representation via embedding API.
+    Automatically retries on failure until success.
 
     Args:
-        embedding_text: Text to generate embeddings for
-        model: Model name to use for embedding generation
-        dimensions: Output dimension size
-        retry_interval: Fixed interval between retries in seconds
+        embedding_text: Source text to be vectorized
+        model: Embedding model identifier
+        dimensions: Vector output length
+        retry_interval: Seconds to wait before next attempt
 
     Returns:
-        The embedding vector as a list of floats
+        List of floats representing the text embedding
     """
     attempt = 0
     while True:
@@ -64,10 +65,22 @@ def generate_response(
 
             return embedding_vector
 
-        except Exception as e:
-            # Retry indefinitely on any error until successful
+        except (APIConnectionError, RateLimitError) as e:
+            # 网络错误、限流：无限重试
             logger.warning(f"Embedding error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
             time.sleep(retry_interval)
+        except APIError as e:
+            # API 错误：5xx 服务端错误重试，4xx 客户端错误直接抛出
+            if hasattr(e, 'status_code') and e.status_code >= 500:
+                logger.warning(f"Embedding server error (attempt {attempt}): {e}. Retrying in {retry_interval}s...")
+                time.sleep(retry_interval)
+            else:
+                logger.error(f"Embedding API error (non-retryable): {e}")
+                raise
+        except Exception as e:
+            # 其他未知错误：直接抛出
+            logger.error(f"Embedding unexpected error: {type(e).__name__}: {e}")
+            raise
 
 
 if __name__ == "__main__":

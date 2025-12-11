@@ -4,7 +4,7 @@ import time
 from typing import List, Optional, Union
 
 import dotenv
-from openai import OpenAI
+from openai import APIConnectionError, APIError, OpenAI, RateLimitError
 
 from .image_utils import cleanup_temp_files, process_images_to_base64
 
@@ -33,21 +33,20 @@ def generate_response(
     prompt: str,
     images: Optional[Union[str, List[str]]] = None,
     model: str = "qwen3-vl-plus",
-    # model: str = "qwen3-vl-plus",
-    retry_interval: float = 2.0,  
+    retry_interval: float = 2.0,  # pause duration between retries
 ) -> str:
     """
-    Generate a response from the VLM (Vision Language Model) using OpenAI-compatible API
-    with infinite retry logic.
+    Query vision-language model with text and optional images.
+    Automatically handles failures by retrying until success.
 
     Args:
-        prompt: Text prompt for the model
-        images: Optional image path(s) or base64 encoded image(s)
-        model: Model name to use for generation
-        retry_interval: Fixed interval between retries in seconds
+        prompt: Text instruction for the model
+        images: Image file paths or base64 strings (single or list)
+        model: VLM model identifier
+        retry_interval: Seconds to pause before retry attempt
 
     Returns:
-        The generated response content as a string
+        Model's text output as string
     """
 
     # Store original image paths for potential compression on errors
@@ -85,7 +84,7 @@ def generate_response(
             response = vlm_client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.2,
+                temperature=0.1,
             )
 
             if not response.choices or not response.choices[0].message.content:
@@ -100,8 +99,11 @@ def generate_response(
 
             return content
 
-        except Exception as e:
-            # Retry indefinitely on any error until successful
+        except (APIConnectionError, RateLimitError) as e:
+            # 网络错误、限流：无限重试
+            logger.warning(f"VLM error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
+            time.sleep(retry_interval)
+        except APIError as e:
             error_str = str(e).lower()
             
             # Handle 502 errors - try compressing images
@@ -127,8 +129,19 @@ def generate_response(
                 except Exception as compress_error:
                     logger.error(f"Failed to compress images: {compress_error}")
             
-            logger.warning(f"VLM error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
-            time.sleep(retry_interval)
+            # API 错误：5xx 服务端错误重试，4xx 客户端错误直接抛出
+            if hasattr(e, 'status_code') and e.status_code >= 500:
+                logger.warning(f"VLM server error (attempt {attempt}): {e}. Retrying in {retry_interval}s...")
+                time.sleep(retry_interval)
+            else:
+                logger.error(f"VLM API error (non-retryable): {e}")
+                cleanup_temp_files(temp_files_to_cleanup)
+                raise
+        except Exception as e:
+            # 其他未知错误：直接抛出
+            logger.error(f"VLM unexpected error: {type(e).__name__}: {e}")
+            cleanup_temp_files(temp_files_to_cleanup)
+            raise
 
 
 if __name__ == "__main__":

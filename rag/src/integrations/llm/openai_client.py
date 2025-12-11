@@ -1,9 +1,12 @@
+import logging
 import os
 import time
 from typing import Dict, List
 
 import dotenv
 from openai import APIConnectionError, APIError, OpenAI, RateLimitError
+
+logger = logging.getLogger(__name__)
 
 dotenv.load_dotenv()
 
@@ -26,19 +29,20 @@ llm = OpenAI(
 def generate_response(
     messages: List[Dict[str, str]],
     model="qwen-plus",
-    retry_interval: float = 2.0,  # 固定重试间隔
+    retry_interval: float = 2.0,  # delay between retry attempts
     timeout: float = 300.0,
     temperature: float = 0.0,
 ) -> str:
     """
-    Generate a response from the LLM with error handling and infinite retry logic.
+    Send chat messages to LLM and retrieve completion.
+    Keeps retrying on failure until a valid response is obtained.
 
     Args:
-        messages: List of message dictionaries with 'role' and 'content' keys
-        model: Model name to use for generation
-        retry_interval: Fixed interval between retries in seconds
-        timeout: Request timeout in seconds
-        temperature: Sampling temperature
+       messages: Conversation history as list of role/content dicts
+        model: LLM model identifier to invoke
+        retry_interval: Wait duration before retrying (seconds)
+        timeout: Max wait time for API response
+        temperature: Controls randomness in output (0=deterministic)
 
     Returns:
         The generated response content as a string
@@ -59,10 +63,22 @@ def generate_response(
 
             return response.choices[0].message.content
 
-        except Exception as e:
-            # Retry indefinitely on any error until successful
-            print(f"LLM error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
+        except (APIConnectionError, RateLimitError) as e:
+            # 网络错误、限流：无限重试
+            logger.warning(f"LLM error (attempt {attempt}): {type(e).__name__}: {str(e)[:100]}. Retrying in {retry_interval}s...")
             time.sleep(retry_interval)
+        except APIError as e:
+            # API 错误：5xx 服务端错误重试，4xx 客户端错误直接抛出
+            if hasattr(e, 'status_code') and e.status_code >= 500:
+                logger.warning(f"LLM server error (attempt {attempt}): {e}. Retrying in {retry_interval}s...")
+                time.sleep(retry_interval)
+            else:
+                logger.error(f"LLM API error (non-retryable): {e}")
+                raise
+        except Exception as e:
+            # 其他未知错误：直接抛出
+            logger.error(f"LLM unexpected error: {type(e).__name__}: {e}")
+            raise
 
 
 if __name__ == "__main__":

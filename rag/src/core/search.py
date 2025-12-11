@@ -27,7 +27,7 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 25  # Optimal value for LLM Rerank - 65.29 best score
+TOP_K = 30  # Increased for better recall
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
@@ -154,7 +154,10 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
 候选文档片段（共{len(top_results)}个）：
 {candidates_text}
 
-请仔细分析每个候选片段的内容，判断哪一个最能准确、完整地回答这个问题。或者和问题最相关
+选择标准（按优先级）：
+1. 【最重要】内容中包含问题提到的具体年份、数字、百分比、金额等关键信息
+2. 内容直接回答问题，而非间接相关
+3. 内容信息完整，能支撑完整答案
 
 要求：
 1. 必须从上述候选中选择一个
@@ -166,7 +169,7 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
 
     try:
         messages = [{"role": "user", "content": prompt}]
-        result_text = generate_llm_response(messages, temperature=0.0).strip()  # Use 0.0 for deterministic reranking
+        result_text = generate_llm_response(messages, model="qwen-max", temperature=0.0).strip()  # Use qwen-max for better reranking
         
         # Extract JSON
         import re
@@ -390,7 +393,7 @@ def search(question: str) -> Answer:
                     "page": page,
                     "score": score,
                     "source": source,
-                    "content_preview": content[:100] + "..." if len(content) > 100 else content,
+                    "content_preview": content[:300] + "..." if len(content) > 300 else content,
                     "content_length": len(content),
                     "used_for_context": True,
                 })
@@ -412,7 +415,7 @@ def search(question: str) -> Answer:
                     "page": page,
                     "score": score,
                     "source": source,
-                    "content_preview": content[:100] + "..." if len(content) > 100 else content,
+                    "content_preview": content[:300] + "..." if len(content) > 300 else content,
                     "content_length": len(content),
                     "used_for_context": True,
                 })
@@ -527,6 +530,9 @@ def search(question: str) -> Answer:
 
         # Save retrieval results to answer object
         answer.retrieval_results = retrieval_results
+
+        # Combine contexts
+        context_text = "\n\n".join(contexts)
 
         # Generate answer using LLM
         logger.debug(f"Generating answer using LLM model ...")
