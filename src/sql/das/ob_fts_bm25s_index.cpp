@@ -19,6 +19,7 @@
 #include "sql/das/ob_fts_bm25s_index.h"
 #include "lib/ob_define.h"
 #include "lib/utility/ob_print_utils.h"
+#include "share/rc/ob_tenant_base.h"       // MTL, MTL_ID
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -49,6 +50,10 @@ ObFtsBM25SIndex::ObFtsBM25SIndex()
   : is_inited_(false),
     is_finalized_(false),
     active_collectors_(0),
+    tmp_dir_id_(-1),
+    tmp_files_inited_(false),
+    index_fd_(-1),
+    index_persisted_(false),
     collect_token_to_id_(),
     unique_docs_(),
     total_doc_len_(0),
@@ -62,11 +67,13 @@ ObFtsBM25SIndex::ObFtsBM25SIndex()
     allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "BM25SIndex")),
     lock_()
 {
-  bucket_dir_path_[0] = '\0';
-  for (int i = 0; i < NUM_BUCKETS; i++) {
-    bucket_files_[i] = nullptr;
+  // 初始化 TmpFile 相关数组
+  for (int64_t i = 0; i < NUM_BUCKETS; i++) {
+    bucket_fds_[i] = -1;
+    bucket_write_offsets_[i] = 0;
     bucket_entry_counts_[i] = 0;
   }
+  LOG_INFO("BM25S ObFtsBM25SIndex constructor called", K(NUM_BUCKETS));
 }
 
 ObFtsBM25SIndex::~ObFtsBM25SIndex()
@@ -85,51 +92,27 @@ int ObFtsBM25SIndex::init()
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
     // 已初始化
+    LOG_DEBUG("BM25S init: already initialized");
   } else {
     SpinWLockGuard guard(lock_);
     if (!is_inited_) {
-      // 创建分桶目录
-      snprintf(bucket_dir_path_, sizeof(bucket_dir_path_), "./bm25s_buckets_%d", getpid());
-      if (mkdir(bucket_dir_path_, 0755) != 0 && errno != EEXIST) {
-        ret = OB_IO_ERROR;
-        LOG_WARN("fail to create bucket directory", K(ret), K(bucket_dir_path_));
-      }
+      LOG_INFO("BM25S init: starting initialization", K(NUM_BUCKETS));
       
-      // 创建分桶文件
-      if (OB_SUCC(ret)) {
-        for (int i = 0; OB_SUCC(ret) && i < NUM_BUCKETS; i++) {
-          char bucket_path[512];
-          snprintf(bucket_path, sizeof(bucket_path), "%s/bucket_%03d.bin", bucket_dir_path_, i);
-          bucket_files_[i] = fopen(bucket_path, "wb+");
-          if (OB_ISNULL(bucket_files_[i])) {
-            ret = OB_IO_ERROR;
-            LOG_WARN("fail to create bucket file", K(ret), K(i), K(bucket_path));
-          }
-          bucket_entry_counts_[i] = 0;
-        }
-      }
-      
-      if (OB_FAIL(ret)) {
-        // 清理已创建的文件
-        for (int i = 0; i < NUM_BUCKETS; i++) {
-          if (bucket_files_[i] != nullptr) {
-            fclose(bucket_files_[i]);
-            bucket_files_[i] = nullptr;
-          }
-        }
-      } else if (OB_FAIL(collect_token_to_id_.create(DEFAULT_BUCKET_COUNT,
+      // 创建 HashMap
+      if (OB_FAIL(collect_token_to_id_.create(DEFAULT_BUCKET_COUNT,
                                     ObMemAttr(OB_SERVER_TENANT_ID, "BM25SCollectMap")))) {
-        LOG_WARN("fail to create collect token map", K(ret));
+        LOG_WARN("BM25S init: fail to create collect token map", K(ret));
       } else if (OB_FAIL(unique_docs_.create(DEFAULT_BUCKET_COUNT,
                                               ObMemAttr(OB_SERVER_TENANT_ID, "BM25SDocSet")))) {
-        LOG_WARN("fail to create unique docs set", K(ret));
+        LOG_WARN("BM25S init: fail to create unique docs set", K(ret));
       } else if (OB_FAIL(token_to_id_.create(DEFAULT_BUCKET_COUNT,
                                               ObMemAttr(OB_SERVER_TENANT_ID, "BM25STokenMap")))) {
-        LOG_WARN("fail to create token to id map", K(ret));
+        LOG_WARN("BM25S init: fail to create token to id map", K(ret));
       } else {
         raw_entry_count_ = 0;
         is_inited_ = true;
-        LOG_INFO("ObFtsBM25SIndex initialized (bucketed)", K(bucket_dir_path_), K(NUM_BUCKETS));
+        LOG_INFO("BM25S init: initialization completed successfully", 
+                 K(NUM_BUCKETS), K_(is_inited), K_(tmp_files_inited));
       }
     }
   }
@@ -145,18 +128,351 @@ int ObFtsBM25SIndex::ensure_inited()
   return ret;
 }
 
+// ========== TmpFile 接口实现（Phase 1）==========
+
+int ObFtsBM25SIndex::init_tmp_files()
+{
+  int ret = OB_SUCCESS;
+  
+  // 检查是否已初始化
+  if (tmp_files_inited_) {
+    LOG_DEBUG("BM25S init_tmp_files: already initialized");
+    return OB_SUCCESS;
+  }
+  
+  LOG_INFO("BM25S init_tmp_files: starting TmpFile initialization", K(NUM_BUCKETS));
+  
+  // 初始化固定数组（NUM_BUCKETS = 1024）
+  for (int64_t i = 0; i < NUM_BUCKETS; ++i) {
+    bucket_fds_[i] = -1;
+    bucket_write_offsets_[i] = 0;
+    new (&bucket_locks_[i]) ObSpinLock();
+  }
+  
+  // 获取 TmpFileManager
+  tmp_file::ObTenantTmpFileManager *tmp_mgr = MTL(tmp_file::ObTenantTmpFileManager*);
+  if (OB_ISNULL(tmp_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("BM25S init_tmp_files: tmp file manager is null", K(ret));
+    return ret;
+  }
+  
+  // 分配 TmpFile 目录
+  if (OB_FAIL(tmp_mgr->alloc_dir(tmp_dir_id_))) {
+    LOG_WARN("BM25S init_tmp_files: fail to alloc tmp dir", K(ret));
+    return ret;
+  }
+  
+  LOG_INFO("BM25S init_tmp_files: allocated tmp dir", K_(tmp_dir_id));
+  
+  // 打开 NUM_BUCKETS 个临时文件
+  int64_t opened_count = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < NUM_BUCKETS; ++i) {
+    if (OB_FAIL(tmp_mgr->open(bucket_fds_[i], tmp_dir_id_, "bm25s_bucket"))) {
+      LOG_WARN("BM25S init_tmp_files: fail to open tmp file", K(ret), K(i), K_(tmp_dir_id));
+      // 清理已打开的文件
+      for (int64_t j = 0; j < i; ++j) {
+        if (bucket_fds_[j] >= 0) {
+          int tmp_ret = tmp_mgr->remove(bucket_fds_[j]);
+          if (OB_SUCCESS != tmp_ret) {
+            LOG_WARN("BM25S init_tmp_files: fail to remove tmp file during cleanup", 
+                     K(tmp_ret), K(j), K(bucket_fds_[j]));
+          }
+          bucket_fds_[j] = -1;
+        }
+      }
+      break;
+    }
+    opened_count++;
+    
+    // 每打开 128 个文件记录一次日志
+    if ((i + 1) % 128 == 0) {
+      LOG_INFO("BM25S init_tmp_files: progress", K(i), K(NUM_BUCKETS), K(opened_count));
+    }
+  }
+  
+  if (OB_SUCC(ret)) {
+    tmp_files_inited_ = true;
+    LOG_INFO("BM25S init_tmp_files: TmpFile initialization completed", 
+             K_(tmp_dir_id), K(NUM_BUCKETS), K(opened_count));
+  }
+  
+  return ret;
+}
+
+int ObFtsBM25SIndex::write_to_bucket(int64_t bucket_id, const FileRecord &record)
+{
+  int ret = OB_SUCCESS;
+  
+  // 参数检查
+  if (bucket_id < 0 || bucket_id >= NUM_BUCKETS) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("BM25S write_to_bucket: invalid bucket id", K(ret), K(bucket_id), K(NUM_BUCKETS));
+    return ret;
+  }
+  
+  if (!tmp_files_inited_ || bucket_fds_[bucket_id] < 0) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("BM25S write_to_bucket: tmp file not initialized", 
+             K(ret), K(bucket_id), K_(tmp_files_inited), K(bucket_fds_[bucket_id]));
+    return ret;
+  }
+  
+  // 构建 IO 信息
+  tmp_file::ObTmpFileIOInfo io_info;
+  io_info.fd_ = bucket_fds_[bucket_id];
+  io_info.dir_id_ = tmp_dir_id_;
+  io_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_DATA_READ);  // 使用 DATA_READ（写入也适用）
+  io_info.buf_ = reinterpret_cast<char*>(const_cast<FileRecord*>(&record));
+  io_info.size_ = sizeof(FileRecord);
+  io_info.io_timeout_ms_ = 5000;  // 5 秒超时
+  
+  // 写入（append 模式，TmpFile 自动追加）
+  tmp_file::ObTenantTmpFileManager *tmp_mgr = MTL(tmp_file::ObTenantTmpFileManager*);
+  if (OB_ISNULL(tmp_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("BM25S write_to_bucket: tmp file manager is null", K(ret));
+    return ret;
+  }
+  
+  if (OB_FAIL(tmp_mgr->write(MTL_ID(), io_info))) {
+    LOG_WARN("BM25S write_to_bucket: fail to write to tmp file", 
+             K(ret), K(bucket_id), K(sizeof(FileRecord)), K(bucket_fds_[bucket_id]));
+  } else {
+    // 更新写入偏移（用于统计）
+    ATOMIC_AAF(&bucket_write_offsets_[bucket_id], sizeof(FileRecord));
+  }
+  
+  return ret;
+}
+
+int ObFtsBM25SIndex::write_records_to_bucket(int64_t bucket_id, 
+                                              const FileRecord *records, 
+                                              int64_t count)
+{
+  int ret = OB_SUCCESS;
+  
+  if (count <= 0 || OB_ISNULL(records)) {
+    return OB_SUCCESS;
+  }
+  
+  // 参数检查
+  if (bucket_id < 0 || bucket_id >= NUM_BUCKETS) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("BM25S write_records_to_bucket: invalid bucket id", K(ret), K(bucket_id), K(NUM_BUCKETS));
+    return ret;
+  }
+  
+  if (!tmp_files_inited_ || bucket_fds_[bucket_id] < 0) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("BM25S write_records_to_bucket: tmp file not initialized", 
+             K(ret), K(bucket_id), K_(tmp_files_inited));
+    return ret;
+  }
+  
+  // 构建 IO 信息
+  tmp_file::ObTmpFileIOInfo io_info;
+  io_info.fd_ = bucket_fds_[bucket_id];
+  io_info.dir_id_ = tmp_dir_id_;
+  io_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_DATA_READ);  // 使用 DATA_READ（写入也适用）
+  io_info.buf_ = reinterpret_cast<char*>(const_cast<FileRecord*>(records));
+  io_info.size_ = count * sizeof(FileRecord);
+  io_info.io_timeout_ms_ = 5000;
+  
+  tmp_file::ObTenantTmpFileManager *tmp_mgr = MTL(tmp_file::ObTenantTmpFileManager*);
+  if (OB_ISNULL(tmp_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("BM25S write_records_to_bucket: tmp file manager is null", K(ret));
+    return ret;
+  }
+  
+  if (OB_FAIL(tmp_mgr->write(MTL_ID(), io_info))) {
+    LOG_WARN("BM25S write_records_to_bucket: fail to batch write to tmp file", 
+             K(ret), K(bucket_id), K(count), K(io_info.size_));
+  } else {
+    ATOMIC_AAF(&bucket_write_offsets_[bucket_id], count * sizeof(FileRecord));
+    LOG_DEBUG("BM25S write_records_to_bucket: batch write success", 
+              K(bucket_id), K(count), K(io_info.size_));
+  }
+  
+  return ret;
+}
+
+int ObFtsBM25SIndex::read_bucket(int64_t bucket_id, common::ObIArray<FileRecord> &records)
+{
+  int ret = OB_SUCCESS;
+  
+  if (bucket_id < 0 || bucket_id >= NUM_BUCKETS) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("BM25S read_bucket: invalid bucket id", K(ret), K(bucket_id), K(NUM_BUCKETS));
+    return ret;
+  }
+  
+  if (!tmp_files_inited_ || bucket_fds_[bucket_id] < 0) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("BM25S read_bucket: tmp file not initialized", 
+             K(ret), K(bucket_id), K_(tmp_files_inited));
+    return ret;
+  }
+  
+  tmp_file::ObTenantTmpFileManager *tmp_mgr = MTL(tmp_file::ObTenantTmpFileManager*);
+  if (OB_ISNULL(tmp_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("BM25S read_bucket: tmp file manager is null", K(ret));
+    return ret;
+  }
+  
+  // 1. 获取文件大小
+  int64_t file_size = 0;
+  if (OB_FAIL(tmp_mgr->get_tmp_file_size(bucket_fds_[bucket_id], file_size))) {
+    LOG_WARN("BM25S read_bucket: fail to get tmp file size", 
+             K(ret), K(bucket_id), K(bucket_fds_[bucket_id]));
+    return ret;
+  }
+  
+  LOG_DEBUG("BM25S read_bucket: got file size", K(bucket_id), K(file_size));
+  
+  if (file_size == 0) {
+    // 空桶，直接返回
+    LOG_DEBUG("BM25S read_bucket: empty bucket", K(bucket_id));
+    return OB_SUCCESS;
+  }
+  
+  // 2. 检查文件大小是否合法
+  if (file_size % sizeof(FileRecord) != 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("BM25S read_bucket: invalid tmp file size", 
+             K(ret), K(bucket_id), K(file_size), K(sizeof(FileRecord)));
+    return ret;
+  }
+  
+  int64_t record_count = file_size / sizeof(FileRecord);
+  LOG_INFO("BM25S read_bucket: reading bucket", 
+           K(bucket_id), K(file_size), K(record_count));
+  
+  // 3. 分配读取缓冲区
+  char *buf = static_cast<char*>(allocator_.alloc(file_size));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("BM25S read_bucket: fail to alloc buffer", K(ret), K(file_size));
+    return ret;
+  }
+  
+  // 4. 读取整个文件
+  tmp_file::ObTmpFileIOInfo io_info;
+  io_info.fd_ = bucket_fds_[bucket_id];
+  io_info.dir_id_ = tmp_dir_id_;
+  io_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_DATA_READ);
+  io_info.buf_ = buf;
+  io_info.size_ = file_size;
+  io_info.io_timeout_ms_ = 30000;  // 30 秒超时（大文件）
+  
+  tmp_file::ObTmpFileIOHandle handle;
+  if (OB_FAIL(tmp_mgr->pread(MTL_ID(), io_info, 0 /*offset*/, handle))) {
+    LOG_WARN("BM25S read_bucket: fail to read tmp file", 
+             K(ret), K(bucket_id), K(file_size), K(bucket_fds_[bucket_id]));
+    allocator_.free(buf);
+    return ret;
+  }
+  
+  // 5. 检查实际读取大小
+  if (handle.get_done_size() != file_size) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("BM25S read_bucket: read size mismatch", 
+             K(ret), K(handle.get_done_size()), K(file_size), K(bucket_id));
+    allocator_.free(buf);
+    return ret;
+  }
+  
+  LOG_DEBUG("BM25S read_bucket: read completed", 
+            K(bucket_id), K(file_size), K(handle.get_done_size()));
+  
+  // 6. 转换为记录数组
+  FileRecord *record_array = reinterpret_cast<FileRecord*>(buf);
+  if (OB_FAIL(records.reserve(records.count() + record_count))) {
+    LOG_WARN("BM25S read_bucket: fail to reserve records", K(ret), K(record_count));
+    allocator_.free(buf);
+    return ret;
+  }
+  
+  for (int64_t i = 0; OB_SUCC(ret) && i < record_count; ++i) {
+    if (OB_FAIL(records.push_back(record_array[i]))) {
+      LOG_WARN("BM25S read_bucket: fail to push record", K(ret), K(i));
+    }
+  }
+  
+  // 7. 释放缓冲区
+  allocator_.free(buf);
+  
+  LOG_INFO("BM25S read_bucket: bucket read complete", K(bucket_id), K(record_count));
+  return ret;
+}
+
+void ObFtsBM25SIndex::cleanup_tmp_files()
+{
+  int ret = OB_SUCCESS;  // LOG_WARN 需要 ret 变量
+  LOG_INFO("BM25S cleanup_tmp_files: starting cleanup", K_(tmp_files_inited), K_(tmp_dir_id));
+  
+  if (!tmp_files_inited_) {
+    LOG_DEBUG("BM25S cleanup_tmp_files: tmp files not initialized, skip");
+    return;
+  }
+  
+  tmp_file::ObTenantTmpFileManager *tmp_mgr = MTL(tmp_file::ObTenantTmpFileManager*);
+  if (OB_ISNULL(tmp_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("BM25S cleanup_tmp_files: tmp file manager is null during cleanup", K(ret));
+    return;
+  }
+  
+  // 删除所有桶文件（固定 NUM_BUCKETS 个）
+  int64_t removed_count = 0;
+  for (int64_t i = 0; i < NUM_BUCKETS; ++i) {
+    if (bucket_fds_[i] >= 0) {
+      int tmp_ret = tmp_mgr->remove(bucket_fds_[i]);
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN("BM25S cleanup_tmp_files: fail to remove tmp file", 
+                 K(tmp_ret), K(i), K(bucket_fds_[i]));
+      } else {
+        removed_count++;
+      }
+      bucket_fds_[i] = -1;
+      bucket_write_offsets_[i] = 0;
+    }
+  }
+  
+  tmp_files_inited_ = false;
+  tmp_dir_id_ = -1;
+  
+  LOG_INFO("BM25S cleanup_tmp_files: cleanup completed", K(removed_count), K(NUM_BUCKETS));
+}
+
 int ObFtsBM25SIndex::collect_raw_data(const common::ObString &token, int64_t doc_id, int32_t tf, int32_t doc_len)
 {
   int ret = OB_SUCCESS;
   
   if (OB_FAIL(ensure_inited())) {
-    // 初始化失败
+    LOG_WARN("BM25S collect_raw_data: ensure_inited failed", K(ret));
   } else if (token.empty()) {
     // 空 token，跳过
+    LOG_DEBUG("BM25S collect_raw_data: empty token, skip");
   } else if (is_finalized_) {
     // 已经 finalize，跳过（无需加锁检查，因为 finalize 后不会再变）
+    LOG_DEBUG("BM25S collect_raw_data: already finalized, skip");
   } else {
-    // ========== 第一步：获取或分配 token_id（HashMap 读写锁）==========
+    // ========== 第一步：确保 TmpFile 已初始化（双重检查锁定）==========
+    if (!tmp_files_inited_) {
+      SpinWLockGuard guard(lock_);
+      if (!tmp_files_inited_) {
+        LOG_INFO("BM25S collect_raw_data: initializing tmp files");
+        if (OB_FAIL(init_tmp_files())) {
+          LOG_WARN("BM25S collect_raw_data: fail to init tmp files", K(ret));
+          return ret;
+        }
+      }
+    }
+    
+    // ========== 第二步：获取或分配 token_id（HashMap 读写锁）==========
     uint32_t token_id = 0;
     bool need_insert = false;
     
@@ -168,6 +484,7 @@ int ObFtsBM25SIndex::collect_raw_data(const common::ObString &token, int64_t doc
         need_insert = true;
       } else if (OB_SUCCESS != tmp_ret) {
         ret = tmp_ret;
+        LOG_WARN("BM25S collect_raw_data: get token failed", K(ret), K(token));
       }
     }
     
@@ -184,23 +501,27 @@ int ObFtsBM25SIndex::collect_raw_data(const common::ObString &token, int64_t doc
         char *token_buf = static_cast<char*>(allocator_.alloc(token.length()));
         if (OB_ISNULL(token_buf)) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("BM25S collect_raw_data: fail to alloc token buffer", K(ret), K(token.length()));
         } else {
           MEMCPY(token_buf, token.ptr(), token.length());
           common::ObString stored_token(token.length(), token_buf);
           if (OB_FAIL(collect_token_to_id_.set_refactored(stored_token, token_id, 0))) {
-            // set 失败
+            LOG_WARN("BM25S collect_raw_data: fail to set token", K(ret), K(token));
+          } else {
+            LOG_DEBUG("BM25S collect_raw_data: new token registered", K(token_id), K(token));
           }
         }
       } else if (OB_SUCCESS == tmp_ret) {
         // 其他线程已经插入了，使用它的 token_id
       } else {
         ret = tmp_ret;
+        LOG_WARN("BM25S collect_raw_data: get token failed in write lock", K(ret), K(token));
       }
     }
     
-    // ========== 第二步：写入桶文件（桶锁）==========
+    // ========== 第三步：写入 TmpFile（桶锁保护）==========
     if (OB_SUCC(ret)) {
-      int bucket_id = token_id % NUM_BUCKETS;
+      int64_t bucket_id = token_id % NUM_BUCKETS;
       
       FileRecord record;
       record.token_id = token_id;
@@ -208,26 +529,29 @@ int ObFtsBM25SIndex::collect_raw_data(const common::ObString &token, int64_t doc
       record.tf = tf;
       record.doc_len = doc_len;
       
-      // 只锁对应的桶
+      // 使用桶锁保护写入（TmpFile 的 write 可能不是线程安全的）
       {
         common::ObSpinLockGuard bucket_guard(bucket_locks_[bucket_id]);
-        FILE *bucket_file = bucket_files_[bucket_id];
-        
-        if (OB_ISNULL(bucket_file)) {
-          ret = OB_NOT_INIT;
-        } else if (fwrite(&record, sizeof(FileRecord), 1, bucket_file) != 1) {
-          ret = OB_IO_ERROR;
+        if (OB_FAIL(write_to_bucket(bucket_id, record))) {
+          LOG_WARN("BM25S collect_raw_data: fail to write to bucket", 
+                   K(ret), K(bucket_id), K(token_id), K(doc_id));
+          return ret;
         }
       }
       
-      if (OB_SUCC(ret)) {
-        // 原子更新计数
-        ATOMIC_AAF(&bucket_entry_counts_[bucket_id], 1);
-        ATOMIC_AAF(&raw_entry_count_, 1);
+      // 原子更新计数
+      ATOMIC_AAF(&bucket_entry_counts_[bucket_id], 1);
+      ATOMIC_AAF(&raw_entry_count_, 1);
+      
+      // 每写入 10 万条记录打印一次日志
+      int64_t current_count = ATOMIC_LOAD(&raw_entry_count_);
+      if (current_count % 100000 == 0) {
+        LOG_INFO("BM25S collect_raw_data: progress", 
+                 K(current_count), K(collect_token_to_id_.size()));
       }
     }
     
-    // ========== 第三步：统计唯一文档（DocSet 读写锁）==========
+    // ========== 第四步：统计唯一文档（DocSet 读写锁）==========
     if (OB_SUCC(ret)) {
       bool doc_exists = false;
       
@@ -247,6 +571,7 @@ int ObFtsBM25SIndex::collect_raw_data(const common::ObString &token, int64_t doc
             ret = OB_SUCCESS;
           } else {
             ATOMIC_AAF(&total_doc_len_, doc_len);
+            LOG_DEBUG("BM25S collect_raw_data: new document registered", K(doc_id), K(doc_len));
           }
         }
       }
@@ -258,26 +583,17 @@ int ObFtsBM25SIndex::collect_raw_data(const common::ObString &token, int64_t doc
 
 void ObFtsBM25SIndex::reset()
 {
+  LOG_INFO("BM25S reset: starting reset", K_(is_inited), K_(tmp_files_inited));
+  
   SpinWLockGuard guard(lock_);
   
   if (is_inited_) {
-    // 关闭并删除分桶文件
-    for (int i = 0; i < NUM_BUCKETS; i++) {
-      if (OB_NOT_NULL(bucket_files_[i])) {
-        fclose(bucket_files_[i]);
-        bucket_files_[i] = nullptr;
-      }
+    // 清理 TmpFile
+    cleanup_tmp_files();
+    
+    // 重置桶计数
+    for (int64_t i = 0; i < NUM_BUCKETS; i++) {
       bucket_entry_counts_[i] = 0;
-    }
-    // 删除桶文件和目录
-    if (bucket_dir_path_[0] != '\0') {
-      char bucket_path[512];
-      for (int i = 0; i < NUM_BUCKETS; i++) {
-        snprintf(bucket_path, sizeof(bucket_path), "%s/bucket_%03d.bin", bucket_dir_path_, i);
-        unlink(bucket_path);
-      }
-      rmdir(bucket_dir_path_);
-      bucket_dir_path_[0] = '\0';
     }
     
     collect_token_to_id_.reuse();
@@ -296,31 +612,19 @@ void ObFtsBM25SIndex::reset()
     is_finalized_ = false;
     
     allocator_.reset();
-    LOG_INFO("ObFtsBM25SIndex reset");
+    LOG_INFO("BM25S reset: reset completed");
   }
 }
 
 void ObFtsBM25SIndex::destroy()
 {
+  LOG_INFO("BM25S destroy: starting destroy", K_(is_inited), K_(tmp_files_inited));
+  
   SpinWLockGuard guard(lock_);
   
   if (is_inited_) {
-    // 关闭并删除分桶文件
-    for (int i = 0; i < NUM_BUCKETS; i++) {
-      if (OB_NOT_NULL(bucket_files_[i])) {
-        fclose(bucket_files_[i]);
-        bucket_files_[i] = nullptr;
-      }
-    }
-    if (bucket_dir_path_[0] != '\0') {
-      char bucket_path[512];
-      for (int i = 0; i < NUM_BUCKETS; i++) {
-        snprintf(bucket_path, sizeof(bucket_path), "%s/bucket_%03d.bin", bucket_dir_path_, i);
-        unlink(bucket_path);
-      }
-      rmdir(bucket_dir_path_);
-      bucket_dir_path_[0] = '\0';
-    }
+    // 清理 TmpFile
+    cleanup_tmp_files();
     
     collect_token_to_id_.destroy();
     unique_docs_.destroy();
@@ -333,7 +637,7 @@ void ObFtsBM25SIndex::destroy()
     allocator_.reset();
     is_inited_ = false;
     is_finalized_ = false;
-    LOG_INFO("ObFtsBM25SIndex destroyed");
+    LOG_INFO("BM25S destroy: destroy completed");
   }
 }
 
@@ -372,11 +676,18 @@ int ObFtsBM25SIndex::finalize()
   int ret = OB_SUCCESS;
   int64_t start_time = ObTimeUtility::current_time();
   
+  LOG_INFO("BM25S finalize: starting finalize", K_(is_inited), K_(is_finalized), K_(tmp_files_inited));
+  
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
-    LOG_WARN("not initialized", K(ret));
+    LOG_WARN("BM25S finalize: not initialized", K(ret));
   } else if (is_finalized_) {
-    LOG_INFO("ObFtsBM25SIndex already finalized");
+    LOG_INFO("BM25S finalize: already finalized");
+  } else if (!tmp_files_inited_) {
+    // 没有收集任何数据
+    LOG_INFO("BM25S finalize: no data collected (tmp files not initialized)");
+    SpinWLockGuard guard(lock_);
+    is_finalized_ = true;
   } else {
     SpinWLockGuard guard(lock_);
     
@@ -390,21 +701,13 @@ int ObFtsBM25SIndex::finalize()
       avg_doc_len_ = (total_docs_ > 0) ? (double)total_doc_len_ / total_docs_ : 1.0;
       int64_t vocab_size = collect_token_to_id_.size();
       
-      LOG_INFO("BM25S finalize starting (bucketed)",
+      LOG_INFO("BM25S finalize: starting (TmpFile mode)",
                K_(total_docs), K_(avg_doc_len), K(vocab_size), K_(raw_entry_count), K(NUM_BUCKETS));
-      // 关闭所有桶文件准备读取
-      for (int i = 0; i < NUM_BUCKETS; i++) {
-        if (bucket_files_[i] != nullptr) {
-          fflush(bucket_files_[i]);
-          fclose(bucket_files_[i]);
-          bucket_files_[i] = nullptr;
-        }
-      }
       
-      // 第一遍：统计每个 token 的 df
+      // 第一遍：统计每个 token 的 df（使用 read_bucket）
       common::ObSEArray<int64_t, 1024> token_df;
       if (OB_FAIL(token_df.prepare_allocate(vocab_size))) {
-        LOG_WARN("fail to allocate token_df", K(ret), K(vocab_size));
+        LOG_WARN("BM25S finalize: fail to allocate token_df", K(ret), K(vocab_size));
       }
       for (int64_t i = 0; OB_SUCC(ret) && i < vocab_size; i++) {
         token_df.at(i) = 0;
@@ -412,45 +715,69 @@ int ObFtsBM25SIndex::finalize()
       
       int64_t total_df_count = 0;
       if (OB_SUCC(ret)) {
-        for (int bucket_id = 0; OB_SUCC(ret) && bucket_id < NUM_BUCKETS; bucket_id++) {
-          char bucket_path[512];
-          snprintf(bucket_path, sizeof(bucket_path), "%s/bucket_%03d.bin", bucket_dir_path_, bucket_id);
-          FILE *f = fopen(bucket_path, "rb");
-          if (f == nullptr) {
-            continue;  // 空桶
+        LOG_INFO("BM25S finalize: phase 1 - counting df for each token");
+        
+        for (int64_t bucket_id = 0; OB_SUCC(ret) && bucket_id < NUM_BUCKETS; bucket_id++) {
+          // 使用 read_bucket 读取
+          common::ObSEArray<FileRecord, 1024> bucket_records;
+          if (OB_FAIL(read_bucket(bucket_id, bucket_records))) {
+            LOG_WARN("BM25S finalize: fail to read bucket for df counting", K(ret), K(bucket_id));
+            break;
           }
-          FileRecord record;
-          while (fread(&record, sizeof(FileRecord), 1, f) == 1) {
+          
+          // 统计 df
+          for (int64_t i = 0; i < bucket_records.count(); i++) {
+            const FileRecord &record = bucket_records.at(i);
             if (record.token_id < vocab_size) {
               token_df.at(record.token_id)++;
               total_df_count++;
             }
           }
-          fclose(f);
+          
+          // 记录最大桶大小
+          int64_t bucket_size = bucket_records.count() * sizeof(FileRecord);
+          if (bucket_size > max_bucket_size) {
+            max_bucket_size = bucket_size;
+          }
+          
+          // 每处理 128 个桶打印一次进度
+          if ((bucket_id + 1) % 128 == 0) {
+            LOG_INFO("BM25S finalize: df counting progress", 
+                     K(bucket_id), K(NUM_BUCKETS), K(total_df_count));
+          }
         }
-        LOG_INFO("BM25S df statistics", K(total_df_count), K_(raw_entry_count), K(vocab_size));
+        LOG_INFO("BM25S finalize: phase 1 completed - df statistics", 
+                 K(total_df_count), K_(raw_entry_count), K(vocab_size));
       }
       
       // 计算 token_ptr_（前缀和）
       if (OB_SUCC(ret)) {
+        LOG_INFO("BM25S finalize: phase 2 - computing token_ptr (prefix sum)");
+        
         if (OB_FAIL(token_ptr_.reserve(vocab_size + 1))) {
-          LOG_WARN("fail to reserve token_ptr", K(ret));
+          LOG_WARN("BM25S finalize: fail to reserve token_ptr", K(ret));
         } else {
           token_ptr_.push_back(0);
           for (int64_t i = 0; OB_SUCC(ret) && i < vocab_size; i++) {
             if (OB_FAIL(token_ptr_.push_back(token_ptr_.at(i) + token_df.at(i)))) {
-              LOG_WARN("fail to push token_ptr", K(ret));
+              LOG_WARN("BM25S finalize: fail to push token_ptr", K(ret));
             }
           }
+          LOG_INFO("BM25S finalize: phase 2 completed - token_ptr computed", 
+                   K(vocab_size), "token_ptr_size", token_ptr_.count());
         }
       }
       
       // 预分配 CSC 数组
       if (OB_SUCC(ret)) {
+        LOG_INFO("BM25S finalize: phase 3 - allocating CSC arrays", K_(raw_entry_count));
+        
         if (OB_FAIL(scores_.prepare_allocate(raw_entry_count_))) {
-          LOG_WARN("fail to allocate scores", K(ret), K_(raw_entry_count));
+          LOG_WARN("BM25S finalize: fail to allocate scores", K(ret), K_(raw_entry_count));
         } else if (OB_FAIL(doc_ids_.prepare_allocate(raw_entry_count_))) {
-          LOG_WARN("fail to allocate doc_ids", K(ret), K_(raw_entry_count));
+          LOG_WARN("BM25S finalize: fail to allocate doc_ids", K(ret), K_(raw_entry_count));
+        } else {
+          LOG_INFO("BM25S finalize: phase 3 completed - CSC arrays allocated");
         }
       }
       
@@ -458,7 +785,7 @@ int ObFtsBM25SIndex::finalize()
       common::ObSEArray<int64_t, 1024> token_fill_pos;
       if (OB_SUCC(ret)) {
         if (OB_FAIL(token_fill_pos.prepare_allocate(vocab_size))) {
-          LOG_WARN("fail to allocate token_fill_pos", K(ret));
+          LOG_WARN("BM25S finalize: fail to allocate token_fill_pos", K(ret));
         }
         for (int64_t i = 0; OB_SUCC(ret) && i < vocab_size; i++) {
           token_fill_pos.at(i) = token_ptr_.at(i);
@@ -467,12 +794,15 @@ int ObFtsBM25SIndex::finalize()
       
       // 复制 collect_token_to_id_ 到 token_to_id_
       if (OB_SUCC(ret)) {
+        LOG_INFO("BM25S finalize: phase 4 - copying token_to_id map", K(vocab_size));
+        
         for (TokenIdMap::const_iterator it = collect_token_to_id_.begin();
              OB_SUCC(ret) && it != collect_token_to_id_.end(); ++it) {
           if (OB_FAIL(token_to_id_.set_refactored(it->first, it->second, 0))) {
-            LOG_WARN("fail to copy token_to_id", K(ret));
+            LOG_WARN("BM25S finalize: fail to copy token_to_id", K(ret));
           }
         }
+        LOG_INFO("BM25S finalize: phase 4 completed - token_to_id copied");
       }
       
       // 记录排序前内存
@@ -488,66 +818,50 @@ int ObFtsBM25SIndex::finalize()
         }
         fclose(status_file);
       }
+      LOG_INFO("BM25S finalize: memory before bucket processing", K(mem_before_sort));
       
-      // 第二遍：逐桶处理，排序并填充 CSC 数组
+      // 第二遍：逐桶处理，排序并填充 CSC 数组（使用 read_bucket）
       if (OB_SUCC(ret)) {
-        for (int bucket_id = 0; OB_SUCC(ret) && bucket_id < NUM_BUCKETS; bucket_id++) {
-          char bucket_path[512];
-          snprintf(bucket_path, sizeof(bucket_path), "%s/bucket_%03d.bin", bucket_dir_path_, bucket_id);
-          
-          // 获取文件大小来确定记录数
-          struct stat st;
-          if (stat(bucket_path, &st) != 0 || st.st_size == 0) {
-            continue;  // 文件不存在或为空
+        LOG_INFO("BM25S finalize: phase 5 - processing buckets (sort and fill CSC)");
+        
+        int64_t processed_records = 0;
+        for (int64_t bucket_id = 0; OB_SUCC(ret) && bucket_id < NUM_BUCKETS; bucket_id++) {
+          // 使用 read_bucket 读取
+          common::ObSEArray<FileRecord, 1024> bucket_records;
+          if (OB_FAIL(read_bucket(bucket_id, bucket_records))) {
+            LOG_WARN("BM25S finalize: fail to read bucket for processing", K(ret), K(bucket_id));
+            break;
           }
           
-          int64_t bucket_count = st.st_size / sizeof(FileRecord);
-          int64_t bucket_size = st.st_size;
-          
-          // 跟踪最大桶大小
-          if (bucket_size > max_bucket_size) {
-            max_bucket_size = bucket_size;
+          int64_t bucket_count = bucket_records.count();
+          if (bucket_count == 0) {
+            continue;  // 空桶，跳过
           }
           
-          // 读取桶文件到内存
-          FileRecord *records = static_cast<FileRecord*>(malloc(bucket_size));
-          if (OB_ISNULL(records)) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-            LOG_WARN("fail to allocate bucket buffer", K(ret), K(bucket_id), K(bucket_size));
-          } else {
-            FILE *f = fopen(bucket_path, "rb");
-            if (f == nullptr) {
-              ret = OB_IO_ERROR;
-              LOG_WARN("fail to open bucket file", K(ret), K(bucket_path));
-            } else {
-              size_t read_count = fread(records, sizeof(FileRecord), bucket_count, f);
-              fclose(f);
-              
-              if (read_count != (size_t)bucket_count) {
-                ret = OB_IO_ERROR;
-                LOG_WARN("fail to read bucket file", K(ret), K(read_count), K(bucket_count));
-              } else {
-                // 桶内排序
-                std::sort(records, records + bucket_count);
-                
-                // 填充到 CSC 数组
-                for (int64_t i = 0; OB_SUCC(ret) && i < bucket_count; i++) {
-                  const FileRecord &r = records[i];
-                  int64_t pos = token_fill_pos.at(r.token_id)++;
-                  
-                  double score = calc_bm25_score(r.tf, r.doc_len, token_df.at(r.token_id));
-                  scores_.at(pos) = static_cast<float>(score);
-                  doc_ids_.at(pos) = static_cast<uint32_t>(r.doc_id);
-                }
-              }
-            }
-            free(records);
+          // 桶内排序（使用指针直接排序）
+          FileRecord *records_ptr = &bucket_records.at(0);
+          std::sort(records_ptr, records_ptr + bucket_count);
+          
+          // 填充到 CSC 数组
+          for (int64_t i = 0; OB_SUCC(ret) && i < bucket_count; i++) {
+            const FileRecord &r = bucket_records.at(i);
+            int64_t pos = token_fill_pos.at(r.token_id)++;
+            
+            double score = calc_bm25_score(r.tf, r.doc_len, token_df.at(r.token_id));
+            scores_.at(pos) = static_cast<float>(score);
+            doc_ids_.at(pos) = static_cast<uint32_t>(r.doc_id);
           }
           
-          if ((bucket_id + 1) % 32 == 0) {
-            LOG_INFO("BM25S bucket progress", K(bucket_id), K(NUM_BUCKETS));
+          processed_records += bucket_count;
+          
+          // 每处理 64 个桶打印一次进度
+          if ((bucket_id + 1) % 64 == 0) {
+            LOG_INFO("BM25S finalize: bucket processing progress", 
+                     K(bucket_id), K(NUM_BUCKETS), K(processed_records));
           }
         }
+        LOG_INFO("BM25S finalize: phase 5 completed - all buckets processed", 
+                 K(processed_records), K_(raw_entry_count));
       }
       
       // 记录排序后内存
@@ -563,17 +877,12 @@ int ObFtsBM25SIndex::finalize()
         fclose(status_file);
       }
       sort_mem_increase = mem_after_sort - mem_before_sort;
-      LOG_INFO("BM25S bucketed processing done", K(mem_before_sort), K(mem_after_sort), K(sort_mem_increase), K(max_bucket_size));
+      LOG_INFO("BM25S finalize: memory after bucket processing", 
+               K(mem_before_sort), K(mem_after_sort), K(sort_mem_increase), K(max_bucket_size));
       
-      // 删除桶文件
-      if (bucket_dir_path_[0] != '\0') {
-        char bucket_path[512];
-        for (int i = 0; i < NUM_BUCKETS; i++) {
-          snprintf(bucket_path, sizeof(bucket_path), "%s/bucket_%03d.bin", bucket_dir_path_, i);
-          unlink(bucket_path);
-        }
-        rmdir(bucket_dir_path_);
-      }
+      // 清理 TmpFile（删除所有桶文件）
+      LOG_INFO("BM25S finalize: phase 6 - cleaning up TmpFile");
+      cleanup_tmp_files();
       
       // 清理收集阶段的数据（但保留 allocator_，因为 token_to_id_ 中的 token 字符串需要它）
       collect_token_to_id_.reuse();
@@ -587,12 +896,13 @@ int ObFtsBM25SIndex::finalize()
         int64_t end_time = ObTimeUtility::current_time();
         double elapsed_ms = (end_time - start_time) / 1000.0;
         
-        LOG_INFO("ObFtsBM25SIndex finalized (bucketed)",
+        LOG_INFO("BM25S finalize: completed successfully (TmpFile mode)",
                  K_(total_docs), K_(avg_doc_len),
                  "vocab_size", token_to_id_.size(),
                  "total_entries", scores_.count(),
                  "elapsed_ms", elapsed_ms,
-                 K(max_bucket_size));
+                 K(max_bucket_size),
+                 K(sort_mem_increase));
       }
     }
   }

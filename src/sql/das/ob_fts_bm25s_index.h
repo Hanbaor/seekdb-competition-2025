@@ -27,6 +27,9 @@
 #include "lib/container/ob_se_array.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_print_utils.h"
+#include "storage/tmp_file/ob_tmp_file_manager.h"
+#include "storage/tmp_file/ob_tmp_file_io_info.h"
+#include "storage/tmp_file/ob_tmp_file_io_handle.h"
 #include <fstream>
 #include <cstdio>
 
@@ -92,13 +95,15 @@ public:
       return token_id < other.token_id || 
              (token_id == other.token_id && doc_id < other.doc_id);
     }
+    
+    TO_STRING_KV(K(token_id), K(doc_id), K(tf), K(doc_len));
   } __attribute__((packed));  // 20 字节
   typedef common::hash::ObHashMap<common::ObString, uint32_t,
                                    common::hash::NoPthreadDefendMode> TokenIdMap;
   typedef common::hash::ObHashSet<int64_t, common::hash::NoPthreadDefendMode> DocIdSet;
 
   static const int64_t DEFAULT_BUCKET_COUNT = 100000;
-  static const int64_t NUM_BUCKETS = 128;  // 分桶数量，用于减少排序内存峰值
+  static const int64_t NUM_BUCKETS = 1024;  // 分桶数量（使用 TmpFile），用于减少排序内存峰值
   
   // BM25 参数（与 ObExprBM25 保持一致）
   static constexpr double K1 = 1.2;
@@ -191,7 +196,13 @@ public:
   // ========== 状态查询 ==========
   bool is_inited() const { return is_inited_; }
   bool is_finalized() const { return is_finalized_; }
-  bool is_ready() const { return is_inited_ && is_finalized_; }
+  bool is_ready() const { return is_finalized_; }  // 只需 finalized，不需要 inited
+  
+  /**
+   * @brief 确保索引就绪（如果未就绪，尝试从 TmpFile 加载）
+   * 在搜索时调用
+   */
+  int ensure_ready();
   int64_t get_total_docs() const { return total_docs_; }
   int64_t get_vocab_size() const { return token_to_id_.size(); }
   int64_t get_total_entries() const { return scores_.count(); }
@@ -218,15 +229,76 @@ private:
 
   int ensure_inited();
   double calc_bm25_score(int32_t tf, int32_t doc_len, int64_t df);
+  
+  // ========== TmpFile 接口（Phase 1）==========
+  /**
+   * @brief 初始化 TmpFile 目录和文件
+   */
+  int init_tmp_files();
+  
+  /**
+   * @brief 写入一条记录到指定桶
+   * @param bucket_id 桶 ID [0, NUM_BUCKETS)
+   * @param record 要写入的记录
+   */
+  int write_to_bucket(int64_t bucket_id, const FileRecord &record);
+  
+  /**
+   * @brief 批量写入多条记录到指定桶（减少系统调用）
+   * @param bucket_id 桶 ID [0, NUM_BUCKETS)
+   * @param records 记录数组
+   * @param count 记录数量
+   */
+  int write_records_to_bucket(int64_t bucket_id, const FileRecord *records, int64_t count);
+  
+  /**
+   * @brief 读取整个桶的所有记录
+   * @param bucket_id 桶 ID [0, NUM_BUCKETS)
+   * @param records 输出：读取的记录数组
+   */
+  int read_bucket(int64_t bucket_id, common::ObIArray<FileRecord> &records);
+  
+  /**
+   * @brief 清理所有 TmpFile
+   */
+  void cleanup_tmp_files();
+  
+  /**
+   * @brief 将最终索引持久化到 TmpFile（进程间共享）
+   * 在 finalize() 完成后调用
+   */
+  int save_index_to_tmpfile();
+  
+  /**
+   * @brief 从 TmpFile 加载索引（在其他进程中恢复索引）
+   * 在搜索时如果索引未就绪，尝试调用此函数
+   */
+  int load_index_from_tmpfile();
+  
+  /**
+   * @brief 尝试加载持久化的索引（供搜索进程调用）
+   * 如果索引未 finalize 但有持久化数据，则加载
+   */
+  int try_load_persisted_index();
 
 private:
   bool is_inited_;
   bool is_finalized_;
   volatile int64_t active_collectors_;  // 活跃的收集任务数（原子计数器）
   
+  // ========== TmpFile 分桶存储（Phase 1）==========
+  int64_t tmp_dir_id_;                            // TmpFile 目录 ID
+  int64_t bucket_fds_[NUM_BUCKETS];               // TmpFile 文件描述符数组
+  volatile int64_t bucket_write_offsets_[NUM_BUCKETS]; // 每个桶的当前写入偏移（用于统计）
+  bool tmp_files_inited_;                         // TmpFile 是否已初始化
+  
+  // ========== 索引持久化 TmpFile（跨进程共享）==========
+  int64_t index_fd_;                              // 持久化索引文件描述符
+  bool index_persisted_;                          // 索引是否已持久化
+  static const int64_t INDEX_MAGIC = 0x424D3235;  // "BM25" magic number
+  static const int64_t INDEX_VERSION = 1;
+  
   // ========== 收集阶段数据（分桶文件流式）==========
-  FILE *bucket_files_[NUM_BUCKETS];       // 分桶临时文件
-  char bucket_dir_path_[256];             // 桶文件目录路径
   volatile int64_t bucket_entry_counts_[NUM_BUCKETS]; // 每个桶的条目计数（原子）
   TokenIdMap collect_token_to_id_;        // 收集阶段的 token -> token_id
   DocIdSet unique_docs_;                  // 唯一文档 ID 集合
@@ -236,7 +308,7 @@ private:
   // ========== 细粒度锁 ==========
   mutable common::SpinRWLock token_map_lock_;    // HashMap 读写锁
   mutable common::SpinRWLock doc_set_lock_;      // DocSet 读写锁
-  mutable common::ObSpinLock bucket_locks_[NUM_BUCKETS];  // 每个桶一把锁
+  mutable common::ObSpinLock bucket_locks_[NUM_BUCKETS];  // 每个桶一把锁（TmpFile 写入保护）
   
   // ========== 最终 CSC 索引 ==========
   common::ObArray<float> scores_;        // 预计算得分

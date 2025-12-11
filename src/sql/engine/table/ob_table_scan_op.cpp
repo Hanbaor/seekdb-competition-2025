@@ -4130,16 +4130,20 @@
    int ret = OB_SUCCESS;
    bool has_segment_word = false;
    
-   // ========== FTS Scalar Cache: 通用初始化 ==========
+   // ========== FTS Scalar Cache: 初始化 HashMap（仅一次）==========
    // 状态变量
    static bool fts_cache_initialized = false;
-   static bool fts_cache_columns_registered = false;  // 列是否已注册
    static int64_t fts_cache_fill_count = 0;
-   static int64_t fts_row_process_count = 0;
-   
-   // 缓存每列在 output_exprs 中的索引（避免每行都遍历）
-   static thread_local int64_t cached_col_indices[16];  // 最多 16 列
-   static thread_local int64_t cached_col_count = 0;
+   static int64_t fts_row_process_count = 0;  // 处理的行数
+   if (!fts_cache_initialized) {
+     int init_ret = g_fts_scalar_cache.init(200000);  // 使用默认容量，需要时自动扩容
+     if (OB_SUCCESS == init_ret || OB_INIT_TWICE == init_ret) {
+       fts_cache_initialized = true;
+       LOG_INFO("FTS Scalar Cache: initialized in fetch_next_fts_index_rows");
+     } else {
+       LOG_WARN("FTS Scalar Cache: Failed to initialize HashMap", K(init_ret));
+     }
+   }
    // ==========================================================
   
   // ========== BM25S 索引：标记一个并行任务开始 ==========

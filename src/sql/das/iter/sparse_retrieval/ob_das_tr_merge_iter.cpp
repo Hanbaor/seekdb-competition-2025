@@ -1188,22 +1188,40 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     // 使用全局过滤上下文中的 id_limit
     int64_t id_limit = g_fts_filter_ctx.has_id_filter_ ? g_fts_filter_ctx.id_limit_ : INT64_MAX;
     
+    // ========== 诊断日志：检查索引状态 ==========
+    LOG_INFO("BM25S search: checking index state",
+             "is_finalized", g_bm25s_index.is_finalized(),
+             "vocab_size", g_bm25s_index.get_vocab_size(),
+             "total_entries", g_bm25s_index.get_total_entries(),
+             "total_docs", g_bm25s_index.get_total_docs(),
+             "query_tokens_count", query_tokens_.count(),
+             K(id_limit),
+             "scalar_cache_size", g_fts_scalar_cache.size(),
+             "scalar_cache_capacity", g_fts_scalar_cache.capacity());
+    
     // 1. 遍历每个查询 token，从索引获取倒排链并累加分数
+    int64_t tokens_found = 0, tokens_not_found = 0;
+    int64_t total_postings = 0, filtered_by_base_id = 0;
     for (int64_t t = 0; t < query_tokens_.count(); t++) {
       const ObString &token = query_tokens_.at(t);
       uint64_t start = 0, end = 0;
       
       if (!g_bm25s_index.get_posting_list(token, id_limit, start, end)) {
+        tokens_not_found++;
         continue;
       }
+      tokens_found++;
+      total_postings += (end - start);
       
       for (uint64_t i = start; i < end; i++) {
         uint32_t doc_id = g_bm25s_index.get_doc_id(i);
         
         // 高效检查 base_id：直接数组访问，O(1) 无 hash 开销
-        if (g_fts_filter_ctx.has_base_id_filter_) {
+        // 注意：如果 scalar_cache 为空，跳过 base_id 过滤（允许所有文档通过）
+        if (g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
           const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
           if (!g_fts_filter_ctx.check_base_id(base_id)) {
+            filtered_by_base_id++;
             continue; // base_id 不匹配，跳过
           }
         }
@@ -1216,6 +1234,12 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         scores_array[doc_id] += score;
       }
     }
+    
+    // ========== 诊断日志：token 查找结果 ==========
+    LOG_INFO("BM25S search: token lookup summary",
+             K(tokens_found), K(tokens_not_found),
+             K(total_postings), K(filtered_by_base_id),
+             "touched_docs_count", touched_docs.count());
     
     // 2. 收集并排序结果
     ObSEArray<ObFtsBM25SIndex::DocScore, 256> results;
