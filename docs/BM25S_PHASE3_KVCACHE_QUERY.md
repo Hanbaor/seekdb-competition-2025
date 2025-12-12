@@ -482,18 +482,62 @@ int ObFtsBM25SIndex::find_token_in_file(const common::ObString &token,
     int ret = OB_SUCCESS;
     uint64_t token_hash = token.hash();
     
-    // 1. 计算桶 ID
+    // 1. 计算桶 ID（与 Phase 2 写入时一致）
     int32_t bucket_id = token_hash % file_header_.bucket_num;
     BucketDirectoryEntry &bucket = bucket_directory_[bucket_id];
     
     if (bucket.entry_count == 0) {
-        ret = OB_ENTRY_NOT_EXIST;
+        return OB_ENTRY_NOT_EXIST;
+    }
+    
+    // 2. 读取整个桶数据
+    int64_t bucket_file_offset = file_header_.vocab_buckets_offset + bucket.offset;
+    char *bucket_data = static_cast<char*>(allocator_.alloc(bucket.size));
+    if (OB_ISNULL(bucket_data)) {
+        return OB_ALLOCATE_MEMORY_FAILED;
+    }
+    
+    int64_t read_size = 0;
+    ret = ObIODeviceLocalFileOp::pread_impl(index_fd_.second_id_, bucket_data, 
+                                            bucket.size, bucket_file_offset, read_size);
+    if (OB_FAIL(ret)) {
+        allocator_.free(bucket_data);
         return ret;
     }
     
-    // 2. 读取桶数据并查找
-    // ... 省略具体实现，参见 Phase 2 文件格式
+    // 3. 遍历桶内 Entry 查找 token（按 Phase 2 格式解析）
+    ret = OB_ENTRY_NOT_EXIST;
+    char *p = bucket_data;
+    char *end = bucket_data + bucket.size;
     
+    while (p < end) {
+        // 解析 VocabEntry（与 Phase 2 写入顺序一致）
+        uint64_t entry_hash = *reinterpret_cast<uint64_t*>(p); p += 8;
+        int32_t entry_token_len = *reinterpret_cast<int32_t*>(p); p += 4;
+        const char *entry_token_data = p; p += entry_token_len;
+        uint32_t entry_token_id = *reinterpret_cast<uint32_t*>(p); p += 4;  // 不使用
+        int64_t entry_posting_offset = *reinterpret_cast<int64_t*>(p); p += 8;
+        int32_t entry_posting_count = *reinterpret_cast<int32_t*>(p); p += 4;
+        p += 4;  // reserved
+        
+        // 比较 token（先比 hash，再比内容）
+        if (entry_hash == token_hash &&
+            entry_token_len == token.length() &&
+            0 == MEMCMP(entry_token_data, token.ptr(), token.length())) {
+            // 找到了！
+            posting_offset = entry_posting_offset;
+            posting_count = entry_posting_count;
+            ret = OB_SUCCESS;
+            break;
+        }
+        
+        // 优化：桶内按 hash 排序，如果 entry_hash > token_hash 可以提前退出
+        if (entry_hash > token_hash) {
+            break;
+        }
+    }
+    
+    allocator_.free(bucket_data);
     return ret;
 }
 ```

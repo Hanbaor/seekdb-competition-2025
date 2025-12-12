@@ -58,7 +58,7 @@
 +============================================+
 | Section 1: Header (256 bytes, 固定)        |
 +--------------------------------------------+
-| Section 2: Bucket Directory (64 KB, 固定)  |
+| Section 2: Bucket Directory (16 KB, 固定)  |
 +--------------------------------------------+
 | Section 3: Vocab Buckets (变长)            |
 +--------------------------------------------+
@@ -92,7 +92,7 @@ struct BM25SIndexFileHeader {
     int64_t reserved2;
     
     // 配置参数 (16 bytes)
-    int32_t bucket_num;          // 桶数量（默认 4096）
+    int32_t bucket_num;          // 桶数量（默认 1024）
     int32_t reserved3;
     int64_t reserved4;
     
@@ -110,11 +110,11 @@ struct BM25SIndexFileHeader {
 };
 ```
 
-### 2.3 Bucket Directory 结构 (64 KB)
+### 2.3 Bucket Directory 结构 (16 KB)
 
 ```cpp
-// 固定 4096 个桶
-static const int32_t NUM_VOCAB_BUCKETS = 4096;
+// 固定 1024 个桶（与 Phase 1 TmpFile 分桶数量一致）
+static const int32_t NUM_VOCAB_BUCKETS = 1024;
 
 struct BucketDirectoryEntry {
     int64_t offset;      // 该桶在文件中的偏移（相对于 vocab_buckets_offset）
@@ -122,7 +122,7 @@ struct BucketDirectoryEntry {
     int32_t size;        // 该桶的数据大小（字节）
 };
 // sizeof(BucketDirectoryEntry) = 16 bytes
-// 总大小 = 4096 * 16 = 64 KB
+// 总大小 = 1024 * 16 = 16 KB
 ```
 
 ### 2.4 Vocab Bucket 结构
@@ -204,7 +204,7 @@ struct BM25SIndexFileHeader {
     static const uint64_t MAGIC = 0x424D32355349445A;
     static const int32_t CURRENT_VERSION = 1;
     static const int64_t HEADER_SIZE = 256;
-    static const int32_t DEFAULT_BUCKET_NUM = 4096;
+    static const int32_t DEFAULT_BUCKET_NUM = 1024;
     
     void reset() { memset(this, 0, sizeof(*this)); }
     bool is_valid() const { return magic == MAGIC && version == CURRENT_VERSION; }
@@ -843,7 +843,7 @@ void ObFtsBM25SIndex::close_index_file()
 | 数据 | 计算公式 | 100万词汇/1亿posting |
 |-----|---------|---------------------|
 | Header | 256 B | 256 B |
-| Bucket Directory | 4096 × 16 B | 64 KB |
+| Bucket Directory | 1024 × 16 B | 16 KB |
 | Vocab Buckets | vocab_size × (32 + avg_token_len) | ~50 MB |
 | Posting Data | total_postings × 8 B | ~800 MB |
 | **总计** | | **~850 MB** |
