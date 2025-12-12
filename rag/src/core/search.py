@@ -27,7 +27,7 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 50  # Increased for better recall
+TOP_K = 30  # Increased for better recall
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
@@ -548,7 +548,7 @@ def search(question: str) -> Answer:
             {"role": "user", "content": prompt},
         ]
 
-        answer.answer = generate_llm_response(messages,model="qwen-max", temperature=0.3)  # Use 0.3 for natural answer generation
+        answer.answer = generate_llm_response(messages, temperature=0.3)  # Use 0.3 for natural answer generation
         logger.debug(
             f"Query completed: question='{question[:50]}...', filename='{answer.filename}', page={answer.page}"
         )
