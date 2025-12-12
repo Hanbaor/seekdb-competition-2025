@@ -2329,27 +2329,8 @@ int ObFtsBM25SIndex::load_from_disk(const char *index_dir)
     return ret;
   }
   
-  // 同时构建 token_ptr_
-  if (OB_FAIL(token_ptr_.reserve(file_header_.vocab_size + 1))) {
-    LOG_WARN("BM25S load_from_disk: fail to reserve token_ptr", K(ret));
-    close_index_file();
-    return ret;
-  }
-  
-  // 临时数组存储 (token_id, posting_offset, posting_count)
-  struct TokenInfo {
-    uint32_t token_id;
-    int64_t posting_offset;
-    int32_t posting_count;
-    
-    TO_STRING_KV(K(token_id), K(posting_offset), K(posting_count));
-  };
-  ObArray<TokenInfo> token_infos;
-  if (OB_FAIL(token_infos.prepare_allocate(file_header_.vocab_size))) {
-    LOG_WARN("BM25S load_from_disk: fail to alloc token_infos", K(ret));
-    close_index_file();
-    return ret;
-  }
+  // 注意：不再构建 token_ptr_ 和加载 posting data 到内存
+  // 阶段三设计：posting data 在查询时通过 find_token_in_file() + load_posting_to_cache() 按需加载
   
   // 遍历所有 bucket，读取 vocab entries
   for (int32_t bucket_id = 0; OB_SUCC(ret) && bucket_id < file_header_.bucket_num; ++bucket_id) {
@@ -2409,83 +2390,20 @@ int ObFtsBM25SIndex::load_from_disk(const char *index_dir)
         LOG_WARN("BM25S load_from_disk: fail to set token_to_id", K(ret), K(token_id));
         break;
       }
-      
-      // 记录 token info
-      if (token_id < static_cast<uint32_t>(file_header_.vocab_size)) {
-        token_infos.at(token_id).token_id = token_id;
-        token_infos.at(token_id).posting_offset = posting_offset;
-        token_infos.at(token_id).posting_count = posting_count;
-      }
+      // 注意：posting_offset 和 posting_count 不再保存到内存
+      // 查询时通过 find_token_in_file() 从文件中按需获取
+      UNUSED(posting_offset);
+      UNUSED(posting_count);
     }
     
     allocator_.free(buf);
   }
   
-  // 构建 token_ptr_
-  if (OB_SUCC(ret)) {
-    token_ptr_.push_back(0);
-    for (int64_t i = 0; OB_SUCC(ret) && i < file_header_.vocab_size; ++i) {
-      int64_t count = token_infos.at(i).posting_count;
-      if (OB_FAIL(token_ptr_.push_back(token_ptr_.at(i) + count))) {
-        LOG_WARN("BM25S load_from_disk: fail to push token_ptr", K(ret));
-      }
-    }
-  }
+  // 注意：Posting Data 不在此处加载！
+  // 阶段三设计：posting data 在查询时通过 load_posting_to_cache() 按需从磁盘加载
+  // 这样可以大幅减少内存占用（从 ~1GB 降低到仅加载 token 映射表）
   
-  // 8. 加载 Posting Data
-  if (OB_SUCC(ret)) {
-    int64_t total_postings = file_header_.total_postings;
-    if (OB_FAIL(scores_.prepare_allocate(total_postings))) {
-      LOG_WARN("BM25S load_from_disk: fail to alloc scores", K(ret), K(total_postings));
-      close_index_file();
-      return ret;
-    }
-    if (OB_FAIL(doc_ids_.prepare_allocate(total_postings))) {
-      LOG_WARN("BM25S load_from_disk: fail to alloc doc_ids", K(ret), K(total_postings));
-      close_index_file();
-      return ret;
-    }
-    
-    // 按 token 顺序读取 posting data
-    for (int64_t token_id = 0; OB_SUCC(ret) && token_id < file_header_.vocab_size; ++token_id) {
-      int64_t posting_offset = token_infos.at(token_id).posting_offset;
-      int32_t posting_count = token_infos.at(token_id).posting_count;
-      
-      if (posting_count == 0) {
-        continue;
-      }
-      
-      int64_t file_offset = file_header_.posting_data_offset + posting_offset;
-      int64_t idx_start = token_ptr_.at(token_id);
-      
-      // 读取 doc_ids
-      int64_t doc_ids_size = posting_count * sizeof(uint32_t);
-      if (OB_FAIL(share::ObIODeviceLocalFileOp::pread_impl(persist_fd_.second_id_, 
-                                                     &doc_ids_.at(idx_start),
-                                                     doc_ids_size, file_offset, read_size))) {
-        LOG_WARN("BM25S load_from_disk: fail to read doc_ids", K(ret), K(token_id));
-        break;
-      }
-      
-      // 读取 scores
-      int64_t scores_offset = file_offset + posting_count * sizeof(uint32_t);
-      int64_t scores_size = posting_count * sizeof(float);
-      if (OB_FAIL(share::ObIODeviceLocalFileOp::pread_impl(persist_fd_.second_id_,
-                                                     &scores_.at(idx_start),
-                                                     scores_size, scores_offset, read_size))) {
-        LOG_WARN("BM25S load_from_disk: fail to read scores", K(ret), K(token_id));
-        break;
-      }
-      
-      // 每处理 10000 个 token 打印一次进度
-      if ((token_id + 1) % 10000 == 0) {
-        LOG_INFO("BM25S load_from_disk: loading progress", 
-                 K(token_id), K(file_header_.vocab_size));
-      }
-    }
-  }
-  
-  // 9. 恢复统计信息
+  // 8. 恢复统计信息
   if (OB_SUCC(ret)) {
     total_docs_ = file_header_.total_docs;
     avg_doc_len_ = file_header_.avg_doc_len;
