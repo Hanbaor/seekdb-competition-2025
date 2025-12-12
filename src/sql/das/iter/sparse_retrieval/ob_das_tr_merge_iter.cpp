@@ -22,6 +22,7 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/das/ob_das_fts_filter_ctx.h"
 #include "sql/das/ob_fts_scalar_cache.h"
+#include "sql/das/ob_fts_bm25s_cache.h"
 #include <unistd.h>  // for usleep
 #include <sys/time.h>  // for gettimeofday
 
@@ -1199,33 +1200,44 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     // 使用全局过滤上下文中的 id_limit
     int64_t id_limit = g_fts_filter_ctx.has_id_filter_ ? g_fts_filter_ctx.id_limit_ : INT64_MAX;
     
-    // ========== 诊断日志：检查索引状态 ==========
-    LOG_INFO("BM25S search: checking index state",
-             "is_finalized", g_bm25s_index.is_finalized(),
-             "vocab_size", g_bm25s_index.get_vocab_size(),
-             "total_entries", g_bm25s_index.get_total_entries(),
-             "total_docs", g_bm25s_index.get_total_docs(),
+    // ========== 诊断日志：检查索引状态（KVCache 模式）==========
+    // 注意：get_posting_from_cache() 内部会自动调用 ensure_ready() 确保索引就绪
+    LOG_INFO("BM25S search: starting (KVCache mode)",
              "query_tokens_count", query_tokens_.count(),
              K(id_limit),
-             "scalar_cache_size", g_fts_scalar_cache.size(),
-             "scalar_cache_capacity", g_fts_scalar_cache.capacity());
+             "scalar_cache_size", g_fts_scalar_cache.size());
     
-    // 1. 遍历每个查询 token，从索引获取倒排链并累加分数
+    // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
     int64_t tokens_found = 0, tokens_not_found = 0;
     int64_t total_postings = 0, filtered_by_base_id = 0;
+    int64_t cache_hits = 0, cache_misses = 0;
+    
     for (int64_t t = 0; t < query_tokens_.count(); t++) {
       const ObString &token = query_tokens_.at(t);
-      uint64_t start = 0, end = 0;
       
-      if (!g_bm25s_index.get_posting_list(token, id_limit, start, end)) {
+      // ========== 从 KVCache 获取 posting（缓存未命中时从文件加载）==========
+      const ObBM25SPostingValue *posting = nullptr;
+      common::ObKVCacheHandle handle;
+      
+      int posting_ret = g_bm25s_index.get_posting_from_cache(token, posting, handle);
+      if (OB_ENTRY_NOT_EXIST == posting_ret) {
+        tokens_not_found++;
+        continue;
+      } else if (OB_SUCCESS != posting_ret) {
+        LOG_WARN("BM25S search: fail to get posting from cache", K(posting_ret), K(token));
         tokens_not_found++;
         continue;
       }
-      tokens_found++;
-      total_postings += (end - start);
       
-      for (uint64_t i = start; i < end; i++) {
-        uint32_t doc_id = g_bm25s_index.get_doc_id(i);
+      tokens_found++;
+      
+      // 使用二分查找获取有效的 posting 数量（doc_id < id_limit）
+      int64_t valid_count = posting->get_valid_count(id_limit);
+      total_postings += valid_count;
+      
+      // 遍历有效的 posting
+      for (int64_t i = 0; i < valid_count; i++) {
+        uint32_t doc_id = posting->get_doc_id(i);
         
         // 高效检查 base_id：直接数组访问，O(1) 无 hash 开销
         // 注意：如果 scalar_cache 为空，跳过 base_id 过滤（允许所有文档通过）
@@ -1237,13 +1249,15 @@ ObDASTRMergeIter::ObDASTRMergeIter()
           }
         }
         
-        float score = g_bm25s_index.get_score(i);
+        float score = posting->get_score(i);
         
         if (scores_array[doc_id] == 0.0) {
           touched_docs.push_back(doc_id);
         }
         scores_array[doc_id] += score;
       }
+      
+      // handle 析构时自动释放 KVCache 引用
     }
     
     // ========== 诊断日志：token 查找结果 ==========

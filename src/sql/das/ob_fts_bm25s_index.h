@@ -30,8 +30,20 @@
 #include "storage/tmp_file/ob_tmp_file_manager.h"
 #include "storage/tmp_file/ob_tmp_file_io_info.h"
 #include "storage/tmp_file/ob_tmp_file_io_handle.h"
+#include "share/ob_io_device_helper.h"
+#include "common/storage/ob_io_device.h"
+#include "share/cache/ob_kv_storecache.h"
 #include <fstream>
 #include <cstdio>
+#include <fcntl.h>
+
+// 前向声明
+namespace oceanbase {
+namespace sql {
+class ObBM25SPostingValue;
+class ObBM25SPostingKey;
+} // namespace sql
+} // namespace oceanbase
 
 namespace oceanbase
 {
@@ -40,6 +52,85 @@ namespace sql
 
 // 持久化日志函数（定义在 ob_fts_bm25s_index.cpp）
 void bm25s_log(const char* fmt, ...);
+
+// ========== Phase 2: 持久化文件格式结构体 ==========
+
+/**
+ * @brief BM25S 索引文件头 (256 bytes)
+ */
+struct BM25SIndexFileHeader {
+  // Magic & Version (16 bytes)
+  uint64_t magic;              // 0x424D32355349445A ("BM25SIDZ")
+  int32_t version;             // 版本号，当前为 1
+  int32_t flags;               // 预留标志位
+  
+  // 统计信息 (32 bytes)
+  int64_t total_docs;          // 总文档数
+  double avg_doc_len;          // 平均文档长度
+  int64_t vocab_size;          // 词汇表大小（token 数量）
+  int64_t total_postings;      // posting 总条目数
+  
+  // Section 偏移和大小 (64 bytes)
+  int64_t bucket_dir_offset;   // Bucket Directory 起始偏移
+  int64_t bucket_dir_size;     // Bucket Directory 大小
+  int64_t vocab_buckets_offset;// Vocab Buckets 起始偏移
+  int64_t vocab_buckets_size;  // Vocab Buckets 总大小
+  int64_t posting_data_offset; // Posting Data 起始偏移
+  int64_t posting_data_size;   // Posting Data 总大小
+  int64_t reserved1;
+  int64_t reserved2;
+  
+  // 配置参数 (16 bytes)
+  int32_t bucket_num;          // 桶数量（默认 4096）
+  int32_t reserved3;
+  int64_t reserved4;
+  
+  // 校验和 (16 bytes)
+  uint64_t checksum;           // 文件校验和（可选）
+  int64_t create_timestamp;    // 创建时间戳
+  
+  // 填充到 256 bytes
+  char padding[256 - 144];
+  
+  // 常量
+  static const uint64_t MAGIC = 0x424D32355349445A;  // "BM25SIDZ"
+  static const int32_t CURRENT_VERSION = 1;
+  static const int64_t HEADER_SIZE = 256;
+  static const int32_t DEFAULT_BUCKET_NUM = 4096;
+  
+  void reset() { memset(this, 0, sizeof(*this)); }
+  bool is_valid() const { return magic == MAGIC && version == CURRENT_VERSION; }
+  
+  TO_STRING_KV(K(magic), K(version), K(total_docs), K(avg_doc_len), K(vocab_size), 
+               K(total_postings), K(bucket_dir_offset), K(vocab_buckets_offset), 
+               K(posting_data_offset), K(posting_data_size));
+};
+
+/**
+ * @brief 桶目录条目 (16 bytes)
+ */
+struct BucketDirectoryEntry {
+  int64_t offset;      // 该桶在文件中的偏移（相对于 vocab_buckets_offset）
+  int32_t entry_count; // 该桶包含的 token 数量
+  int32_t size;        // 该桶的数据大小（字节）
+  
+  void reset() { offset = 0; entry_count = 0; size = 0; }
+  
+  TO_STRING_KV(K(offset), K(entry_count), K(size));
+};
+
+/**
+ * @brief Vocab Entry 内存结构（用于写入）
+ */
+struct VocabEntryMem {
+  uint64_t token_hash;
+  common::ObString token;
+  uint32_t token_id;
+  int64_t posting_offset;
+  int32_t posting_count;
+  
+  TO_STRING_KV(K(token_hash), K(token), K(token_id), K(posting_offset), K(posting_count));
+};
 
 /**
  * @brief BM25S 预计算索引
@@ -223,6 +314,78 @@ public:
   void dump_finalize_time(const char *filepath, double elapsed_ms,
                           int64_t sort_file_size = 0, int64_t sort_mem_increase = 0) const;
 
+  // ========== Phase 2: 持久化接口 ==========
+  /**
+   * @brief 获取索引文件路径
+   * @param tenant_id 租户 ID
+   * @param table_id 表 ID
+   * @param path_buf 输出路径缓冲区
+   * @param buf_len 缓冲区长度
+   */
+  static int get_index_path(uint64_t tenant_id, uint64_t table_id,
+                            char *path_buf, int64_t buf_len);
+  
+  /**
+   * @brief 将索引持久化到磁盘
+   * @param index_dir 索引目录路径
+   */
+  int persist_to_disk(const char *index_dir);
+  
+  /**
+   * @brief 流式 Finalize + 持久化（不构建内存 CSC，直接写文件）
+   * @param index_path 索引文件完整路径
+   */
+  int finalize_and_persist(const char *index_path);
+  
+  /**
+   * @brief 从磁盘加载索引
+   * @param index_dir 索引目录路径
+   */
+  int load_from_disk(const char *index_dir);
+  
+  /**
+   * @brief 关闭索引文件
+   */
+  void close_index_file();
+
+  // ========== Phase 3: KVCache 查询接口 ==========
+  /**
+   * @brief 使用 KVCache 进行搜索（支持动态加载）
+   * @param tokens 查询词列表
+   * @param id_limit id < id_limit 过滤条件（0 表示不过滤）
+   * @param top_k 返回 top_k 个结果
+   * @param results 输出结果（doc_id, score）
+   */
+  int search_with_cache(const common::ObIArray<common::ObString> &tokens,
+                        int64_t id_limit,
+                        int64_t top_k,
+                        common::ObIArray<DocScore> &results);
+  
+  /**
+   * @brief 从 PostingCache 获取倒排链
+   * @param token 查询词
+   * @param posting 输出：posting 数据指针
+   * @param handle 缓存句柄（管理生命周期）
+   */
+  int get_posting_from_cache(const common::ObString &token,
+                             const ObBM25SPostingValue *&posting,
+                             common::ObKVCacheHandle &handle);
+  
+  /**
+   * @brief 打印缓存统计信息
+   */
+  void print_cache_stats();
+  
+  /**
+   * @brief 检查索引文件是否已打开
+   */
+  bool is_index_file_opened() const { return persist_file_opened_; }
+  
+  /**
+   * @brief 获取文件头信息（用于查询时访问元数据）
+   */
+  const BM25SIndexFileHeader& get_file_header() const { return file_header_; }
+
 private:
   ObFtsBM25SIndex();
   ~ObFtsBM25SIndex();
@@ -263,23 +426,67 @@ private:
    */
   void cleanup_tmp_files();
   
+
+  
+  // ========== Phase 2: 持久化私有函数 ==========
   /**
-   * @brief 将最终索引持久化到 TmpFile（进程间共享）
-   * 在 finalize() 完成后调用
+   * @brief 写入 Header 和 Bucket Directory（占位）
    */
-  int save_index_to_tmpfile();
+  int write_header_and_directory(const common::ObIOFd &fd);
   
   /**
-   * @brief 从 TmpFile 加载索引（在其他进程中恢复索引）
-   * 在搜索时如果索引未就绪，尝试调用此函数
+   * @brief 预计算 Posting Offsets
    */
-  int load_index_from_tmpfile();
+  int calc_posting_offsets(common::ObIArray<int64_t> &posting_offsets);
   
   /**
-   * @brief 尝试加载持久化的索引（供搜索进程调用）
-   * 如果索引未 finalize 但有持久化数据，则加载
+   * @brief 写入 Vocab Buckets
    */
-  int try_load_persisted_index();
+  int write_vocab_buckets(const common::ObIOFd &fd,
+                          const common::ObIArray<int64_t> &posting_offsets);
+  
+  /**
+   * @brief 写入 Vocab Buckets（流式版本，用于 finalize_and_persist）
+   */
+  int write_vocab_buckets_streaming(const common::ObIOFd &fd,
+                                     const common::ObIArray<int64_t> &posting_offsets,
+                                     const common::ObIArray<int64_t> &token_df);
+  
+  /**
+   * @brief 写入 Posting Data
+   */
+  int write_posting_data(const common::ObIOFd &fd);
+  
+  /**
+   * @brief 更新 Header 和 Bucket Directory
+   */
+  int update_header(const common::ObIOFd &fd);
+  
+  /**
+   * @brief 计算 BM25 分数（float 版本，用于持久化）
+   */
+  float calc_bm25_score_f(int32_t tf, int32_t doc_len, int64_t df);
+  
+  // ========== Phase 3: KVCache 私有函数 ==========
+  /**
+   * @brief 从文件加载 Posting 并放入缓存
+   * @param token 查询词
+   * @param posting 输出：posting 数据指针
+   * @param handle 缓存句柄
+   */
+  int load_posting_to_cache(const common::ObString &token,
+                            const ObBM25SPostingValue *&posting,
+                            common::ObKVCacheHandle &handle);
+  
+  /**
+   * @brief 从文件查找 Token 的 posting 信息
+   * @param token 查询词
+   * @param posting_offset 输出：posting 在文件中的偏移
+   * @param posting_count 输出：posting 数量
+   */
+  int find_token_in_file(const common::ObString &token,
+                         int64_t &posting_offset,
+                         int64_t &posting_count);
 
 private:
   bool is_inited_;
@@ -292,11 +499,16 @@ private:
   volatile int64_t bucket_write_offsets_[NUM_BUCKETS]; // 每个桶的当前写入偏移（用于统计）
   bool tmp_files_inited_;                         // TmpFile 是否已初始化
   
-  // ========== 索引持久化 TmpFile（跨进程共享）==========
-  int64_t index_fd_;                              // 持久化索引文件描述符
-  bool index_persisted_;                          // 索引是否已持久化
-  static const int64_t INDEX_MAGIC = 0x424D3235;  // "BM25" magic number
-  static const int64_t INDEX_VERSION = 1;
+  // ========== Phase 2: 持久化相关 ==========
+  static const int32_t NUM_PERSIST_BUCKETS = 4096;  // 持久化文件的桶数量
+  char index_file_path_[512];                       // 索引文件路径
+  common::ObIOFd persist_fd_;                       // 持久化文件描述符（写入/查询共用）
+  bool persist_file_opened_;                        // 持久化文件是否已打开
+  BM25SIndexFileHeader file_header_;                // 文件头
+  BucketDirectoryEntry *bucket_directory_;          // 桶目录
+  
+  // ========== Phase 3: KVCache 查询相关 ==========
+  common::ObArenaAllocator cache_allocator_;        // KVCache 查询时的临时内存分配器
   
   // ========== 收集阶段数据（分桶文件流式）==========
   volatile int64_t bucket_entry_counts_[NUM_BUCKETS]; // 每个桶的条目计数（原子）
