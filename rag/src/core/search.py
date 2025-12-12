@@ -32,7 +32,6 @@ TOP_K = 30  # Increased for better recall
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
 
-
 def _search_with_retry(client, index: str, body: dict, max_retries: int = 3, backoff_base: float = 0.3):
     last_exception = None
     for attempt in range(1, max_retries + 1):
