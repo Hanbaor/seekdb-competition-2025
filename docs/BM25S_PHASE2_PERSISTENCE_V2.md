@@ -111,7 +111,7 @@ struct BM25SIndexFileHeader {
 static const int32_t NUM_BUCKETS = 1024;
 
 struct BucketDirectoryEntry {
-    int64_t vocab_offset;    // 该桶的 Vocab 数据在文件中的偏移
+    int64_t vocab_offset;    // 该桶的 Vocab 数据在 Vocab Section 内的偏移（字节）
     int32_t vocab_size;      // 该桶的 Vocab 数据大小（字节）
     int32_t entry_count;     // 该桶包含的 token 数量
 };
@@ -121,12 +121,12 @@ struct BucketDirectoryEntry {
 
 ### 2.4 Vocab Bucket 结构
 
-每个桶内按 token_hash 排序存储，支持二分查找：
+每个桶内按 token_hash 升序存储（若 hash 相等再按 token_str 比较），支持二分查找与提前退出：
 
 ```cpp
-// 变长 VocabEntry 格式：
-// [token_hash: 8][token_len: 2][token_str: N][posting_offset: 8][posting_count: 4]
-// 
+// 变长 VocabEntry 格式（无 token_id / reserved）：
+// [token_hash: 8][token_len: uint16][token_str: N][posting_offset: int64][posting_count: int32]
+//
 // 固定部分 = 8 + 2 + 8 + 4 = 22 bytes
 // 变长部分 = token_len bytes
 
@@ -147,16 +147,24 @@ struct VocabEntryHeader {
 
 ### 2.5 Posting Data 结构
 
-每个 token 的 posting list 连续存储：
+每个 token 的 posting list 连续存储，posting_offset 为相对 Posting Section 起点的字节偏移：
 
 ```cpp
 // Posting Data 布局:
-// [doc_ids: uint32_t * count][scores: float * count]
-// 
+// [doc_ids: uint32_t * count][scores: float * count]  // 中间无填充
+//
 // 示例：count = 100
 // - doc_ids: 100 * 4 = 400 bytes
 // - scores:  100 * 4 = 400 bytes
 // - 总计: 800 bytes
+
+### 2.6 迷你示例（用于 Phase3 对齐验证）
+
+- 假设 bucket_dir_offset=256，dir_size=16384，vocab_buckets_offset=16640（紧随目录），posting_data_offset=16640+V。
+- 一个桶内只有一个 token "abc"，token_hash=H，posting_count=2，posting_offset=0。
+- Vocab entry 字节序：`[H(8)][len=3(2)]["abc"(3)][posting_offset=0(8)][count=2(4)]` → 总 25 字节。
+- BucketDirectory 该桶：vocab_offset=0（相对 vocab_section），vocab_size=25，entry_count=1。
+- PostingData：`[doc_ids: d1,d2][scores: s1,s2]`，占 16 字节。
 ```
 
 ---
@@ -343,7 +351,7 @@ int process_bucket_v2(int fd, int64_t bucket_id, BucketDirectoryEntry &dir_entry
         return OB_SUCCESS;
     }
     
-    // 2. 桶内排序（按 token_str, doc_id）
+    // 2. 桶内排序（按 token_str, doc_id）——与写 Posting/df 统计保持一致
     std::sort(records.begin(), records.end(),
               [](const TmpRecord &a, const TmpRecord &b) {
                   int cmp = a.token.compare(b.token);
@@ -393,7 +401,7 @@ int process_bucket_v2(int fd, int64_t bucket_id, BucketDirectoryEntry &dir_entry
         }
     }
     
-    // 4. 写入 Vocab Bucket（按 token_hash 排序）
+    // 4. 写入 Vocab Bucket（按 token_hash 排序，hash 相等再比 token_str）
     // 先对 all_token_infos 中该桶的 entry 按 hash 排序
     // （这里简化处理，实际可以在写入时排序）
     
@@ -681,18 +689,20 @@ int32_t bucket_id = token.hash() % file_header_.bucket_num;
 // Phase 2: 直接转换，不重新分桶
 ```
 
-### 6.2 Vocab Entry 解析
+### 6.2 Vocab Entry 解析（与 V2 最终格式一致）
 
 ```cpp
 // Phase 3 解析格式与 Phase 2 写入格式一致：
 uint64_t entry_hash = *reinterpret_cast<uint64_t*>(p); p += 8;
-uint16_t entry_token_len = *reinterpret_cast<uint16_t*>(p); p += 2;
+uint16_t entry_token_len = *reinterpret_cast<uint16_t*>(p); p += 2;  // uint16
 const char *entry_token_data = p; p += entry_token_len;
 int64_t entry_posting_offset = *reinterpret_cast<int64_t*>(p); p += 8;
 int32_t entry_posting_count = *reinterpret_cast<int32_t*>(p); p += 4;
 ```
 
-**注意**：V2 设计中没有 token_id 字段。
+**注意**：
+- V2 设计中没有 token_id/reserved 字段。
+- 桶内写入顺序必须按 token_hash 升序（hash 相等再比 token_str），Phase3 查找可在 entry_hash > token_hash 时提前退出。
 
 ---
 
