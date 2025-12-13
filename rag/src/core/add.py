@@ -235,7 +235,7 @@ def process_single_page(
     
     try:
         # Step 1: Convert PDF page to image
-        page_image_path = pdf_page_to_image(pdf_file, page_num, dpi=100)
+        page_image_path = pdf_page_to_image(pdf_file, page_num, dpi=150)
         logger.debug(f"{filename} page {page_num}: converted to image")
         
         # Step 2: Extract information using VLM
