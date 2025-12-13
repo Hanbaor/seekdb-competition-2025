@@ -27,7 +27,7 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 50  # Increased for better recall
+TOP_K = 40  # Increased for better recall
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
