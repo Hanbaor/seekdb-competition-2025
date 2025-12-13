@@ -548,7 +548,7 @@ def search(question: str) -> Answer:
             {"role": "user", "content": prompt},
         ]
 
-        answer.answer = generate_llm_response(messages, temperature=0.3)  # Use 0.3 for natural answer generation
+        answer.answer = generate_llm_response(messages, temperature=0.1)  # Use 0.3 for natural answer generation
         logger.debug(
             f"Query completed: question='{question[:50]}...', filename='{answer.filename}', page={answer.page}"
         )
