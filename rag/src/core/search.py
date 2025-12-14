@@ -3,6 +3,7 @@ import os
 import time
 import json
 import re
+import hashlib
 
 import dotenv
 
@@ -27,10 +28,69 @@ TABLE_NAME = "rag_documents"
 
 # Number of top results to retrieve
 # TOP_K = 30  # Increased to 30 for better coverage across 20 PDFs
-TOP_K = 40  # Increased for better recall
+TOP_K = 50  # Increased for better recall
 
 # Enable LLM Rerank: Use LLM to rerank top results and select best file/page
 USE_LLM_RERANK = True  # Set to True to enable LLM reranking
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+USE_BATCH_SUMMARIZE = _env_bool("USE_BATCH_SUMMARIZE", False)
+USE_SUMMARY_CACHE = _env_bool("USE_SUMMARY_CACHE", False)
+USE_REGEX_FACTS = _env_bool("USE_REGEX_FACTS", True)
+
+SUMMARY_CACHE_DIR = os.getenv("SUMMARY_CACHE_DIR", "./cache/summaries")
+SUMMARY_TOP_N = _env_int("SUMMARY_TOP_N", 10)
+RERANK_CANDIDATES_K = _env_int("RERANK_CANDIDATES_K", TOP_K * 2)
+CONTEXT_TOP_N = _env_int("CONTEXT_TOP_N", 0)
+
+
+class SummaryCache:
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir or "./cache/summaries"
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _make_key(self, filename: str, page: int, content: str) -> str:
+        base = (filename or "").split("/")[-1]
+        content_hash = hashlib.md5((content or "").encode("utf-8")).hexdigest()
+        return f"{base}__p{int(page or 0)}__{content_hash[:12]}.json"
+
+    def get(self, filename: str, page: int, content: str):
+        path = os.path.join(self.cache_dir, self._make_key(filename, page, content))
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def set(self, filename: str, page: int, content: str, payload: dict) -> None:
+        path = os.path.join(self.cache_dir, self._make_key(filename, page, content))
+        try:
+            data = dict(payload or {})
+            data["_ts"] = time.time()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception:
+            pass
+
 
 def _search_with_retry(client, index: str, body: dict, max_retries: int = 3, backoff_base: float = 0.3):
     last_exception = None
@@ -112,6 +172,34 @@ def apply_rrf_reranking(search_results, k=60, score_weight=0.5):
     return rrf_results
 
 
+def _extract_key_facts(text: str) -> str:
+    if not text:
+        return ""
+
+    facts = []
+    years = sorted(set(re.findall(r"(19\d{2}|20\d{2})", text)))
+    if years:
+        facts.append(f"年份: {', '.join(years[:10])}")
+
+    percentages = list(dict.fromkeys(re.findall(r"\d+(?:\.\d+)?%", text)))
+    if percentages:
+        facts.append(f"百分比: {', '.join(percentages[:10])}")
+
+    amounts = list(
+        dict.fromkeys(
+            re.findall(r"\d+(?:\.\d+)?(?:亿元|万元|万|亿|元)", text)
+        )
+    )
+    if amounts:
+        facts.append(f"金额: {', '.join(amounts[:10])}")
+
+    numbers = sorted(set(re.findall(r"\d{3,}(?:\.\d+)?", text)))
+    if numbers and len(numbers) <= 10:
+        facts.append(f"关键数字: {', '.join(numbers[:10])}")
+
+    return " | ".join(facts)
+
+
 def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -> tuple:
     """
     Use LLM to rerank top results and select the most relevant file and page.
@@ -127,70 +215,243 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
     if not retrieval_results:
         return "", 0
     
-    # Only use top K results
-    top_results = retrieval_results[:min(top_k, len(retrieval_results))]
+    raw_top_results = retrieval_results[:min(top_k, len(retrieval_results))]
+
+    page_buckets: dict[tuple[str, int], dict] = {}
+    for r in raw_top_results:
+        fn_full = str(r.get("filename", "") or "")
+        if not fn_full:
+            continue
+        try:
+            pg = int(r.get("page", 0) or 0)
+        except Exception:
+            pg = 0
+        try:
+            sc = float(r.get("score", 0.0) or 0.0)
+        except Exception:
+            sc = 0.0
+        text = str(r.get("content_preview", "") or "")
+        try:
+            rk = int(r.get("rank", 0) or 0)
+        except Exception:
+            rk = 0
+
+        key = (fn_full, pg)
+        bucket = page_buckets.get(key)
+        if bucket is None:
+            bucket = {
+                "filename": fn_full,
+                "page": pg,
+                "score": sc,
+                "best_rank": rk,
+                "chunks": [],
+            }
+            page_buckets[key] = bucket
+        else:
+            bucket["score"] = max(float(bucket.get("score", 0.0) or 0.0), sc)
+            bucket["best_rank"] = min(int(bucket.get("best_rank", rk) or rk), rk)
+
+        bucket["chunks"].append({"score": sc, "rank": rk, "text": text})
+
+    top_results: list[dict] = []
+    for bucket in page_buckets.values():
+        chunks = bucket.get("chunks") or []
+        chunks = [c for c in chunks if (c.get("text") or "").strip()]
+        chunks.sort(key=lambda c: (float(c.get("score", 0.0) or 0.0), -int(c.get("rank", 0) or 0)), reverse=True)
+        top_texts = [str(c.get("text") or "") for c in chunks[:3] if str(c.get("text") or "").strip()]
+        combined = "\n".join(top_texts).strip()
+        bucket["content_preview"] = combined
+        bucket["chunk_count"] = len(bucket.get("chunks") or [])
+        top_results.append(bucket)
+
+    if not top_results:
+        return "", 0
+
+    q_text = question or ""
+    q_years = list(dict.fromkeys(re.findall(r"(19\d{2}|20\d{2})", q_text)))
+    q_pcts = list(dict.fromkeys(re.findall(r"\d+(?:\.\d+)?%", q_text)))
+    q_amounts = list(
+        dict.fromkeys(re.findall(r"\d+(?:\.\d+)?(?:亿元|万元|万|亿|元)", q_text))
+    )
+
+    def _question_match_score(r: dict) -> int:
+        text = str(r.get("content_preview", "") or "")
+        s = 0
+        for y in q_years:
+            if y and y in text:
+                s += 3
+        for p in q_pcts:
+            if p and p in text:
+                s += 5
+        for a in q_amounts:
+            if a and a in text:
+                s += 6
+        return s
+
+    top_results = sorted(
+        top_results,
+        key=lambda r: (_question_match_score(r), float(r.get("score", 0.0) or 0.0), int(r.get("chunk_count", 0) or 0)),
+        reverse=True,
+    )
 #    相似度分数: {score:.3f} 
-    # Build candidate list
+    summaries: dict[int, str] = {}
+    if USE_BATCH_SUMMARIZE and SUMMARY_TOP_N > 0:
+        cache = SummaryCache(SUMMARY_CACHE_DIR) if USE_SUMMARY_CACHE else None
+        to_summarize: list[tuple[int, str, int, str]] = []
+
+        max_n = min(SUMMARY_TOP_N, len(top_results))
+        for idx0, r in enumerate(top_results[:max_n], 1):
+            content0 = str(r.get("content_preview", "") or "")
+            if not content0:
+                continue
+            fn0 = str(r.get("filename", "") or "")
+            try:
+                pg0 = int(r.get("page", 0) or 0)
+            except Exception:
+                pg0 = 0
+
+            cached = cache.get(fn0, pg0, content0) if cache else None
+            if isinstance(cached, dict) and cached.get("summary"):
+                summaries[idx0] = str(cached.get("summary") or "").strip()
+            else:
+                to_summarize.append((idx0, fn0, pg0, content0))
+
+        if to_summarize:
+            parts = []
+            for idx0, _, _, content0 in to_summarize:
+                excerpt = content0.replace("\n", " ").strip()[:300]
+                parts.append(f"{idx0}) {excerpt}")
+
+            batch_prompt = (
+                f"请为下面按序号列出的 {len(to_summarize)} 个文档片段生成每个片段的一句摘要。"
+                "输出必须为 JSON 数组，数组长度与输入片段数相同，每个项格式为："
+                "{\"index\": <序号>, \"summary\": \"一句话摘要（提到关键数字/年份/金额，如有）\", \"key_numbers\": [..], \"confidence\": \"low|medium|high\"}。\n\n"
+                "输入片段（请保持顺序）：\n"
+                + "\n".join(parts)
+                + "\n\n要求：不要添加额外说明，严格输出 JSON 数组。"
+            )
+
+            try:
+                summary_resp = generate_llm_response(
+                    [{"role": "user", "content": batch_prompt}],
+                    model="qwen-max",
+                    temperature=0.0,
+                ).strip()
+
+                arr_match = re.search(r"\[[\s\S]*\]", summary_resp)
+                arr_text = arr_match.group(0) if arr_match else ""
+                items = json.loads(arr_text) if arr_text else []
+
+                if isinstance(items, list):
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        try:
+                            i = int(it.get("index", 0) or 0)
+                        except Exception:
+                            i = 0
+                        s = str(it.get("summary", "") or "").strip()
+                        if i > 0 and s:
+                            summaries[i] = s
+
+                if cache:
+                    for idx0, fn0, pg0, content0 in to_summarize:
+                        s = summaries.get(idx0, "")
+                        if s:
+                            cache.set(fn0, pg0, content0, {"summary": s})
+            except Exception:
+                pass
+
     candidates = []
     for idx, r in enumerate(top_results, 1):
-        filename = r.get('filename', '').split('/')[-1]  # Only filename
-        page = r.get('page', 0)
-        content = r.get('content_preview', '')
-        score = r.get('score', 0)
-        
-        candidates.append(f"""【候选{idx}】
-文件: {filename}
-页码: 第{page}页
-内容摘要: {content}""")
+        filename = r.get("filename", "").split("/")[-1]
+        page = r.get("page", 0)
+        content = r.get("content_preview", "")
+        key_facts = _extract_key_facts(content) if USE_REGEX_FACTS else ""
+        summary = summaries.get(idx, "")
+        snippet = (content or "").replace("\n", " ").strip()[:200]
+        chunk_cnt = int(r.get("chunk_count", 0) or 0)
+
+        candidates.append(
+            f"{idx}) filename: {filename}, page: {page}, chunks: {chunk_cnt}, key_facts: {key_facts}, summary: {summary or snippet}"
+        )
     
-    candidates_text = "\n\n".join(candidates)
+    candidates_text = "\n".join(candidates)
     
     # Build LLM prompt
-    prompt = f"""你是一个专业的金融文档检索评估专家。现在有一个关于千味央厨公司的问题和{len(top_results)}个通过混合检索筛选出的候选文档片段。
+    prompt = f"""你是一个精确的文档选择专家。下面给出 {len(top_results)} 个候选页面（按 filename+page 聚合；每个候选包含该页的若干片段信息），请严格从中选择一个最能回答问题的候选。
 
-问题：{question}
+选择原则（优先级）：
+1) 片段中包含与问题完全匹配的关键数字/年份/金额/百分比；
+2) 片段能直接回答问题；
+3) 如果多个片段都满足条件，选择信息最完整且更靠前的候选；
 
-候选文档片段（共{len(top_results)}个）：
+返回要求（严格）：
+- 只返回一个 JSON 对象，不要输出任何其他文字：
+{{"index": <候选序号>, "filename": "basename.pdf", "page": <页码>, "reason": "一句话说明依据（需引用候选中出现的数字或短语）"}}
+
+候选列表：
 {candidates_text}
 
-选择标准（按优先级）：
-1. 【最重要】内容中包含问题提到的具体年份、数字、百分比、金额等关键信息
-2. 内容直接回答问题，而非间接相关
-3. 内容信息完整，能支撑完整答案
-
-要求：
-1. 必须从上述候选中选择一个
-2. 只返回一个JSON对象：{{"filename": "完整文件名.pdf", "page": 页码数字, "reason": "选择理由（一句话）"}}
-3. filename必须与候选中的文件名完全一致，页码也一致并且是对应的
-4. 不要有任何其他解释文字
-
-返回："""
+问题：{question}
+"""
 
     try:
         messages = [{"role": "user", "content": prompt}]
         result_text = generate_llm_response(messages, model="qwen-max", temperature=0.0).strip()  # Use qwen-max for better reranking
         
         # Extract JSON
-        import re
-        import json
-        json_match = re.search(r'\{[^}]+\}', result_text)
-        if json_match:
-            result = json.loads(json_match.group())
-            filename = result.get('filename', '')
-            page = result.get('page', 0)
-            
-            # Find full file path
-            for r in top_results:
-                if filename in r.get('filename', ''):
-                    logger.info(f"LLM Rerank selected: {filename} page {page}")
-                    return r.get('filename', ''), page
-            
-            # If not found, fall back to hybrid strategy
-            logger.warning(f"LLM Rerank: filename '{filename}' not found in results, triggering fallback")
+        json_objs = re.findall(r"\{[\s\S]*?\}", result_text)
+        parsed = None
+        for obj in reversed(json_objs):
+            try:
+                cand = json.loads(obj)
+                if isinstance(cand, dict) and any(k in cand for k in ["index", "filename", "page"]):
+                    parsed = cand
+                    break
+            except Exception:
+                continue
+
+        if not parsed:
+            logger.warning("LLM Rerank: invalid response format, falling back to hybrid strategy")
             return "", 0
-        else:
-            logger.warning(f"LLM Rerank: invalid response format, falling back to hybrid strategy")
-            return "", 0
+
+        idx = 0
+        try:
+            idx = int(parsed.get("index", 0) or 0)
+        except Exception:
+            idx = 0
+
+        if 1 <= idx <= len(top_results):
+            chosen = top_results[idx - 1]
+            chosen_fn = chosen.get("filename", "")
+            chosen_pg = int(chosen.get("page", 0) or 0)
+            logger.info(
+                "LLM Rerank selected: idx=%d %s page %d",
+                idx,
+                os.path.basename(chosen_fn),
+                chosen_pg,
+            )
+            return chosen_fn, chosen_pg
+
+        filename = str(parsed.get("filename", "") or "").strip()
+        try:
+            page = int(parsed.get("page", 0) or 0)
+        except Exception:
+            page = 0
+
+        for r in top_results:
+            cand_full = r.get("filename", "") or ""
+            cand_base = cand_full.split("/")[-1] if cand_full else ""
+            cand_page = int(r.get("page", 0) or 0)
+            if filename and cand_base == filename:
+                if page and cand_page != page:
+                    continue
+                logger.info("LLM Rerank selected (fallback match): %s page %d", cand_base, cand_page)
+                return cand_full, cand_page
+
+        logger.warning("LLM Rerank: could not match parsed selection, falling back")
+        return "", 0
             
     except Exception as e:
         logger.error(f"LLM Rerank error: {e}, falling back to hybrid strategy")
@@ -217,15 +478,17 @@ def search(question: str) -> Answer:
         # Step 1: Generate hypothetical answer first (HyDE approach)
         logger.debug("Generating hypothetical answer for better retrieval...")
         hypothetical_prompt = (
-            "你是一个检索增强生成（RAG）系统的检索提示生成器。"
-            "请针对下面的问题，先给出一个尽量准确且详细的假设性回答 answer，"
-            "然后抽取出与检索最相关的实体 entities 和关键词 keywords。尽量精确而且全面,具体的实体数量和回答长度以问题的复杂度来定\n\n"
-            "严格按照下面 JSON 模板输出（不要包含任何多余文字）：\n"
+            "你是一个针对公司财务/业务文档的检索辅助生成器。"
+            "请基于任务对下面的问题生成一个假设性回答（可能的答案短文本），并抽取最多 8 个与检索最相关的实体或关键词。\n\n"
+            "要求：\n"
+            "1) 只能以严格 JSON 格式返回，且不要输出除 JSON 以外的任何文字。\n"
+            "2) JSON 模板如下：\n"
             "{\n"
-            "  \"answer\": \"完整的假设性回答，包含关键数字和实体\",\n"
-            "  \"entities\": [\"实体1\", \"实体2\", \"实体3\", \"实体4\", \"实体5\"],\n"  
-            "  \"keywords\": [\"关键词1\", \"关键词2\", \"关键词3\", \"关键词4\", \"关键词5\"]\n"
+            "  \"answer\": \"<简短的假设性回答，少于300字；若无相关信息可写空字符串>\",\n"
+            "  \"entities\": [\"实体1\", \"实体2\"],\n"
+            "  \"keywords\": [\"关键词1\", \"关键词2\"]\n"
             "}\n\n"
+            "说明：不要凭空编造具体数字或年份。如果推测，请将推测放在 answer 中并在句首标注[推测]。\n\n"
             f"问题：{question}\n"
         )
 
@@ -385,6 +648,7 @@ def search(question: str) -> Answer:
             source = result.get("_source", "hypothetical")
 
             if content:
+                context_index = len(contexts)
                 contexts.append(content)
                 retrieval_results.append({
                     "rank": rank_counter,
@@ -394,6 +658,7 @@ def search(question: str) -> Answer:
                     "source": source,
                     "content_preview": content[:300] + "..." if len(content) > 300 else content,
                     "content_length": len(content),
+                    "context_index": context_index,
                     "used_for_context": True,
                 })
                 rank_counter += 1
@@ -407,6 +672,7 @@ def search(question: str) -> Answer:
             source = result.get("_source", "question")
 
             if content:
+                context_index = len(contexts)
                 contexts.append(content)
                 retrieval_results.append({
                     "rank": rank_counter,
@@ -416,6 +682,7 @@ def search(question: str) -> Answer:
                     "source": source,
                     "content_preview": content[:300] + "..." if len(content) > 300 else content,
                     "content_length": len(content),
+                    "context_index": context_index,
                     "used_for_context": True,
                 })
                 rank_counter += 1
@@ -479,7 +746,8 @@ def search(question: str) -> Answer:
             if USE_LLM_RERANK:
                 # Strategy: LLM Rerank - Let LLM select the most relevant file and page
                 logger.info("Using LLM Rerank to select file and page")
-                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=TOP_K * 2)
+                llm_k = min(TOP_K * 2, RERANK_CANDIDATES_K) if RERANK_CANDIDATES_K > 0 else TOP_K * 2
+                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=llm_k)
                 
                 if llm_filename:
                     answer.filename = llm_filename
@@ -530,6 +798,36 @@ def search(question: str) -> Answer:
         # Save retrieval results to answer object
         answer.retrieval_results = retrieval_results
 
+        if USE_LLM_RERANK and answer.filename and not use_hybrid_strategy:
+            try:
+                selected_indices = [
+                    int(r.get("context_index"))
+                    for r in retrieval_results
+                    if r.get("used_for_context")
+                    and r.get("filename") == answer.filename
+                    and r.get("page") == answer.page
+                    and r.get("context_index") is not None
+                ]
+                selected_set = set(selected_indices)
+
+                if selected_indices:
+                    contexts = [
+                        contexts[i]
+                        for i in selected_indices
+                        if isinstance(i, int) and 0 <= i < len(contexts)
+                    ] + [c for i, c in enumerate(contexts) if i not in selected_set]
+
+                logger.info(
+                    "Reordered contexts: selected_first=%d total_contexts=%d",
+                    len(selected_indices),
+                    len(contexts),
+                )
+            except Exception as e:
+                logger.debug("Reordering contexts skipped: %s", e)
+
+        if CONTEXT_TOP_N > 0 and len(contexts) > CONTEXT_TOP_N:
+            contexts = contexts[:CONTEXT_TOP_N]
+        
         # Combine contexts
         context_text = "\n\n".join(contexts)
 
@@ -547,8 +845,8 @@ def search(question: str) -> Answer:
             },
             {"role": "user", "content": prompt},
         ]
-
-        answer.answer = generate_llm_response(messages, temperature=0.1)  # Use 0.3 for natural answer generation
+        # answer.answer = generate_llm_response(messages,model="qwen-max", temperature=0.3)
+        answer.answer = generate_llm_response(messages, temperature=0.3)  # Use 0.3 for natural answer generation
         logger.debug(
             f"Query completed: question='{question[:50]}...', filename='{answer.filename}', page={answer.page}"
         )
