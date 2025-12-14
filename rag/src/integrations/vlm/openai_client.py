@@ -34,6 +34,7 @@ def generate_response(
     images: Optional[Union[str, List[str]]] = None,
     model: str = "qwen3-vl-plus",
     retry_interval: float = 2.0,  # pause duration between retries
+    temperature: float = 0.1,
 ) -> str:
     """
     Query vision-language model with text and optional images.
