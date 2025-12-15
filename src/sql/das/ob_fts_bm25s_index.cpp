@@ -355,8 +355,8 @@ int ObFtsBM25SIndex::read_variable_bucket(int64_t bucket_id, common::ObIArray<Tm
   
   LOG_DEBUG("BM25S read_variable_bucket: reading bucket", K(bucket_id), K(file_size));
   
-  // 2. 分配读取缓冲区
-  char *buf = static_cast<char*>(allocator_.alloc(file_size));
+  // 2. 分配读取缓冲区（使用 ob_malloc，支持真正释放）
+  char *buf = static_cast<char*>(ob_malloc(file_size, "BM25SBucket"));
   if (OB_ISNULL(buf)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("BM25S read_variable_bucket: fail to alloc buffer", K(ret), K(file_size));
@@ -376,7 +376,7 @@ int ObFtsBM25SIndex::read_variable_bucket(int64_t bucket_id, common::ObIArray<Tm
   if (OB_FAIL(tmp_mgr->pread(MTL_ID(), io_info, 0 /*offset*/, handle))) {
     LOG_WARN("BM25S read_variable_bucket: fail to read tmp file", 
              K(ret), K(bucket_id), K(file_size));
-    allocator_.free(buf);
+    ob_free(buf);
     return ret;
   }
   
@@ -414,7 +414,7 @@ int ObFtsBM25SIndex::read_variable_bucket(int64_t bucket_id, common::ObIArray<Tm
   
   // 如果解析失败，释放 buf 并清空 records
   if (OB_FAIL(ret)) {
-    allocator_.free(buf);
+    ob_free(buf);
     records.reset();
   } else {
     // 成功时，buf 由调用方负责释放（通过 out_buf）
@@ -665,7 +665,7 @@ int ObFtsBM25SIndex::write_header_and_directory(const common::ObIOFd &fd)
   
   // 3. 准备 Bucket Directory（先写入空的，后面更新）
   int64_t dir_size = file_header_.bucket_num * sizeof(BucketDirectoryEntry);
-  char *dir_buf = static_cast<char*>(allocator_.alloc(dir_size));
+  char *dir_buf = static_cast<char*>(ob_malloc(dir_size, "BM25SDirBuf"));
   if (OB_ISNULL(dir_buf)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("BM25S write_header_and_directory: fail to alloc dir_buf", K(ret), K(dir_size));
@@ -676,11 +676,11 @@ int ObFtsBM25SIndex::write_header_and_directory(const common::ObIOFd &fd)
   if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(fd.second_id_, dir_buf, dir_size,
                                                   file_header_.bucket_dir_offset, write_size))) {
     LOG_WARN("BM25S write_header_and_directory: fail to write bucket directory", K(ret));
-    allocator_.free(dir_buf);
+    ob_free(dir_buf);
     return ret;
   }
   
-  allocator_.free(dir_buf);
+  ob_free(dir_buf);
   
   LOG_INFO("BM25S write_header_and_directory: completed", 
            K(file_header_.bucket_dir_offset), K(dir_size));
@@ -804,7 +804,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
     TokenDfMap bucket_df_map;
     if (OB_FAIL(bucket_df_map.create(1024, "BM25SBucketDf"))) {
       LOG_WARN("BM25S finalize_and_persist V2: fail to create bucket_df_map", K(ret), K(bucket_id));
-      if (bucket_buf != nullptr) allocator_.free(bucket_buf);
+      if (bucket_buf != nullptr) ob_free(bucket_buf);
       break;
     }
     
@@ -840,7 +840,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
     
     // 零拷贝优化：只需释放一个 bucket_buf，不需要逐个释放 token
     if (bucket_buf != nullptr) {
-      allocator_.free(bucket_buf);
+      ob_free(bucket_buf);
     }
     
     if ((bucket_id + 1) % 256 == 0) {
@@ -931,7 +931,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
         int tmp_ret = token_postings.get_refactored(rec.token, posting_list);
         if (OB_HASH_NOT_EXIST == tmp_ret) {
           // 新 token，创建 posting list
-          posting_list = static_cast<ObArray<TmpRecord>*>(allocator_.alloc(sizeof(ObArray<TmpRecord>)));
+          posting_list = static_cast<ObArray<TmpRecord>*>(ob_malloc(sizeof(ObArray<TmpRecord>), "BM25SPostList"));
           if (OB_NOT_NULL(posting_list)) {
             new (posting_list) ObArray<TmpRecord>();
             token_postings.set_refactored(rec.token, posting_list, 0);
@@ -974,7 +974,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
       // 写入 Vocab Bucket
       bucket_directory_[bucket_id].size = static_cast<int32_t>(bucket_size);
       
-      char *vocab_buf = static_cast<char*>(allocator_.alloc(bucket_size));
+      char *vocab_buf = static_cast<char*>(ob_malloc(bucket_size, "BM25SVocab"));
       if (OB_ISNULL(vocab_buf)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         break;
@@ -995,10 +995,10 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
       if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(
               fd.second_id_, vocab_buf, bucket_size, vocab_write_offset, write_size))) {
         LOG_WARN("BM25S finalize_and_persist V2: fail to write vocab bucket", K(ret), K(bucket_id));
-        allocator_.free(vocab_buf);
+        ob_free(vocab_buf);
         break;
       }
-      allocator_.free(vocab_buf);
+      ob_free(vocab_buf);
       
       // 写入 Posting Data
       for (int64_t j = 0; OB_SUCC(ret) && j < entries.count(); ++j) {
@@ -1015,7 +1015,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
         
         int64_t df = posting_list->count();
         int64_t posting_buf_size = df * 8;
-        char *posting_buf = static_cast<char*>(allocator_.alloc(posting_buf_size));
+        char *posting_buf = static_cast<char*>(ob_malloc(posting_buf_size, "BM25SPosting"));
         if (OB_ISNULL(posting_buf)) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
           break;
@@ -1033,13 +1033,13 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
         if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(
                 fd.second_id_, posting_buf, posting_buf_size, posting_write_offset, write_size))) {
           LOG_WARN("BM25S finalize_and_persist V2: fail to write posting", K(ret), K(bucket_id), K(j));
-          allocator_.free(posting_buf);
+          ob_free(posting_buf);
           break;
         }
         
         posting_write_offset += posting_buf_size;
         written_postings += df;
-        allocator_.free(posting_buf);
+        ob_free(posting_buf);
       }
       
       if (OB_SUCC(ret)) {
@@ -1054,7 +1054,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
       for (TokenPostingMap::iterator it = token_postings.begin(); it != token_postings.end(); ++it) {
         if (OB_NOT_NULL(it->second)) {
           it->second->~ObArray();
-          allocator_.free(it->second);
+          ob_free(it->second);
         }
       }
       token_postings.destroy();
@@ -1062,7 +1062,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
     
     // 零拷贝优化：只需释放一个 bucket_buf，不需要逐个释放 token
     if (bucket_buf != nullptr) {
-      allocator_.free(bucket_buf);
+      ob_free(bucket_buf);
     }
     
     if (OB_FAIL(ret)) {
@@ -1106,7 +1106,13 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
     } else if (OB_NOT_NULL(bucket_directory_)) {
       MEMCPY(saved_dir, bucket_directory_, dir_size);
       
-      // 11. 释放 ArenaAllocator 中的所有临时内存（关键！）
+      // 11. 释放 ArenaAllocator 中的所有临时内存
+      // 注意：主要内存(bucket_buf/vocab_buf/posting_buf)已改用 ob_malloc，在使用后即释放
+      // allocator_ 中只剩余 ObArray 指针等小分配
+      int64_t allocator_used = allocator_.total();
+      LOG_INFO("BM25S finalize_and_persist: allocator memory before reset (small allocations only)", 
+               K(allocator_used));
+      
       allocator_.reset();
       
       // 12. 恢复 bucket_directory_ 指针
