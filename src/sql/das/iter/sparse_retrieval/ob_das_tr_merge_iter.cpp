@@ -905,9 +905,20 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
     } else {
-      if (g_bm25s_index.is_ready() && query_tokens_.count() > 0) {
-        bm25s_skip_init_ = true;
-        return ret;
+      // BM25S 模式检查：先尝试加载索引，再决定是否跳过迭代器初始化
+      if (query_tokens_.count() > 0) {
+        if (!g_bm25s_index.is_ready()) {
+          // 重启后索引未加载，尝试从磁盘加载
+          int load_ret = g_bm25s_index.ensure_ready();
+          if (OB_SUCCESS != load_ret) {
+            LOG_WARN("BM25S index load failed in do_table_scan", K(load_ret));
+          }
+        }
+        if (g_bm25s_index.is_ready()) {
+          bm25s_skip_init_ = true;
+          LOG_DEBUG("BM25S mode: skip iterator init");
+          return ret;
+        }
       }
       
       if (function_lookup_mode_) {
@@ -1144,7 +1155,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
      int64_t actual = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
      LOG_INFO("usleep(620) actual delay", K(actual));
 
-    // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
+    // ========== TAAT 算法在存储层实现==========
     // 确保 scalar cache 已加载到内存
     if (!g_fts_scalar_cache.is_loaded()) {
       int load_ret = g_fts_scalar_cache.load_to_memory();
@@ -1360,7 +1371,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
   int ObDASTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   {
     int ret = OB_SUCCESS;
-    // BM25S 模式：使用 TAAT 算法
+    // BM25S 模式：使用 TAAT 算法（索引加载已在 do_table_scan 中完成）
     if (g_bm25s_index.is_ready() && query_tokens_.count() > 0) {
       return do_bm25s_search(count, capacity);
     }
@@ -1374,7 +1385,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     } else if (OB_UNLIKELY(0 == capacity)) {
       count = 0;
     } else {
-      ret = sparse_retrieval_iter_->get_next_rows(capacity, count);  // 注意参数顺序！
+      ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
     }
     return ret;
   }

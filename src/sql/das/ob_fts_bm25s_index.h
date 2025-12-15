@@ -312,13 +312,18 @@ public:
    * @brief 获取文件头信息（用于查询时访问元数据）
    */
   const BM25SIndexFileHeader& get_file_header() const { return file_header_; }
+  
+  /**
+   * @brief 确保索引就绪（从磁盘加载）
+   * @return OB_SUCCESS 如果索引已就绪或成功加载
+   */
+  int ensure_ready();
 
 private:
   ObFtsBM25SIndex();
   ~ObFtsBM25SIndex();
 
   int ensure_inited();
-  int ensure_ready();  // 确保索引就绪（从磁盘加载）
   double calc_bm25_score(int32_t tf, int32_t doc_len, int64_t df);
   
   // ========== TmpFile 接口（Phase 1）==========
