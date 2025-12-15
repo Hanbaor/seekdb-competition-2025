@@ -74,6 +74,9 @@ ob_set_subtarget(ob_sql das
   das/ob_fts_scalar_cache.cpp
   das/ob_fts_scalar_cache_init.cpp
   das/ob_fts_bm25s_index.cpp
+  das/ob_fts_column_value.cpp
+  das/ob_fts_generic_cache.cpp
+  das/ob_fts_generic_filter.cpp
   das/ob_group_scan_iter.cpp
   das/ob_das_dml_vec_iter.cpp
   das/ob_das_parallel_handler.cpp

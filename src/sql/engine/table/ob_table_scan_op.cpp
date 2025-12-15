@@ -32,6 +32,9 @@
  // BM25S 索引：预计算 BM25 得分
  #include "sql/das/ob_fts_bm25s_index.h"
 #include "sql/das/ob_das_fts_filter_ctx.h"
+// 新系统：通用 FTS 缓存和过滤
+#include "sql/das/ob_fts_generic_cache.h"
+#include "sql/das/ob_fts_generic_filter.h"
 #include "common/object/ob_object.h"  // for ObDocId
  
  namespace oceanbase
@@ -1700,38 +1703,44 @@
     bool is_fts_query = (attach_ctdef != nullptr);
     
     if (is_fts_query) {
-     g_fts_filter_ctx.reset();
+      // ========== 旧系统：重置过滤上下文 ==========
+      g_fts_filter_ctx.reset();
+      
+      // ========== 新系统：重置通用过滤上下文 ==========
+      g_fts_generic_filter_ctx.reset();
+      
       // Filter Extraction
-     const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
-     for (int64_t i = 0; i < filters.count(); ++i) {
-       ObExpr *expr = filters.at(i);
-       if (OB_ISNULL(expr)) continue;
-       
-       // id < N (LE/LT)
-       if (expr->type_ == T_OP_LE || expr->type_ == T_OP_LT) {
-         // 安全检查：参数个数为2，且参数1是常量
+      const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
+      for (int64_t i = 0; i < filters.count(); ++i) {
+        ObExpr *expr = filters.at(i);
+        if (OB_ISNULL(expr)) continue;
+        
+        // id < N (LE/LT)
+        if (expr->type_ == T_OP_LE || expr->type_ == T_OP_LT) {
+          // 安全检查：参数个数为2，且参数1是常量
           if (expr->arg_cnt_ == 2 && OB_NOT_NULL(expr->args_[1]) && expr->args_[1]->is_const_expr()) {
             // 类型检查：左值必须是整数（排除非 id 列），右值必须是整数
             if (ob_is_integer_type(expr->args_[0]->datum_meta_.type_) && 
                 ob_is_integer_type(expr->args_[1]->datum_meta_.type_)) {
-               ObDatum &datum = expr->args_[1]->locate_expr_datum(eval_ctx_);
-               int64_t val = datum.get_int();
-               g_fts_filter_ctx.id_limit_ = val;
-               g_fts_filter_ctx.has_id_filter_ = true;
-                LOG_INFO("FTS optimizer: id limit extracted", K(val));
+              ObDatum &datum = expr->args_[1]->locate_expr_datum(eval_ctx_);
+              int64_t val = datum.get_int();
+              // 旧系统：设置 id 过滤
+              g_fts_filter_ctx.id_limit_ = val;
+              g_fts_filter_ctx.has_id_filter_ = true;
+              LOG_INFO("FTS optimizer: id limit extracted", K(val));
             }
-         }
-       }
-       // base_id IN (...)
-       else if (expr->type_ == T_OP_IN) {
-         // 安全检查：参数大于1，且左值必须是字符串（排除非 base_id 列）
+          }
+        }
+        // base_id IN (...)
+        else if (expr->type_ == T_OP_IN) {
+          // 安全检查：参数大于1，且左值必须是字符串（排除非 base_id 列）
           if (expr->arg_cnt_ > 1 && OB_NOT_NULL(expr->args_[0]) && ob_is_string_type(expr->args_[0]->datum_meta_.type_)) {
-           for (int64_t k = 1; k < expr->arg_cnt_; ++k) {
+            for (int64_t k = 1; k < expr->arg_cnt_; ++k) {
               if (OB_ISNULL(expr->args_[k])) continue;
-             if (expr->args_[k]->type_ == T_OP_ROW) {
-               // Handle Row wrapper if present
-               ObExpr *row = expr->args_[k];
-               for (int64_t m = 0; m < row->arg_cnt_; ++m) {
+              if (expr->args_[k]->type_ == T_OP_ROW) {
+                // Handle Row wrapper if present
+                ObExpr *row = expr->args_[k];
+                for (int64_t m = 0; m < row->arg_cnt_; ++m) {
                   if (OB_NOT_NULL(row->args_[m]) && row->args_[m]->is_const_expr() && ob_is_string_type(row->args_[m]->datum_meta_.type_)) {
                     // 字符串常量需要先 eval 计算值
                     ObDatum *datum = nullptr;
@@ -1739,32 +1748,48 @@
                       LOG_INFO("FTS optimizer: add_base_id", K(datum->get_string()));
                       g_fts_filter_ctx.add_base_id(datum->get_string());
                     }
-                 }
-               }
-             } else if (expr->args_[k]->is_const_expr() && ob_is_string_type(expr->args_[k]->datum_meta_.type_)) {
+                  }
+                }
+              } else if (expr->args_[k]->is_const_expr() && ob_is_string_type(expr->args_[k]->datum_meta_.type_)) {
                 // 字符串常量需要先 eval 计算值
                 ObDatum *datum = nullptr;
                 if (OB_SUCCESS == expr->args_[k]->eval(eval_ctx_, datum) && OB_NOT_NULL(datum)) {
                   g_fts_filter_ctx.add_base_id(datum->get_string());
                 }
-             }
-           }
-           if (g_fts_filter_ctx.has_base_id_filter_) {
+              }
+            }
+            if (g_fts_filter_ctx.has_base_id_filter_) {
               LOG_INFO("FTS optimizer: base_id filter extracted", "base_id_count", g_fts_filter_ctx.base_id_count());
-           }
-         }
+            }
+          }
         }
+      }
+      
+      // ========== 新系统：从过滤表达式自动提取条件 ==========
+      // 仅当新系统缓存已初始化时才提取条件（需要缓存元数据来匹配列）
+      if (g_fts_generic_cache.is_inited()) {
+        int extract_ret = g_fts_generic_filter_ctx.extract_from_filters(
+            filters, MY_SPEC.output_, g_fts_generic_cache, eval_ctx_);
+        if (OB_SUCCESS == extract_ret) {
+          LOG_INFO("[FTS_NEW_SYSTEM] filter extraction SUCCESS",
+                   "condition_count", g_fts_generic_filter_ctx.condition_count());
+        } else {
+          LOG_INFO("[FTS_NEW_SYSTEM] filter extraction FAILED, fallback to old system",
+                   K(extract_ret));
+        }
+      } else {
+        LOG_INFO("[FTS_NEW_SYSTEM] cache not inited, filter extraction SKIPPED (will use old system)");
       }
       
       // 仅在提取到过滤条件时打印
       if (g_fts_filter_ctx.has_id_filter_ || g_fts_filter_ctx.has_base_id_filter_) {
-        LOG_INFO("FTS filter context set",
+        LOG_INFO("FTS filter context set (OLD SYSTEM)",
                  "has_id_filter", g_fts_filter_ctx.has_id_filter_,
                  "id_limit", g_fts_filter_ctx.id_limit_,
                  "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
                  "base_id_count", g_fts_filter_ctx.base_id_count());
-       }
-     }
+      }
+    }
 
      if (MY_CTDEF.get_query_range_provider().is_fast_nlj_range()) {
        int64_t column_count = MY_CTDEF.get_query_range_provider().get_column_count();
@@ -4130,18 +4155,68 @@
    int ret = OB_SUCCESS;
    bool has_segment_word = false;
    
-   // ========== FTS Scalar Cache: 初始化 HashMap（仅一次）==========
+   // ========== FTS 缓存初始化：同时支持新旧两套系统 ==========
    // 状态变量
    static bool fts_cache_initialized = false;
+   static bool fts_generic_cache_initialized = false;
    static int64_t fts_cache_fill_count = 0;
    static int64_t fts_row_process_count = 0;  // 处理的行数
+   
+   // 旧系统：初始化 Scalar Cache
    if (!fts_cache_initialized) {
      int init_ret = g_fts_scalar_cache.init(200000);  // 使用默认容量，需要时自动扩容
      if (OB_SUCCESS == init_ret || OB_INIT_TWICE == init_ret) {
        fts_cache_initialized = true;
-       LOG_INFO("FTS Scalar Cache: initialized in fetch_next_fts_index_rows");
+       LOG_INFO("[FTS_OLD_SYSTEM] Scalar Cache initialized");
      } else {
-       LOG_WARN("FTS Scalar Cache: Failed to initialize HashMap", K(init_ret));
+       LOG_WARN("[FTS_OLD_SYSTEM] Scalar Cache init FAILED", K(init_ret));
+     }
+   }
+   
+   // 新系统：初始化 Generic Cache（根据表结构动态配置列）
+   if (!fts_generic_cache_initialized) {
+     // 分析 MY_SPEC.output_ 获取需要缓存的列元数据
+     common::ObArray<ObFtsColumnMeta> column_metas;
+     int64_t type_orders[64] = {0};  // 每种类型的计数器
+     
+     for (int64_t i = 0; i < MY_SPEC.output_.count(); ++i) {
+       ObExpr *expr = MY_SPEC.output_.at(i);
+       if (OB_ISNULL(expr)) continue;
+       
+       // 跳过 FTS 生成列
+       if (expr->type_ == T_FUN_SYS_DOC_ID || 
+           expr->type_ == T_FUN_SYS_WORD_SEGMENT ||
+           expr->type_ == T_FUN_SYS_WORD_COUNT ||
+           expr->type_ == T_FUN_SYS_DOC_LENGTH) {
+         continue;
+       }
+       
+       // 只缓存普通列引用（整数和字符串类型）
+       if (expr->type_ == T_REF_COLUMN) {
+         common::ObObjType obj_type = expr->datum_meta_.type_;
+         // 支持整数和字符串类型
+         if (ob_is_integer_type(obj_type) || ob_is_string_type(obj_type)) {
+           ObFtsColumnMeta meta;
+           meta.output_idx_ = i;
+           meta.obj_type_ = obj_type;
+           meta.type_order_ = type_orders[static_cast<int>(obj_type)]++;
+           meta.compute_signature();
+           column_metas.push_back(meta);
+         }
+       }
+     }
+     
+     if (column_metas.count() > 0) {
+       int init_ret = g_fts_generic_cache.init(column_metas, 200000);
+       if (OB_SUCCESS == init_ret || OB_INIT_TWICE == init_ret) {
+         fts_generic_cache_initialized = true;
+         LOG_INFO("[FTS_NEW_SYSTEM] Generic Cache initialized",
+                  "column_count", column_metas.count());
+       } else {
+         LOG_WARN("[FTS_NEW_SYSTEM] Generic Cache init FAILED", K(init_ret));
+       }
+     } else {
+       LOG_INFO("[FTS_NEW_SYSTEM] No cacheable columns found, Generic Cache SKIPPED");
      }
    }
    // ==========================================================
@@ -4232,108 +4307,119 @@
            }
          }
        }
-       // ========== FTS Scalar Cache: 填充 HashMap ==========
+       // ========== FTS 缓存填充：同时写入新旧两套系统 ==========
        // 此时已经读取了主表的一行数据，可以访问所有列
-       // 从 MY_SPEC.output_ 中获取标量字段
        ++fts_row_process_count;  // 记录处理的行数
+       
+       // 从 doc_id_datum 获取 doc_id
+       uint64_t doc_id_val = 0;
+       if (!doc_id_datum->is_null()) {
+         doc_id_val = doc_id_datum->get_uint64();
+       }
+       
+       // ========== 旧系统：填充 Scalar Cache ==========
        if (fts_cache_initialized && g_fts_scalar_cache.is_inited()) {
-         uint64_t doc_id_val = 0;  // 系统生成的 doc_id
          uint64_t id_val = 0;      // 主表的 id 字段
          ObString base_id_val;
          ObString docid_col_val;
          
-        // 直接获取 doc_id 的 uint64 值
-        if (!doc_id_datum->is_null()) {
-          doc_id_val = doc_id_datum->get_uint64();
-        }
+         // 从输出列中查找并获取标量字段
+         const ExprFixedArray &output_exprs = MY_SPEC.output_;
          
-        // 从输出列中查找并获取标量字段
-        const ExprFixedArray &output_exprs = MY_SPEC.output_;
-        
-        // 遍历 MY_SPEC.output_ 找到标量列（跳过 FTS 生成列）
-        // 关键逻辑：我们添加的列顺序是 id, base_id, docid_col
-        // 只有在找到 id 列之后的 varchar 列才是 base_id 和 docid_col
-        int64_t varchar_col_after_id = 0;
-        bool id_found = false;
-        
-        for (int64_t i = 0; i < output_exprs.count() && doc_id_val > 0; ++i) {
-          ObExpr *expr = output_exprs.at(i);
-          if (OB_ISNULL(expr)) continue;
-          
-          // 跳过 FTS 生成列（doc_id, word_segment, word_count, doc_length）
-          if (expr->type_ == T_FUN_SYS_DOC_ID || 
-              expr->type_ == T_FUN_SYS_WORD_SEGMENT ||
-              expr->type_ == T_FUN_SYS_WORD_COUNT ||
-              expr->type_ == T_FUN_SYS_DOC_LENGTH) {
-            continue;
-          }
-          
-          // 尝试获取列值
-          ObDatum *col_datum = nullptr;
-          int eval_ret = expr->eval(eval_ctx_, col_datum);
-          
-          if (OB_SUCCESS == eval_ret && OB_NOT_NULL(col_datum) && !col_datum->is_null()) {
-            ObObjType dtype = expr->datum_meta_.type_;
-            
-            if ((dtype == ObIntType || dtype == ObUInt64Type) && !id_found) {
-              // 整数类型 → id 列（我们添加的第一个列）
-              id_val = col_datum->get_uint64();
-              id_found = true;
-              if (fts_cache_fill_count < 1) {
-                LOG_INFO("FTS Scalar Cache: Found id column", K(i), K(dtype), K(id_val));
-              }
-            } else if (dtype == ObVarcharType && id_found) {
-              // 只有在找到 id 之后的 varchar 列才可能是 base_id 或 docid_col
-              ObString str_val = col_datum->get_string();
-              
-              // 通过内容前缀判断列类型（针对当前测试场景的特定逻辑）
-              if (str_val.prefix_match("base_id_")) {
-                base_id_val = str_val;
-                if (fts_cache_fill_count < 1) {
-                  LOG_INFO("FTS Scalar Cache: Found base_id column by content", K(i), K(str_val));
-                }
-              } else if (str_val.prefix_match("doc-")) {
-                docid_col_val = str_val;
-                if (fts_cache_fill_count < 1) {
-                  LOG_INFO("FTS Scalar Cache: Found docid_col column by content", K(i), K(str_val));
-                }
-              } else {
-                 // 以前的逻辑作为 fallback：如果内容不匹配，再按顺序猜？
-                 // 暂时只依赖内容匹配，因为测试数据特征很明显
-                 if (fts_cache_fill_count < 1) {
-                   LOG_INFO("FTS Scalar Cache: Ignored varchar column", K(i), K(str_val));
-                 }
-              }
-            }
-            // 如果是 id 之前的 varchar 列（如 fulltext 内容列），直接跳过不处理
-          }
-        }
+         // 遍历 MY_SPEC.output_ 找到标量列（跳过 FTS 生成列）
+         int64_t varchar_col_after_id = 0;
+         bool id_found = false;
+         
+         for (int64_t i = 0; i < output_exprs.count() && doc_id_val > 0; ++i) {
+           ObExpr *expr = output_exprs.at(i);
+           if (OB_ISNULL(expr)) continue;
+           
+           // 跳过 FTS 生成列（doc_id, word_segment, word_count, doc_length）
+           if (expr->type_ == T_FUN_SYS_DOC_ID || 
+               expr->type_ == T_FUN_SYS_WORD_SEGMENT ||
+               expr->type_ == T_FUN_SYS_WORD_COUNT ||
+               expr->type_ == T_FUN_SYS_DOC_LENGTH) {
+             continue;
+           }
+           
+           // 尝试获取列值
+           ObDatum *col_datum = nullptr;
+           int eval_ret = expr->eval(eval_ctx_, col_datum);
+           
+           if (OB_SUCCESS == eval_ret && OB_NOT_NULL(col_datum) && !col_datum->is_null()) {
+             ObObjType dtype = expr->datum_meta_.type_;
+             
+             if ((dtype == ObIntType || dtype == ObUInt64Type) && !id_found) {
+               // 整数类型 → id 列
+               id_val = col_datum->get_uint64();
+               id_found = true;
+             } else if (dtype == ObVarcharType && id_found) {
+               // 只有在找到 id 之后的 varchar 列才可能是 base_id 或 docid_col
+               ObString str_val = col_datum->get_string();
+               
+               // 通过内容前缀判断列类型
+               if (str_val.prefix_match("base_id_")) {
+                 base_id_val = str_val;
+               } else if (str_val.prefix_match("doc-")) {
+                 docid_col_val = str_val;
+               }
+             }
+           }
+         }
 
-        doc_id_val = id_val;
- 
-        // 添加到 HashMap：用 doc_id_val 作为 key
-        if (doc_id_val > 0 && id_found) {
-          int cache_ret = g_fts_scalar_cache.add_mapping(doc_id_val, id_val, base_id_val, docid_col_val);
-          if (OB_SUCCESS == cache_ret) {
-            ++fts_cache_fill_count;
-            // 每 1000 条输出一次日志，减少日志量
-            if (fts_cache_fill_count % 1000 == 0 || fts_cache_fill_count <= 5) {
-              // 打印 doc_id_val 和 id_val 来验证它们是否相等
-              //LOG_ERROR("FTS Scalar Cache: Filling progress",
-                       //K(fts_cache_fill_count),
-                       //"cache_size", g_fts_scalar_cache.size(),
-                       //K(doc_id_val), K(id_val), 
-                       //"doc_id_equals_id", (doc_id_val == id_val),
-                       //K(base_id_val), K(docid_col_val));
-            }
-          } else if (OB_HASH_EXIST == cache_ret) {
-            // doc_id 已存在，跳过（同一文档会被多次处理，因为每个分词生成一行）
-          } else {
-            LOG_WARN("FTS Scalar Cache: Failed to add mapping", K(cache_ret), K(doc_id_val));
-          }
-        }
+         uint64_t cache_doc_id = id_val;  // 使用 id 作为 doc_id
+  
+         // 添加到 HashMap
+         if (cache_doc_id > 0 && id_found) {
+           int cache_ret = g_fts_scalar_cache.add_mapping(cache_doc_id, id_val, base_id_val, docid_col_val);
+           if (OB_SUCCESS == cache_ret) {
+             ++fts_cache_fill_count;
+           } else if (OB_HASH_EXIST != cache_ret) {
+             LOG_WARN("[FTS_OLD_SYSTEM] Failed to add mapping", K(cache_ret), K(cache_doc_id));
+           }
+         }
        }
-       // ========== FTS Scalar Cache: 填充结束 ==========
+       
+       // ========== 新系统：填充 Generic Cache ==========
+       if (fts_generic_cache_initialized && g_fts_generic_cache.is_inited()) {
+         // 使用 id 列的值作为 doc_id（与旧系统保持一致）
+         // 先找到 id 列的值
+         uint64_t id_for_cache = 0;
+         const ExprFixedArray &output_exprs = MY_SPEC.output_;
+         
+         for (int64_t i = 0; i < output_exprs.count(); ++i) {
+           ObExpr *expr = output_exprs.at(i);
+           if (OB_ISNULL(expr)) continue;
+           
+           // 跳过 FTS 生成列
+           if (expr->type_ == T_FUN_SYS_DOC_ID || 
+               expr->type_ == T_FUN_SYS_WORD_SEGMENT ||
+               expr->type_ == T_FUN_SYS_WORD_COUNT ||
+               expr->type_ == T_FUN_SYS_DOC_LENGTH) {
+             continue;
+           }
+           
+           // 找到第一个整数列作为 id
+           if (expr->type_ == T_REF_COLUMN && ob_is_integer_type(expr->datum_meta_.type_)) {
+             ObDatum *col_datum = nullptr;
+             if (OB_SUCCESS == expr->eval(eval_ctx_, col_datum) && 
+                 OB_NOT_NULL(col_datum) && !col_datum->is_null()) {
+               id_for_cache = col_datum->get_uint64();
+               break;
+             }
+           }
+         }
+         
+         if (id_for_cache > 0) {
+           // 使用 add_row_from_exprs 自动从表达式填充所有缓存列
+           int cache_ret = g_fts_generic_cache.add_row_from_exprs(
+               id_for_cache, MY_SPEC.output_, eval_ctx_);
+           if (OB_SUCCESS != cache_ret && OB_HASH_EXIST != cache_ret) {
+             LOG_WARN("[FTS_NEW_SYSTEM] Failed to add row", K(cache_ret), K(id_for_cache));
+           }
+         }
+       }
+       // ========== FTS 缓存填充：结束 ==========
        
        ObString ft = ft_datum->get_string();
        ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());

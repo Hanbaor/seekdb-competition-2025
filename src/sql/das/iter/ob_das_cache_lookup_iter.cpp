@@ -22,6 +22,8 @@
 #include "sql/das/ob_fts_bm25s_index.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
 #include "storage/concurrency_control/ob_data_validation_service.h"
+// 新系统：通用 FTS 缓存
+#include "sql/das/ob_fts_generic_cache.h"
 
 namespace oceanbase
 {
@@ -369,15 +371,40 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         }
 
         // 收集完毕后，统一检查缓存命中
+        // ========== 优先使用新系统 ==========
         bool will_cache_hit = false;
-        if (OB_SUCC(ret) && lookup_rowkey_cnt_ > 0 && g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0) {
-          will_cache_hit = true;
-          for (int64_t i = 0; i < cached_doc_ids_.count(); ++i) {
-            uint64_t doc_id = cached_doc_ids_.at(i);
-            ScalarFields tmp_fields;
-            if (OB_SUCCESS != g_fts_scalar_cache.get_scalar_fields(doc_id, tmp_fields)) {
-              will_cache_hit = false;
-              break;
+        const bool use_new_cache = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
+        const bool use_old_cache = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+        
+        if (OB_SUCC(ret) && lookup_rowkey_cnt_ > 0) {
+          if (use_new_cache) {
+            // 新系统：使用 Generic Cache
+            will_cache_hit = true;
+            for (int64_t i = 0; i < cached_doc_ids_.count(); ++i) {
+              uint64_t doc_id = cached_doc_ids_.at(i);
+              if (doc_id == 0 || doc_id > static_cast<uint64_t>(g_fts_generic_cache.size())) {
+                will_cache_hit = false;
+                break;
+              }
+            }
+            if (will_cache_hit) {
+              LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache)", 
+                       "doc_count", cached_doc_ids_.count());
+            }
+          } else if (use_old_cache) {
+            // 旧系统：使用 Scalar Cache
+            will_cache_hit = true;
+            for (int64_t i = 0; i < cached_doc_ids_.count(); ++i) {
+              uint64_t doc_id = cached_doc_ids_.at(i);
+              ScalarFields tmp_fields;
+              if (OB_SUCCESS != g_fts_scalar_cache.get_scalar_fields(doc_id, tmp_fields)) {
+                will_cache_hit = false;
+                break;
+              }
+            }
+            if (will_cache_hit) {
+              LOG_INFO("[FTS_LOOKUP] Using OLD system (Scalar Cache)",
+                       "doc_count", cached_doc_ids_.count());
             }
           }
           // 标记已通过缓存验证，OUTPUT_ROWS 阶段无需再检查
@@ -413,8 +440,12 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         
         const ObDASScanCtDef *lookup_ctdef = static_cast<const ObDASScanCtDef*>(lookup_ctdef_);
         int64_t total_doc_ids = cached_doc_ids_.count();
-        const bool cache_inited = g_fts_scalar_cache.is_inited();
-        const int64_t cache_size = g_fts_scalar_cache.size();
+        
+        // ========== 检测使用哪套缓存系统 ==========
+        const bool new_cache_available = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
+        const bool old_cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+        const bool cache_inited = new_cache_available || old_cache_available;
+        const int64_t cache_size = new_cache_available ? g_fts_generic_cache.size() : g_fts_scalar_cache.size();
         const bool cache_available = cache_inited && cache_size > 0;
         const int64_t output_col_count = OB_NOT_NULL(lookup_ctdef) ? lookup_ctdef->result_output_.count() : 0;
         const ObDASIterType iter_type = data_table_iter_->get_type();
@@ -448,48 +479,115 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
           
           // 一次遍历：填充数据（如果 cache_verified_ 为 true，跳过检查）
           all_cache_hit = true;
-          for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
-            uint64_t doc_id = cached_doc_ids_.at(i);
-            ScalarFields fields;
+          
+          // ========== 优先使用新系统获取数据 ==========
+          if (new_cache_available) {
+            // 新系统：使用 Generic Cache
+            LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system for data retrieval",
+                     K(cache_fill_count), K(output_col_count));
             
-            // 获取缓存数据（如果未预验证，需要检查返回值）
-            int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
-            if (!cache_verified_ && OB_SUCCESS != cache_ret) {
-              all_cache_hit = false;
-              break;  // 缓存未命中，退回正常流程
-            }
-            
-            // 填充数据到 datum 数组
-            int string_col_index = 0;
-            for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
-              if (OB_ISNULL(col_datums[j])) continue;
+            for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
+              uint64_t doc_id = cached_doc_ids_.at(i);
               
-              ObDatum &datum = col_datums[j][i];
-              ObObjType col_type = static_cast<ObObjType>(col_types[j]);
+              // 检查 doc_id 是否有效
+              if (!cache_verified_ && (doc_id == 0 || doc_id > static_cast<uint64_t>(g_fts_generic_cache.size()))) {
+                all_cache_hit = false;
+                break;
+              }
               
-              if (col_type == ObIntType || col_type == ObUInt64Type) {
-                datum.set_uint(fields.id_);
-              } else if (ob_is_string_type(col_type)) {
-                ObString src;
-                if (string_col_index == 0) {
-                  src = fields.base_id_;
-                } else if (string_col_index == 1) {
-                  src = fields.docid_col_;
-                }
+              // 填充数据到 datum 数组
+              // 新系统使用类型签名匹配列
+              int64_t int_col_order = 0;
+              int64_t str_col_order = 0;
+              
+              for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
+                if (OB_ISNULL(col_datums[j])) continue;
                 
-                if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
-                  char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
-                  if (OB_ISNULL(buf)) {
-                    ret = OB_ALLOCATE_MEMORY_FAILED;
-                    LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
+                ObDatum &datum = col_datums[j][i];
+                ObObjType col_type = static_cast<ObObjType>(col_types[j]);
+                
+                if (ob_is_integer_type(col_type)) {
+                  // 整数类型：根据类型序号查找
+                  int64_t cache_col_idx = g_fts_generic_cache.find_column_by_type(col_type, int_col_order);
+                  if (cache_col_idx >= 0) {
+                    int64_t val = g_fts_generic_cache.get_int_column_fast(doc_id, cache_col_idx);
+                    datum.set_uint(static_cast<uint64_t>(val));
                   } else {
-                    MEMCPY(buf, src.ptr(), src.length());
-                    datum.set_string(buf, src.length());
+                    datum.set_uint(doc_id);  // fallback: 使用 doc_id
                   }
-                } else {
-                  datum.set_string(nullptr, 0);
+                  int_col_order++;
+                } else if (ob_is_string_type(col_type)) {
+                  // 字符串类型：根据类型序号查找
+                  int64_t cache_col_idx = g_fts_generic_cache.find_column_by_type(ObVarcharType, str_col_order);
+                  if (cache_col_idx >= 0) {
+                    ObString src = g_fts_generic_cache.get_string_column_fast(doc_id, cache_col_idx);
+                    if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
+                      char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
+                      if (OB_ISNULL(buf)) {
+                        ret = OB_ALLOCATE_MEMORY_FAILED;
+                        LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
+                      } else {
+                        MEMCPY(buf, src.ptr(), src.length());
+                        datum.set_string(buf, src.length());
+                      }
+                    } else {
+                      datum.set_string(nullptr, 0);
+                    }
+                  } else {
+                    datum.set_string(nullptr, 0);
+                  }
+                  str_col_order++;
                 }
-                string_col_index++;
+              }
+            }
+          } else {
+            // 旧系统：使用 Scalar Cache
+            LOG_INFO("[FTS_LOOKUP_OUTPUT] Using OLD system for data retrieval",
+                     K(cache_fill_count), K(output_col_count));
+            
+            for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
+              uint64_t doc_id = cached_doc_ids_.at(i);
+              ScalarFields fields;
+              
+              // 获取缓存数据（如果未预验证，需要检查返回值）
+              int cache_ret = g_fts_scalar_cache.get_scalar_fields(doc_id, fields);
+              if (!cache_verified_ && OB_SUCCESS != cache_ret) {
+                all_cache_hit = false;
+                break;  // 缓存未命中，退回正常流程
+              }
+              
+              // 填充数据到 datum 数组
+              int string_col_index = 0;
+              for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
+                if (OB_ISNULL(col_datums[j])) continue;
+                
+                ObDatum &datum = col_datums[j][i];
+                ObObjType col_type = static_cast<ObObjType>(col_types[j]);
+                
+                if (col_type == ObIntType || col_type == ObUInt64Type) {
+                  datum.set_uint(fields.id_);
+                } else if (ob_is_string_type(col_type)) {
+                  ObString src;
+                  if (string_col_index == 0) {
+                    src = fields.base_id_;
+                  } else if (string_col_index == 1) {
+                    src = fields.docid_col_;
+                  }
+                  
+                  if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
+                    char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
+                    if (OB_ISNULL(buf)) {
+                      ret = OB_ALLOCATE_MEMORY_FAILED;
+                      LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
+                    } else {
+                      MEMCPY(buf, src.ptr(), src.length());
+                      datum.set_string(buf, src.length());
+                    }
+                  } else {
+                    datum.set_string(nullptr, 0);
+                  }
+                  string_col_index++;
+                }
               }
             }
           }

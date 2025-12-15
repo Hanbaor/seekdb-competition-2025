@@ -23,6 +23,9 @@
 #include "sql/das/ob_das_fts_filter_ctx.h"
 #include "sql/das/ob_fts_scalar_cache.h"
 #include "sql/das/ob_fts_bm25s_cache.h"
+// 新系统：通用 FTS 缓存和过滤
+#include "sql/das/ob_fts_generic_cache.h"
+#include "sql/das/ob_fts_generic_filter.h"
 #include <unistd.h>  // for usleep
 #include <sys/time.h>  // for gettimeofday
 
@@ -1145,8 +1148,24 @@ ObDASTRMergeIter::ObDASTRMergeIter()
      LOG_INFO("usleep(620) actual delay", K(actual));*/
 
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
-    // 确保 scalar cache 已加载到内存
-    if (!g_fts_scalar_cache.is_loaded()) {
+    
+    // ========== 检测使用哪套系统 ==========
+    const bool use_new_system = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
+    const bool use_old_system = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+    
+    if (use_new_system) {
+      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache + Filter)",
+               "cache_size", g_fts_generic_cache.size(),
+               "filter_count", g_fts_generic_filter_ctx.condition_count());
+    } else if (use_old_system) {
+      LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
+               "cache_size", g_fts_scalar_cache.size());
+    } else {
+      LOG_INFO("[FTS_FILTER] No cache available, filtering DISABLED");
+    }
+    
+    // 确保缓存已加载（旧系统兼容）
+    if (use_old_system && !g_fts_scalar_cache.is_loaded()) {
       int load_ret = g_fts_scalar_cache.load_to_memory();
       if (OB_SUCCESS != load_ret) {
         LOG_WARN("failed to load scalar cache to memory", K(load_ret));
@@ -1163,20 +1182,28 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     int64_t required_capacity;
     
     // 验证过滤上下文是否正确传递（从 ob_table_scan_op.cpp）
-    LOG_INFO("FTS filter context in do_bm25s_search", 
-             "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
-             "id_limit", g_fts_filter_ctx.id_limit_,
-             "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
-             "base_id_count", g_fts_filter_ctx.base_id_count(),
-             "base_id_list-1", g_fts_filter_ctx.base_id_count() > 0 ? g_fts_filter_ctx.base_id_list_.at(0) : common::ObString(),
-             "base_id_list-2", g_fts_filter_ctx.base_id_count() > 1 ? g_fts_filter_ctx.base_id_list_.at(1) : common::ObString(),
-             "base_id_list-3", g_fts_filter_ctx.base_id_count() > 2 ? g_fts_filter_ctx.base_id_list_.at(2) : common::ObString());
+    if (use_new_system) {
+      LOG_INFO("[FTS_NEW_SYSTEM] filter context in do_bm25s_search",
+               "condition_count", g_fts_generic_filter_ctx.condition_count(),
+               "has_limit", g_fts_generic_filter_ctx.has_limit(),
+               "limit_count", g_fts_generic_filter_ctx.get_limit());
+    } else {
+      LOG_INFO("[FTS_OLD_SYSTEM] filter context in do_bm25s_search", 
+               "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
+               "id_limit", g_fts_filter_ctx.id_limit_,
+               "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
+               "base_id_count", g_fts_filter_ctx.base_id_count());
+    }
 
     if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
       // 有 id 过滤，用 id_limit 作为容量（更省内存）
       required_capacity = g_fts_filter_ctx.id_limit_;
+    } else if (use_new_system) {
+      // 新系统：用 generic cache 容量
+      required_capacity = g_fts_generic_cache.capacity();
+      if (required_capacity <= 0) required_capacity = 2000;
     } else {
-      // 无 id 过滤，用 scalar cache 容量
+      // 旧系统：用 scalar cache 容量
       required_capacity = g_fts_scalar_cache.capacity();
       if (required_capacity <= 0) required_capacity = 2000;
     }
@@ -1202,10 +1229,17 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // ========== 诊断日志：检查索引状态（KVCache 模式）==========
     // 注意：get_posting_from_cache() 内部会自动调用 ensure_ready() 确保索引就绪
-    LOG_INFO("BM25S search: starting (KVCache mode)",
-             "query_tokens_count", query_tokens_.count(),
-             K(id_limit),
-             "scalar_cache_size", g_fts_scalar_cache.size());
+    if (use_new_system) {
+      LOG_INFO("BM25S search: starting (KVCache mode, NEW SYSTEM)",
+               "query_tokens_count", query_tokens_.count(),
+               K(id_limit),
+               "generic_cache_size", g_fts_generic_cache.size());
+    } else {
+      LOG_INFO("BM25S search: starting (KVCache mode, OLD SYSTEM)",
+               "query_tokens_count", query_tokens_.count(),
+               K(id_limit),
+               "scalar_cache_size", g_fts_scalar_cache.size());
+    }
     
     // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
     int64_t tokens_found = 0, tokens_not_found = 0;
@@ -1239,15 +1273,27 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       for (int64_t i = 0; i < valid_count; i++) {
         uint32_t doc_id = posting->get_doc_id(i);
         
-        // 高效检查 base_id：直接数组访问，O(1) 无 hash 开销
-        // 注意：如果 scalar_cache 为空，跳过 base_id 过滤（允许所有文档通过）
-        if (g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
-          const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
-          if (!g_fts_filter_ctx.check_base_id(base_id)) {
-            filtered_by_base_id++;
-            continue; // base_id 不匹配，跳过
+        // ========== 过滤检查：优先使用新系统 ==========
+        bool pass_filter = true;
+        
+        if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
+          // 新系统：使用 Generic Filter 进行所有条件检查
+          pass_filter = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
+          if (!pass_filter) {
+            filtered_by_base_id++;  // 复用计数器
+            continue;
+          }
+        } else if (use_old_system) {
+          // 旧系统：使用 Scalar Cache + FilterCtx
+          if (g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
+            const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
+            if (!g_fts_filter_ctx.check_base_id(base_id)) {
+              filtered_by_base_id++;
+              continue; // base_id 不匹配，跳过
+            }
           }
         }
+        // 如果两个系统都不可用，跳过过滤（允许所有文档通过）
         
         float score = posting->get_score(i);
         
