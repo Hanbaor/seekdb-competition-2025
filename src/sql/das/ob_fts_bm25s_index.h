@@ -61,7 +61,7 @@ void bm25s_log(const char* fmt, ...);
 struct BM25SIndexFileHeader {
   // Magic & Version (16 bytes)
   uint64_t magic;              // 0x424D32355349445A ("BM25SIDZ")
-  int32_t version;             // 版本号，当前为 1
+  int32_t version;             // 版本号，V2 设计为 2
   int32_t flags;               // 预留标志位
   
   // 统计信息 (32 bytes)
@@ -81,7 +81,7 @@ struct BM25SIndexFileHeader {
   int64_t reserved2;
   
   // 配置参数 (16 bytes)
-  int32_t bucket_num;          // 桶数量（默认 4096）
+  int32_t bucket_num;          // 桶数量（V2 默认 1024）
   int32_t reserved3;
   int64_t reserved4;
   
@@ -94,12 +94,12 @@ struct BM25SIndexFileHeader {
   
   // 常量
   static const uint64_t MAGIC = 0x424D32355349445A;  // "BM25SIDZ"
-  static const int32_t CURRENT_VERSION = 1;
+  static const int32_t CURRENT_VERSION = 2;  // V2 设计
   static const int64_t HEADER_SIZE = 256;
-  static const int32_t DEFAULT_BUCKET_NUM = 4096;
+  static const int32_t DEFAULT_BUCKET_NUM = 1024;  // V2: 统一 1024 个桶
   
   void reset() { memset(this, 0, sizeof(*this)); }
-  bool is_valid() const { return magic == MAGIC && version == CURRENT_VERSION; }
+  bool is_valid() const { return magic == MAGIC && version == CURRENT_VERSION; }  // 只支持 V2
   
   TO_STRING_KV(K(magic), K(version), K(total_docs), K(avg_doc_len), K(vocab_size), 
                K(total_postings), K(bucket_dir_offset), K(vocab_buckets_offset), 
@@ -121,45 +121,34 @@ struct BucketDirectoryEntry {
 
 /**
  * @brief Vocab Entry 内存结构（用于写入）
+ * V2 设计：移除了 token_id 字段
  */
 struct VocabEntryMem {
   uint64_t token_hash;
   common::ObString token;
-  uint32_t token_id;
   int64_t posting_offset;
   int32_t posting_count;
   
-  TO_STRING_KV(K(token_hash), K(token), K(token_id), K(posting_offset), K(posting_count));
+  TO_STRING_KV(K(token_hash), K(token), K(posting_offset), K(posting_count));
 };
 
 /**
- * @brief BM25S 预计算索引
+ * @brief BM25S 预计算索引 (V2 设计)
  * 
- * 两阶段构建：
- * 1. 收集阶段：DDL 时收集 (token, doc_id, tf, doc_len) 到 HashMap
- * 2. Finalize 阶段：DDL 完成后计算 BM25 得分，构建 CSC 格式
+ * 三阶段构建：
+ * 1. 收集阶段：DDL 时收集 (token, doc_id, tf, doc_len) 到 TmpFile 分桶
+ * 2. Finalize 阶段：计算 BM25 得分，直接写入磁盘文件（不构建内存索引）
+ * 3. 查询阶段：从磁盘文件按需加载，通过 KVCache 缓存热点数据
  * 
- * CSC 格式：
- * - scores_[]: 预计算的 BM25 得分
- * - doc_ids_[]: 文档 ID（每个 token 内有序）
- * - token_ptr_[]: 每个 token 的起止位置
+ * 磁盘文件格式：
+ * - Header (256 bytes)
+ * - Bucket Directory (16KB)
+ * - Vocab Buckets (变长)
+ * - Posting Data (doc_ids + scores)
  */
 class ObFtsBM25SIndex
 {
 public:
-  // ========== 收集阶段的原始数据 ==========
-  struct RawEntry
-  {
-    int64_t doc_id;
-    int32_t tf;        // 词频
-    int32_t doc_len;   // 文档长度
-    
-    RawEntry() : doc_id(0), tf(0), doc_len(0) {}
-    RawEntry(int64_t d, int32_t t, int32_t l) : doc_id(d), tf(t), doc_len(l) {}
-    
-    TO_STRING_KV(K(doc_id), K(tf), K(doc_len));
-  };
-  
   // ========== 查询结果 ==========
   struct DocScore
   {
@@ -174,27 +163,30 @@ public:
     TO_STRING_KV(K(doc_id), K(score));
   };
 
-  // ========== 文件记录（用于流式写入）==========
-  struct FileRecord
-  {
-    uint32_t token_id;
+  // ========== V2: 变长 TmpFile 记录 ==========
+  // 格式: [token_len:2][token_str:N][doc_id:8][tf:4][doc_len:4]
+  // 总大小: 18 + token_len 字节
+  struct TmpRecord {
+    common::ObString token;
     int64_t doc_id;
     int32_t tf;
     int32_t doc_len;
     
-    bool operator<(const FileRecord &other) const {
-      return token_id < other.token_id || 
-             (token_id == other.token_id && doc_id < other.doc_id);
+    TmpRecord() : doc_id(0), tf(0), doc_len(0) {}
+    
+    bool operator<(const TmpRecord &other) const {
+      int cmp = token.compare(other.token);
+      if (cmp != 0) return cmp < 0;
+      return doc_id < other.doc_id;
     }
     
-    TO_STRING_KV(K(token_id), K(doc_id), K(tf), K(doc_len));
-  } __attribute__((packed));  // 20 字节
-  typedef common::hash::ObHashMap<common::ObString, uint32_t,
-                                   common::hash::NoPthreadDefendMode> TokenIdMap;
+    TO_STRING_KV(K(token), K(doc_id), K(tf), K(doc_len));
+  };
+  
   typedef common::hash::ObHashSet<int64_t, common::hash::NoPthreadDefendMode> DocIdSet;
 
   static const int64_t DEFAULT_BUCKET_COUNT = 100000;
-  static const int64_t NUM_BUCKETS = 1024;  // 分桶数量（使用 TmpFile），用于减少排序内存峰值
+  static const int64_t NUM_BUCKETS = 1024;  // 分桶数量（使用 TmpFile），减少 WBP 内存压力
   
   // BM25 参数（与 ObExprBM25 保持一致）
   static constexpr double K1 = 1.2;
@@ -226,46 +218,7 @@ public:
   template <typename FTWordMapType>
   int collect_document(int64_t doc_id, int32_t doc_len, const FTWordMapType &ft_word_map);
 
-  // ========== Finalize 阶段接口 ==========
-  /**
-   * @brief 计算 BM25 得分并构建 CSC 索引（DDL 完成时调用）
-   */
-  int finalize();
-
   // ========== 查询接口 ==========
-  /**
-   * @brief 搜索查询（已分词的 tokens）
-   * @param tokens 查询词列表
-   * @param id_limit id < id_limit 过滤条件（0 表示不过滤）
-   * @param top_k 返回 top_k 个结果
-   * @param results 输出结果（doc_id, score）
-   */
-  int search(const common::ObIArray<common::ObString> &tokens,
-             int64_t id_limit,
-             int64_t top_k,
-             common::ObIArray<DocScore> &results);
-
-  /**
-   * @brief 搜索查询（全局数组优化版本，使用锁）
-   */
-  int search_with_array(const common::ObIArray<common::ObString> &tokens,
-                        int64_t id_limit,
-                        int64_t top_k,
-                        common::ObIArray<DocScore> &results);
-
-  /**
-   * @brief 获取某个 token 的倒排链（支持 id_limit 过滤）
-   * @param token 查询词
-   * @param id_limit 只返回 doc_id < id_limit 的部分（0 表示不过滤）
-   * @param start 输出：倒排链起始索引
-   * @param end 输出：倒排链结束索引（不包含）
-   * @return true 如果 token 存在
-   */
-  bool get_posting_list(const common::ObString &token, int64_t id_limit, uint64_t &start, uint64_t &end) const;
-  
-  // 直接访问倒排链数据
-  uint32_t get_doc_id(uint64_t idx) const { return doc_ids_.at(idx); }
-  float get_score(uint64_t idx) const { return scores_.at(idx); }
 
   // ========== 并行任务管理 ==========
   /**
@@ -288,31 +241,11 @@ public:
   bool is_inited() const { return is_inited_; }
   bool is_finalized() const { return is_finalized_; }
   bool is_ready() const { return is_finalized_; }  // 只需 finalized，不需要 inited
-  
-  /**
-   * @brief 确保索引就绪（如果未就绪，尝试从 TmpFile 加载）
-   * 在搜索时调用
-   */
-  int ensure_ready();
   int64_t get_total_docs() const { return total_docs_; }
-  int64_t get_vocab_size() const { return token_to_id_.size(); }
-  int64_t get_total_entries() const { return scores_.count(); }
+  int64_t get_vocab_size() const { return file_header_.vocab_size; }
+  int64_t get_total_entries() const { return file_header_.total_postings; }
 
   void print_statistics() const;
-  
-  // ========== 调试接口 ==========
-  /**
-   * @brief 导出 CSC 索引到文件用于验证
-   */
-  void dump_csc_to_file(const char *filepath) const;
-  
-  /**
-   * @brief 导出 finalize 耗时到文件
-   * @param sort_file_size 排序时的文件大小（字节）
-   * @param sort_mem_increase 排序导致的内存增长（KB）
-   */
-  void dump_finalize_time(const char *filepath, double elapsed_ms,
-                          int64_t sort_file_size = 0, int64_t sort_mem_increase = 0) const;
 
   // ========== Phase 2: 持久化接口 ==========
   /**
@@ -324,12 +257,6 @@ public:
    */
   static int get_index_path(uint64_t tenant_id, uint64_t table_id,
                             char *path_buf, int64_t buf_len);
-  
-  /**
-   * @brief 将索引持久化到磁盘
-   * @param index_dir 索引目录路径
-   */
-  int persist_to_disk(const char *index_dir);
   
   /**
    * @brief 流式 Finalize + 持久化（不构建内存 CSC，直接写文件）
@@ -391,6 +318,7 @@ private:
   ~ObFtsBM25SIndex();
 
   int ensure_inited();
+  int ensure_ready();  // 确保索引就绪（从磁盘加载）
   double calc_bm25_score(int32_t tf, int32_t doc_len, int64_t df);
   
   // ========== TmpFile 接口（Phase 1）==========
@@ -400,62 +328,34 @@ private:
   int init_tmp_files();
   
   /**
-   * @brief 写入一条记录到指定桶
+   * @brief V2: 写入变长记录到指定桶
    * @param bucket_id 桶 ID [0, NUM_BUCKETS)
-   * @param record 要写入的记录
+   * @param token token 字符串
+   * @param doc_id 文档 ID
+   * @param tf 词频
+   * @param doc_len 文档长度
    */
-  int write_to_bucket(int64_t bucket_id, const FileRecord &record);
+  int write_variable_record(int64_t bucket_id, const common::ObString &token,
+                            int64_t doc_id, int32_t tf, int32_t doc_len);
   
   /**
-   * @brief 批量写入多条记录到指定桶（减少系统调用）
-   * @param bucket_id 桶 ID [0, NUM_BUCKETS)
-   * @param records 记录数组
-   * @param count 记录数量
-   */
-  int write_records_to_bucket(int64_t bucket_id, const FileRecord *records, int64_t count);
-  
-  /**
-   * @brief 读取整个桶的所有记录
+   * @brief V2: 读取整个桶的所有变长记录
    * @param bucket_id 桶 ID [0, NUM_BUCKETS)
    * @param records 输出：读取的记录数组
+   * @param out_buf 输出：数据缓冲区指针（调用方负责释放）
    */
-  int read_bucket(int64_t bucket_id, common::ObIArray<FileRecord> &records);
+  int read_variable_bucket(int64_t bucket_id, common::ObIArray<TmpRecord> &records, char *&out_buf);
   
   /**
    * @brief 清理所有 TmpFile
    */
   void cleanup_tmp_files();
   
-
-  
   // ========== Phase 2: 持久化私有函数 ==========
   /**
    * @brief 写入 Header 和 Bucket Directory（占位）
    */
   int write_header_and_directory(const common::ObIOFd &fd);
-  
-  /**
-   * @brief 预计算 Posting Offsets
-   */
-  int calc_posting_offsets(common::ObIArray<int64_t> &posting_offsets);
-  
-  /**
-   * @brief 写入 Vocab Buckets
-   */
-  int write_vocab_buckets(const common::ObIOFd &fd,
-                          const common::ObIArray<int64_t> &posting_offsets);
-  
-  /**
-   * @brief 写入 Vocab Buckets（流式版本，用于 finalize_and_persist）
-   */
-  int write_vocab_buckets_streaming(const common::ObIOFd &fd,
-                                     const common::ObIArray<int64_t> &posting_offsets,
-                                     const common::ObIArray<int64_t> &token_df);
-  
-  /**
-   * @brief 写入 Posting Data
-   */
-  int write_posting_data(const common::ObIOFd &fd);
   
   /**
    * @brief 更新 Header 和 Bucket Directory
@@ -500,7 +400,6 @@ private:
   bool tmp_files_inited_;                         // TmpFile 是否已初始化
   
   // ========== Phase 2: 持久化相关 ==========
-  static const int32_t NUM_PERSIST_BUCKETS = 4096;  // 持久化文件的桶数量
   char index_file_path_[512];                       // 索引文件路径
   common::ObIOFd persist_fd_;                       // 持久化文件描述符（写入/查询共用）
   bool persist_file_opened_;                        // 持久化文件是否已打开
@@ -512,21 +411,13 @@ private:
   
   // ========== 收集阶段数据（分桶文件流式）==========
   volatile int64_t bucket_entry_counts_[NUM_BUCKETS]; // 每个桶的条目计数（原子）
-  TokenIdMap collect_token_to_id_;        // 收集阶段的 token -> token_id
   DocIdSet unique_docs_;                  // 唯一文档 ID 集合
   volatile int64_t total_doc_len_;        // 总文档长度（原子）
   volatile int64_t raw_entry_count_;      // 总条目计数（原子）
   
   // ========== 细粒度锁 ==========
-  mutable common::SpinRWLock token_map_lock_;    // HashMap 读写锁
   mutable common::SpinRWLock doc_set_lock_;      // DocSet 读写锁
   mutable common::ObSpinLock bucket_locks_[NUM_BUCKETS];  // 每个桶一把锁（TmpFile 写入保护）
-  
-  // ========== 最终 CSC 索引 ==========
-  common::ObArray<float> scores_;        // 预计算得分
-  common::ObArray<uint32_t> doc_ids_;    // doc_id（每个 token 内有序）
-  common::ObArray<uint64_t> token_ptr_;  // 每个 token 的起止位置
-  TokenIdMap token_to_id_;               // token -> token_id
   
   // ========== 统计信息 ==========
   int64_t total_docs_;            // 总文档数

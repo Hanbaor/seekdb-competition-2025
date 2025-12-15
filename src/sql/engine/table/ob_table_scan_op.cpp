@@ -4169,16 +4169,22 @@
           bm25s_log("END_COLLECT: task ending, calling end_collect()");
           // 只有当所有并行任务都完成时才 finalize
           if (g_bm25s_index.end_collect()) {
-            bm25s_log("END_COLLECT: all tasks done, starting finalize");
-            int finalize_ret = g_bm25s_index.finalize();
+            bm25s_log("END_COLLECT: all tasks done, starting finalize_and_persist");
+            // V2: 直接调用 finalize_and_persist，不构建内存 CSC
+            const char *persist_dir = "/data/obcluster/store/bm25s_index";
+            char index_path[512];
+            snprintf(index_path, sizeof(index_path), "%s/bm25s_index.dat", persist_dir);
+            // 确保目录存在
+            share::ObIODeviceLocalFileOp::mkdir(persist_dir, 0755);
+            int finalize_ret = g_bm25s_index.finalize_and_persist(index_path);
             if (OB_SUCCESS != finalize_ret) {
-              LOG_WARN("fail to finalize bm25s index", K(finalize_ret));
+              LOG_WARN("fail to finalize_and_persist bm25s index", K(finalize_ret));
               bm25s_log("FINALIZE_ERROR: ret=%d", finalize_ret);
             } else {
-              // LOG_INFO("BM25S index finalized successfully",
-              //          "total_docs", g_bm25s_index.get_total_docs(),
-              //          "vocab_size", g_bm25s_index.get_vocab_size(),
-              //          "total_entries", g_bm25s_index.get_total_entries());
+              LOG_INFO("BM25S index finalized and persisted successfully",
+                       "total_docs", g_bm25s_index.get_total_docs(),
+                       "vocab_size", g_bm25s_index.get_vocab_size(),
+                       "total_entries", g_bm25s_index.get_total_entries());
             }
           } else {
             bm25s_log("END_COLLECT: waiting for other parallel tasks");
