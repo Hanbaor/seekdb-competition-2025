@@ -51,6 +51,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return default
+
+
 USE_BATCH_SUMMARIZE = _env_bool("USE_BATCH_SUMMARIZE", False)
 USE_SUMMARY_CACHE = _env_bool("USE_SUMMARY_CACHE", False)
 USE_REGEX_FACTS = _env_bool("USE_REGEX_FACTS", True)
@@ -59,6 +69,7 @@ SUMMARY_CACHE_DIR = os.getenv("SUMMARY_CACHE_DIR", "./cache/summaries")
 SUMMARY_TOP_N = _env_int("SUMMARY_TOP_N", 10)
 RERANK_CANDIDATES_K = _env_int("RERANK_CANDIDATES_K", TOP_K * 2)
 CONTEXT_TOP_N = _env_int("CONTEXT_TOP_N", 0)
+LLM_ANSWER_TEMPERATURE = _env_float("LLM_ANSWER_TEMPERATURE", 0.3)
 
 
 class SummaryCache:
@@ -214,8 +225,44 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
     """
     if not retrieval_results:
         return "", 0
-    
-    raw_top_results = retrieval_results[:min(top_k, len(retrieval_results))]
+
+    candidates = [
+        r
+        for r in retrieval_results
+        if r.get("used_for_context")
+        and str(r.get("content_preview", "") or "").strip()
+        and r.get("filename")
+    ]
+    if not candidates:
+        candidates = retrieval_results
+
+    n = min(top_k, len(candidates))
+    hypo = [r for r in candidates if str(r.get("source") or "") == "hypothetical"]
+    ques = [r for r in candidates if str(r.get("source") or "") == "question"]
+
+    def _safe_rank(x: dict) -> int:
+        try:
+            return int(x.get("rank", 10**9) or 10**9)
+        except Exception:
+            return 10**9
+
+    hypo.sort(key=_safe_rank)
+    ques.sort(key=_safe_rank)
+
+    take_h = min(len(hypo), n // 2)
+    take_q = min(len(ques), n - take_h)
+    if take_h + take_q < n:
+        extra = n - (take_h + take_q)
+        add_h = min(extra, len(hypo) - take_h)
+        take_h += add_h
+        extra -= add_h
+        take_q += min(extra, len(ques) - take_q)
+
+    raw_top_results = hypo[:take_h] + ques[:take_q]
+    if len(raw_top_results) < n:
+        rest = [r for r in candidates if r not in raw_top_results]
+        rest.sort(key=_safe_rank)
+        raw_top_results.extend(rest[: max(0, n - len(raw_top_results))])
 
     page_buckets: dict[tuple[str, int], dict] = {}
     for r in raw_top_results:
@@ -290,7 +337,12 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
 
     top_results = sorted(
         top_results,
-        key=lambda r: (_question_match_score(r), float(r.get("score", 0.0) or 0.0), int(r.get("chunk_count", 0) or 0)),
+        key=lambda r: (
+            _question_match_score(r),
+            float(r.get("score", 0.0) or 0.0),
+            -int(r.get("best_rank", 10**9) or 10**9),
+            int(r.get("chunk_count", 0) or 0),
+        ),
         reverse=True,
     )
 #    相似度分数: {score:.3f} 
@@ -366,6 +418,8 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
     for idx, r in enumerate(top_results, 1):
         filename = r.get("filename", "").split("/")[-1]
         page = r.get("page", 0)
+        best_rank = int(r.get("best_rank", 0) or 0)
+        score = float(r.get("score", 0.0) or 0.0)
         content = r.get("content_preview", "")
         key_facts = _extract_key_facts(content) if USE_REGEX_FACTS else ""
         summary = summaries.get(idx, "")
@@ -373,7 +427,7 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
         chunk_cnt = int(r.get("chunk_count", 0) or 0)
 
         candidates.append(
-            f"{idx}) filename: {filename}, page: {page}, chunks: {chunk_cnt}, key_facts: {key_facts}, summary: {summary or snippet}"
+            f"{idx}) filename: {filename}, page: {page}, best_rank: {best_rank}, score: {score:.4f}, chunks: {chunk_cnt}, key_facts: {key_facts}, summary: {summary or snippet}"
         )
     
     candidates_text = "\n".join(candidates)
@@ -846,7 +900,7 @@ def search(question: str) -> Answer:
             {"role": "user", "content": prompt},
         ]
         # answer.answer = generate_llm_response(messages,model="qwen-max", temperature=0.3)
-        answer.answer = generate_llm_response(messages, temperature=0.3)  # Use 0.3 for natural answer generation
+        answer.answer = generate_llm_response(messages, temperature=LLM_ANSWER_TEMPERATURE)  # Use 0.3 for natural answer generation
         logger.debug(
             f"Query completed: question='{question[:50]}...', filename='{answer.filename}', page={answer.page}"
         )
