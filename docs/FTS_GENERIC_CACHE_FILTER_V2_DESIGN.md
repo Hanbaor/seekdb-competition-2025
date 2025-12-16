@@ -10,6 +10,84 @@
 
 ---
 
+## ✅ 实现状态总结
+
+> **状态**：已完成 ✅  
+> **完成日期**：2025-12-16  
+> **测试状态**：Memory Mode 和 KVCache Mode 均已验证通过
+
+### 已实现功能清单
+
+| 功能模块 | 状态 | 实现文件 |
+|----------|------|----------|
+| 文件格式定义 | ✅ 完成 | `ob_fts_scalar_kvcache.h` |
+| 持久化写入 | ✅ 完成 | `ob_fts_generic_cache.cpp::persist_to_disk()` |
+| KVCache Key/Value | ✅ 完成 | `ob_fts_scalar_kvcache.h/cpp` |
+| 磁盘加载 | ✅ 完成 | `ob_fts_generic_cache.cpp::load_from_disk()` |
+| 懒加载机制 | ✅ 完成 | `ob_fts_generic_cache.cpp::ensure_ready()` |
+| KVCache 查询 | ✅ 完成 | `ob_fts_generic_cache.cpp::get_row_from_kvcache()` |
+| 批量预取 | ✅ 完成 | `ob_fts_generic_cache.cpp::prefetch_rows()` |
+| 过滤集成 | ✅ 完成 | `ob_das_tr_merge_iter.cpp` |
+| 回表集成 | ✅ 完成 | `ob_das_cache_lookup_iter.cpp` |
+| 过滤条件提取 | ✅ 完成 | `ob_table_scan_op.cpp` |
+
+### 新增/修改的源文件
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `src/sql/das/ob_fts_scalar_kvcache.h` | 新增 | KVCache Key/Value 定义、文件格式结构 |
+| `src/sql/das/ob_fts_scalar_kvcache.cpp` | 新增 | KVCache 全局实例管理、Value 访问函数 |
+| `src/sql/das/ob_fts_generic_cache.h` | 修改 | 添加持久化和 KVCache 相关接口 |
+| `src/sql/das/ob_fts_generic_cache.cpp` | 修改 | 实现持久化写入、加载、KVCache 查询 |
+| `src/sql/das/ob_fts_generic_filter.h` | 修改 | 添加 `check_row_from_cache()` |
+| `src/sql/das/ob_fts_generic_filter.cpp` | 修改 | 实现基于 KVCache Value 的过滤检查 |
+| `src/sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.cpp` | 修改 | 集成 KVCache 模式过滤 |
+| `src/sql/das/iter/ob_das_cache_lookup_iter.cpp` | 修改 | 集成 KVCache 模式回表 |
+| `src/sql/engine/table/ob_table_scan_op.cpp` | 修改 | 持久化调用、KVCache 模式条件提取 |
+| `src/sql/CMakeLists.txt` | 修改 | 添加 `ob_fts_scalar_kvcache.cpp` |
+
+### 运行模式说明
+
+系统支持两种运行模式，自动切换：
+
+| 模式 | 触发条件 | 数据来源 | 性能 |
+|------|----------|----------|------|
+| **Memory Mode** | DDL 后同一会话 | 内存数组 | 最快（O(1) 访问）|
+| **KVCache Mode** | 服务器重启后 | 持久化文件 + LRU 缓存 | 快（热点数据 O(1)）|
+
+### 持久化文件位置
+
+```
+/data/obcluster/store/fts_scalar_cache/fts_scalar_cache.dat
+```
+
+### 关键日志标识
+
+```bash
+# 过滤条件提取
+[FTS_NEW_SYSTEM] filter extraction SUCCESS(condition_count=X, is_memory_mode=Y, is_kvcache_mode=Z)
+
+# 过滤执行
+[FTS_FILTER] Using NEW system (Generic Cache Memory Mode)
+[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode)
+
+# 回表执行
+[FTS_LOOKUP] Using NEW system (Generic Cache Memory Mode)
+[FTS_LOOKUP] Using NEW system (Generic Cache KVCache Mode)
+
+# 持久化
+[FTS_GENERIC_CACHE] persist_to_disk: completed successfully
+[FTS_GENERIC_CACHE] load_from_disk: completed successfully (KVCache Mode enabled)
+```
+
+### 实现过程中的关键修复
+
+1. **`is_inited_` 状态修复**：`load_from_disk()` 后不再设置 `is_inited_ = true`，确保正确区分 Memory Mode 和 KVCache Mode
+2. **过滤条件提取修复**：KVCache 模式下也能正确提取过滤条件
+3. **列索引映射修复**：KVCache 模式使用 `find_column_by_type()` 获取正确的列索引
+
+---
+
 ## 1. 概述
 
 ### 1.1 V1 的局限性
@@ -944,8 +1022,36 @@ int ObFtsGenericCache::load_from_disk(const char *cache_dir)
 
 ---
 
-**文档版本**：v2.0  
+## 14. 实现验证结果
+
+### 14.1 功能验证
+
+| 测试项 | 状态 | 说明 |
+|--------|------|------|
+| 持久化写入 | ✅ 通过 | 文件正确生成于 `/data/obcluster/store/fts_scalar_cache/` |
+| 文件格式校验 | ✅ 通过 | Header magic、version、row_count、column_count 正确 |
+| Memory Mode 过滤 | ✅ 通过 | DDL 后立即查询，使用内存缓存 |
+| Memory Mode 回表 | ✅ 通过 | DDL 后立即查询，使用内存缓存 |
+| KVCache Mode 过滤 | ✅ 通过 | 重启后查询，从文件加载 |
+| KVCache Mode 回表 | ✅ 通过 | 重启后查询，从文件加载 |
+| 过滤条件提取 | ✅ 通过 | 两种模式都能正确提取 |
+| 列索引映射 | ✅ 通过 | 使用 `find_column_by_type()` 正确映射 |
+
+### 14.2 性能对比（预期）
+
+| 场景 | V1 (全内存) | V2 (持久化 + KVCache) |
+|------|-------------|----------------------|
+| DDL 后首次查询 | 直接使用 | 直接使用（Memory Mode）|
+| 服务器重启后首次查询 | 需重建缓存 | 直接加载文件头（~1ms）|
+| 热点数据查询 | O(1) | O(1)（KVCache 命中）|
+| 冷数据查询 | O(1) | O(1) + 磁盘 I/O |
+| 内存占用（20万行）| ~100 MB | 仅热点数据（由 LRU 控制）|
+
+---
+
+**文档版本**：v2.1（实现完成版）  
 **创建日期**：2025-12-14  
+**实现完成日期**：2025-12-16  
 **依赖文档**：FTS_GENERIC_CACHE_FILTER_DESIGN.md (V1)  
 **参考文档**：BM25S_PHASE2_PERSISTENCE.md, BM25S_PHASE3_KVCACHE_QUERY.md  
 **作者**：FTS 优化开发组

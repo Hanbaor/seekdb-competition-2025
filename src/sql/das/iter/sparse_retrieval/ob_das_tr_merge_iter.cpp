@@ -1150,12 +1150,30 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
     
     // ========== 检测使用哪套系统 ==========
-    const bool use_new_system = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
+    // V2: 如果内存缓存不可用，尝试从持久化文件加载（启动 KVCache 模式）
+    const bool use_new_system_memory = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
+    
+    // 如果内存缓存不可用，尝试加载持久化文件
+    if (!use_new_system_memory && !g_fts_generic_cache.is_cache_file_opened()) {
+      int ensure_ret = g_fts_generic_cache.ensure_ready();
+      if (OB_SUCCESS == ensure_ret) {
+        LOG_INFO("[FTS_FILTER] Cache loaded from disk via ensure_ready");
+      } else if (OB_ENTRY_NOT_EXIST != ensure_ret) {
+        LOG_WARN("[FTS_FILTER] Failed to ensure cache ready", K(ensure_ret));
+      }
+    }
+    
+    const bool use_new_system_kvcache = g_fts_generic_cache.is_cache_file_opened();
+    const bool use_new_system = use_new_system_memory || use_new_system_kvcache;
     const bool use_old_system = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
     
-    if (use_new_system) {
-      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache + Filter)",
+    if (use_new_system_memory) {
+      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode)",
                "cache_size", g_fts_generic_cache.size(),
+               "filter_count", g_fts_generic_filter_ctx.condition_count());
+    } else if (use_new_system_kvcache) {
+      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode)",
+               "file_row_count", g_fts_generic_cache.get_file_header().row_count,
                "filter_count", g_fts_generic_filter_ctx.condition_count());
     } else if (use_old_system) {
       LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
@@ -1189,18 +1207,22 @@ ObDASTRMergeIter::ObDASTRMergeIter()
                "limit_count", g_fts_generic_filter_ctx.get_limit());
     } else {
       LOG_INFO("[FTS_OLD_SYSTEM] filter context in do_bm25s_search", 
-               "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
-               "id_limit", g_fts_filter_ctx.id_limit_,
-               "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
+             "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
+             "id_limit", g_fts_filter_ctx.id_limit_,
+             "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
                "base_id_count", g_fts_filter_ctx.base_id_count());
     }
 
     if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
       // 有 id 过滤，用 id_limit 作为容量（更省内存）
       required_capacity = g_fts_filter_ctx.id_limit_;
-    } else if (use_new_system) {
-      // 新系统：用 generic cache 容量
+    } else if (use_new_system_memory) {
+      // 新系统内存模式：用 generic cache 容量
       required_capacity = g_fts_generic_cache.capacity();
+      if (required_capacity <= 0) required_capacity = 2000;
+    } else if (use_new_system_kvcache) {
+      // 新系统 KVCache 模式：用文件头中的行数
+      required_capacity = g_fts_generic_cache.get_file_header().row_count + 1;
       if (required_capacity <= 0) required_capacity = 2000;
     } else {
       // 旧系统：用 scalar cache 容量
@@ -1236,9 +1258,9 @@ ObDASTRMergeIter::ObDASTRMergeIter()
                "generic_cache_size", g_fts_generic_cache.size());
     } else {
       LOG_INFO("BM25S search: starting (KVCache mode, OLD SYSTEM)",
-               "query_tokens_count", query_tokens_.count(),
-               K(id_limit),
-               "scalar_cache_size", g_fts_scalar_cache.size());
+             "query_tokens_count", query_tokens_.count(),
+             K(id_limit),
+             "scalar_cache_size", g_fts_scalar_cache.size());
     }
     
     // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
@@ -1277,21 +1299,36 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         bool pass_filter = true;
         
         if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
-          // 新系统：使用 Generic Filter 进行所有条件检查
-          pass_filter = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
+          // 新系统：优先使用内存模式，否则使用 KVCache 模式
+          if (use_new_system_memory) {
+            // 内存模式：直接访问内存缓存
+            pass_filter = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
+          } else if (use_new_system_kvcache) {
+            // KVCache 模式：从文件/缓存加载行数据
+            const ObFtsScalarCacheValue *row = nullptr;
+            common::ObKVCacheHandle handle;
+            int cache_ret = g_fts_generic_cache.get_row_from_kvcache(doc_id, row, handle);
+            if (OB_SUCCESS == cache_ret && OB_NOT_NULL(row)) {
+              pass_filter = g_fts_generic_filter_ctx.check_row_from_kvcache(row);
+            } else {
+              // 无法获取行数据，跳过过滤（保守策略，允许通过）
+              pass_filter = true;
+            }
+            // handle 析构时自动释放缓存引用
+          }
           if (!pass_filter) {
             filtered_by_base_id++;  // 复用计数器
             continue;
           }
         } else if (use_old_system) {
           // 旧系统：使用 Scalar Cache + FilterCtx
-          if (g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
-            const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
-            if (!g_fts_filter_ctx.check_base_id(base_id)) {
-              filtered_by_base_id++;
-              continue; // base_id 不匹配，跳过
-            }
+        if (g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
+          const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
+          if (!g_fts_filter_ctx.check_base_id(base_id)) {
+            filtered_by_base_id++;
+            continue; // base_id 不匹配，跳过
           }
+        }
         }
         // 如果两个系统都不可用，跳过过滤（允许所有文档通过）
         

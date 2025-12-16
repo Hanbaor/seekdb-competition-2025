@@ -11,7 +11,11 @@
 #include "lib/lock/ob_spin_lock.h"
 #include "lib/oblog/ob_log_module.h"
 #include "sql/das/ob_fts_column_value.h"
+#include "sql/das/ob_fts_scalar_kvcache.h"
 #include "sql/engine/expr/ob_expr.h"
+#include "share/ob_io_device_helper.h"
+#include "common/storage/ob_io_device.h"
+#include "share/cache/ob_kv_storecache.h"
 
 namespace oceanbase
 {
@@ -269,9 +273,79 @@ public:
   void reuse();
   void destroy();
 
+  // ========== V2: 持久化接口 ==========
+  
+  /**
+   * 获取缓存文件路径
+   * @param path_buf 输出路径缓冲区
+   * @param buf_len 缓冲区长度
+   */
+  static int get_cache_path(char *path_buf, int64_t buf_len);
+  
+  /**
+   * 将缓存持久化到磁盘
+   * @param cache_dir 缓存目录路径
+   */
+  int persist_to_disk(const char *cache_dir);
+  
+  /**
+   * 从磁盘加载缓存
+   * @param cache_dir 缓存目录路径
+   */
+  int load_from_disk(const char *cache_dir);
+  
+  /**
+   * 关闭索引文件
+   */
+  void close_cache_file();
+  
+  /**
+   * 检查缓存文件是否已打开
+   */
+  bool is_cache_file_opened() const { return persist_file_opened_; }
+  
+  /**
+   * 获取文件头信息
+   */
+  const FtsScalarCacheFileHeader& get_file_header() const { return file_header_; }
+  
+  // ========== V2: KVCache 查询接口 ==========
+  
+  /**
+   * 从 KVCache 获取行数据
+   * @param doc_id 文档 ID
+   * @param row 输出：行数据指针
+   * @param handle 缓存句柄（管理生命周期）
+   */
+  int get_row_from_kvcache(uint64_t doc_id,
+                           const ObFtsScalarCacheValue *&row,
+                           common::ObKVCacheHandle &handle);
+  
+  /**
+   * 批量预取行数据到 KVCache
+   */
+  int prefetch_rows(const common::ObIArray<uint64_t> &doc_ids);
+  
+  /**
+   * 确保缓存就绪（如果未就绪，尝试从磁盘加载）
+   */
+  int ensure_ready();
+
 private:
   int ensure_capacity(uint64_t required);
   int copy_column_value(const ObFtsColumnValue &src, ObFtsColumnValue &dst);
+  
+  // ========== V2: 持久化私有方法 ==========
+  int write_header(const common::ObIOFd &fd);
+  int write_column_meta(const common::ObIOFd &fd);
+  int write_row_index_and_data(const common::ObIOFd &fd);
+  int update_header(const common::ObIOFd &fd);
+  int serialize_row(uint64_t doc_id, char *buf, int64_t buf_len, int64_t &row_size);
+  
+  // ========== V2: KVCache 私有方法 ==========
+  int load_row_to_kvcache(uint64_t doc_id,
+                          const ObFtsScalarCacheValue *&row,
+                          common::ObKVCacheHandle &handle);
 
 private:
   bool is_inited_;
@@ -290,6 +364,14 @@ private:
   uint64_t capacity_;  // 容量
 
   mutable common::ObSpinLock lock_;
+  
+  // ========== V2: 持久化相关成员 ==========
+  char cache_file_path_[512];             // 缓存文件路径
+  common::ObIOFd persist_fd_;             // 持久化文件描述符
+  bool persist_file_opened_;              // 持久化文件是否已打开
+  FtsScalarCacheFileHeader file_header_;  // 文件头
+  FtsRowIndexEntry *row_index_;           // 行索引
+  common::ObArenaAllocator cache_allocator_;  // KVCache 查询时的临时内存分配器
 };
 
 // 全局单例

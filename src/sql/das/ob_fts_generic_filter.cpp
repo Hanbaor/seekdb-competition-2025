@@ -297,6 +297,35 @@ bool ObFtsGenericFilterCtx::check_row_fast(uint64_t doc_id, const ObFtsGenericCa
   return true;
 }
 
+bool ObFtsGenericFilterCtx::check_row_from_kvcache(const ObFtsScalarCacheValue *row) const
+{
+  if (condition_count_ == 0 || OB_ISNULL(row)) {
+    return true;
+  }
+  
+  // 检查每个条件
+  for (int64_t i = 0; i < condition_count_; ++i) {
+    const ObFtsFilterCondition &cond = conditions_[i];
+    const int64_t col_idx = cond.column_idx_;
+    
+    if (col_idx < 0 || col_idx >= row->column_count()) {
+      continue;
+    }
+    
+    // 从缓存值中获取列数据
+    ObFtsColumnValue col_val;
+    if (OB_SUCCESS != row->get_column_value(col_idx, col_val)) {
+      continue;
+    }
+    
+    if (!cond.check(col_val)) {
+      return false;
+    }
+  }
+  
+  return true;
+}
+
 int ObFtsGenericFilterCtx::extract_from_filters(
     const common::ObIArray<ObExpr*> &filter_exprs,
     const common::ObIArray<ObExpr*> &output_exprs,

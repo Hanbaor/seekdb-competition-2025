@@ -161,6 +161,12 @@ public:
    */
   bool check_row_fast(uint64_t doc_id, const ObFtsGenericCache &cache) const;
 
+  /**
+   * V2: 从 KVCache 行数据检查过滤条件
+   * @param row KVCache 中的行数据
+   */
+  bool check_row_from_kvcache(const ObFtsScalarCacheValue *row) const;
+
   // ========== 状态查询 ==========
   bool has_conditions() const { return condition_count_ > 0; }
   int64_t condition_count() const { return condition_count_; }
