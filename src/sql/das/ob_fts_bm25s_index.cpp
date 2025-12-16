@@ -1469,7 +1469,7 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
 {
   int ret = OB_SUCCESS;
   
-  LOG_DEBUG("BM25S load_posting_to_cache: loading from file", K(token));
+  // 热路径，移除日志
   
   // 1. 从文件查找 token 的 posting 信息
   int64_t posting_offset = 0;
@@ -1477,15 +1477,11 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
   
   if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count))) {
     if (OB_ENTRY_NOT_EXIST == ret) {
-      // 【负缓存】token 在磁盘索引中不存在，缓存空 posting
-      LOG_INFO("BM25S NEGATIVE CACHE PUT: token NOT in disk", K(token));
+      // 【负缓存】token 在磁盘索引中不存在，缓存空 posting（热路径，移除日志）
       ObBM25SPostingValue empty_value;
       empty_value.set(0, nullptr, nullptr);  // count = 0 表示不存在
       ObBM25SPostingKey key(token);
-      int put_ret = g_posting_cache->put_and_fetch(key, empty_value, posting, handle);
-      if (OB_SUCCESS == put_ret) {
-        LOG_DEBUG("BM25S negative cache: empty posting cached", K(token));
-      }
+      g_posting_cache->put_and_fetch(key, empty_value, posting, handle);
       // 仍然返回 OB_ENTRY_NOT_EXIST
     } else {
       LOG_WARN("BM25S load_posting_to_cache: fail to find token in file", K(ret), K(token));
@@ -1494,15 +1490,11 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
   }
   
   if (posting_count == 0) {
-    // 【负缓存】token 存在但没有 posting，缓存空 posting
-    LOG_DEBUG("BM25S negative cache: token has zero postings", K(token));
+    // 【负缓存】token 存在但没有 posting，缓存空 posting（热路径，移除日志）
     ObBM25SPostingValue empty_value;
     empty_value.set(0, nullptr, nullptr);
     ObBM25SPostingKey key(token);
-    int put_ret = g_posting_cache->put_and_fetch(key, empty_value, posting, handle);
-    if (OB_SUCCESS == put_ret) {
-      LOG_DEBUG("BM25S negative cache: empty posting cached", K(token));
-    }
+    g_posting_cache->put_and_fetch(key, empty_value, posting, handle);
     ret = OB_ENTRY_NOT_EXIST;
     return ret;
   }
@@ -1542,12 +1534,7 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
   ObBM25SPostingKey key(token);
   
   ret = g_posting_cache->put_and_fetch(key, tmp_value, posting, handle);
-  if (OB_FAIL(ret)) {
-    LOG_WARN("BM25S load_posting_to_cache: fail to put posting to cache", K(ret), K(token));
-  } else {
-    LOG_DEBUG("BM25S load_posting_to_cache: posting cached successfully", 
-              K(token), K(posting_count));
-  }
+  // 热路径，移除成功/失败日志
   
   // 7. 释放临时缓冲区（数据已被 deep_copy 到 KVCache）
   cache_allocator_.free(buf);
@@ -1596,17 +1583,15 @@ int ObFtsBM25SIndex::get_posting_from_cache(const common::ObString &token,
   if (OB_SUCCESS == ret) {
     // 缓存命中，检查是否为负缓存（count == 0）
     if (posting->count() == 0) {
-      // 负缓存命中：token 不存在
-      LOG_INFO("BM25S NEGATIVE CACHE HIT: token cached as not-exist", K(token));
+      // 负缓存命中：token 不存在（热路径，移除日志）
       return OB_ENTRY_NOT_EXIST;
     }
-    LOG_DEBUG("BM25S cache HIT", K(token), "count", posting->count());
+    // 热路径，移除日志
     return OB_SUCCESS;
   }
   
   if (OB_ENTRY_NOT_EXIST == ret) {
-    // 2. 缓存未命中，从文件加载
-    LOG_DEBUG("BM25S cache MISS, loading from file", K(token));
+    // 2. 缓存未命中，从文件加载（热路径，移除日志）
     ret = load_posting_to_cache(token, posting, handle);
   }
   

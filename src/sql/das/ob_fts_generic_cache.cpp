@@ -998,14 +998,12 @@ int ObFtsGenericCache::get_row_from_kvcache(uint64_t doc_id,
   ret = kvcache->get(key, row, handle);
   
   if (common::OB_SUCCESS == ret) {
-    // 缓存命中
-    LOG_DEBUG("[FTS_GENERIC_CACHE] get_row_from_kvcache: cache HIT", K(doc_id));
+    // 缓存命中（热路径，移除日志）
     return common::OB_SUCCESS;
   }
   
   if (common::OB_ENTRY_NOT_EXIST == ret) {
-    // 2. 缓存未命中，从文件加载
-    LOG_DEBUG("[FTS_GENERIC_CACHE] get_row_from_kvcache: cache MISS, loading from file", K(doc_id));
+    // 2. 缓存未命中，从文件加载（热路径，移除日志）
     ret = load_row_to_kvcache(doc_id, row, handle);
   }
   
@@ -1065,9 +1063,7 @@ int ObFtsGenericCache::load_row_to_kvcache(uint64_t doc_id,
   
   ret = kvcache->put_and_fetch(key, tmp_value, row, handle);
   if (OB_FAIL(ret)) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_kvcache: fail to put to cache", K(ret), K(doc_id));
-  } else {
-    LOG_DEBUG("[FTS_GENERIC_CACHE] load_row_to_kvcache: row cached", K(doc_id));
+    // 热路径，移除日志
   }
   
   // 5. 释放临时缓冲区（数据已被 deep_copy 到 KVCache）
