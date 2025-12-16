@@ -16,6 +16,7 @@
 #include "share/ob_io_device_helper.h"
 #include "common/storage/ob_io_device.h"
 #include "share/cache/ob_kv_storecache.h"
+#include "lib/hash/ob_hashmap.h"
 
 namespace oceanbase
 {
@@ -370,6 +371,15 @@ public:
    */
   int ensure_ready();
 
+  // ========== V4: HashMap 缓存查询接口 ==========
+  
+  /**
+   * 从 HashMap 获取行数据（轻量级缓存，读不加锁）
+   * @param doc_id 文档 ID
+   * @param row_data 输出：行数据指针
+   */
+  int get_row_from_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data);
+
 private:
   int ensure_capacity(uint64_t required);
   int copy_column_value(const ObFtsColumnValue &src, ObFtsColumnValue &dst);
@@ -389,6 +399,10 @@ private:
   // ========== V3: 流式存储私有方法 ==========
   int serialize_row_from_values(const ObFtsColumnValue *column_values, 
                                 char *buf, int64_t buf_len, int64_t &row_size);
+
+  // ========== V4: HashMap 缓存私有方法 ==========
+  int init_hashmap();
+  int load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data);
 
 private:
   bool is_inited_;
@@ -425,6 +439,18 @@ private:
   int64_t streaming_row_index_capacity_;  // 行索引缓冲区容量
   char *streaming_row_buf_;               // 行数据序列化缓冲区
   static const int64_t STREAMING_ROW_BUF_SIZE = 8192;  // 单行最大 8KB
+  
+  // ========== V4: HashMap 缓存相关成员 ==========
+  typedef common::hash::ObHashMap<uint64_t, ObFtsRowData*, common::hash::NoPthreadDefendMode> RowHashMap;
+  RowHashMap row_hashmap_;                // doc_id -> ObFtsRowData* 的映射
+  common::ObArenaAllocator hashmap_allocator_;  // HashMap 数据的内存分配器
+  bool hashmap_inited_;                   // HashMap 是否已初始化
+  bool use_hashmap_;                      // 是否启用 HashMap 模式
+  mutable common::ObSpinLock hashmap_lock_;  // HashMap 写锁
+
+public:
+  void set_use_hashmap(bool v) { use_hashmap_ = v; }
+  bool is_use_hashmap() const { return use_hashmap_; }
 };
 
 // 全局单例
