@@ -23,76 +23,7 @@ const int64_t ObFtsGenericFilterCtx::MAX_CONDITIONS;
 // 静态空条件
 static ObFtsFilterCondition EMPTY_CONDITION;
 
-// ========== ObFtsFilterCondition 实现 ==========
-
-bool ObFtsFilterCondition::check(const ObFtsColumnValue &col_value) const
-{
-  const int64_t val_count = values_.count();
-  if (op_type_ == FTS_OP_NONE) {
-    return true;  // 无效条件，默认通过
-  }
-
-  switch (op_type_) {
-    case FTS_OP_LT:
-      return val_count > 0 && col_value < values_.at(0);
-
-    case FTS_OP_LE:
-      return val_count > 0 && col_value <= values_.at(0);
-
-    case FTS_OP_GT:
-      return val_count > 0 && col_value > values_.at(0);
-
-    case FTS_OP_GE:
-      return val_count > 0 && col_value >= values_.at(0);
-
-    case FTS_OP_EQ:
-      return val_count > 0 && col_value == values_.at(0);
-
-    case FTS_OP_NE:
-      return val_count > 0 && col_value != values_.at(0);
-
-    case FTS_OP_IN: {
-      // 遍历检查是否在列表中
-      // 优化：直接访问内部数组，避免 at() 的边界检查开销
-      for (int64_t i = 0; i < val_count; ++i) {
-        if (col_value == values_.at(i)) {
-          return true;
-        }
-      }
-      return false;
-    }
-
-    case FTS_OP_NOT_IN: {
-      for (int64_t i = 0; i < val_count; ++i) {
-        if (col_value == values_.at(i)) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    case FTS_OP_IS_NULL:
-      return col_value.is_null();
-
-    case FTS_OP_IS_NOT_NULL:
-      return !col_value.is_null();
-
-    case FTS_OP_BETWEEN:
-      // BETWEEN 需要两个值：下界和上界
-      if (val_count >= 2) {
-        return col_value >= values_.at(0) && col_value <= values_.at(1);
-      }
-      return true;
-
-    case FTS_OP_LIKE:
-    case FTS_OP_NOT_LIKE:
-      // LIKE 操作暂不实现完整语义，默认通过
-      return true;
-
-    default:
-      return true;  // 不支持的操作，默认通过
-  }
-}
+// ========== ObFtsFilterCondition::check 已移至头文件（内联）==========
 
 // ========== ObFtsGenericFilterCtx 实现 ==========
 
@@ -117,6 +48,7 @@ void ObFtsGenericFilterCtx::reset()
   condition_count_ = 0;
   limit_count_ = 0;
   has_limit_ = false;
+  
   allocator_.reset();
 
   LOG_DEBUG("[FTS_GENERIC_FILTER] filter context reset");
@@ -263,39 +195,7 @@ bool ObFtsGenericFilterCtx::check_row(uint64_t doc_id, const ObFtsGenericCache &
   return true;  // 所有条件都满足
 }
 
-bool ObFtsGenericFilterCtx::check_row_fast(uint64_t doc_id, const ObFtsGenericCache &cache) const
-{
-  if (condition_count_ == 0) {
-    return true;
-  }
-
-  // doc_id 是 1-based 索引
-  const uint64_t cache_size = static_cast<uint64_t>(cache.size());
-  if (doc_id == 0 || doc_id > cache_size) {
-    return false;
-  }
-
-  // 提前获取列数，避免循环内重复调用
-  const int64_t col_count = cache.column_count();
-  
-  for (int64_t i = 0; i < condition_count_; ++i) {
-    const ObFtsFilterCondition &cond = conditions_[i];
-    const int64_t col_idx = cond.column_idx_;
-
-    if (col_idx < 0 || col_idx >= col_count) {
-      continue;
-    }
-
-    // 使用快速访问方法
-    const ObFtsColumnValue &col_val = cache.get_column_fast(doc_id, col_idx);
-
-    if (!cond.check(col_val)) {
-      return false;
-    }
-  }
-
-  return true;
-}
+// check_row_fast 已移至头文件（内联）
 
 bool ObFtsGenericFilterCtx::check_row_from_kvcache(const ObFtsScalarCacheValue *row) const
 {

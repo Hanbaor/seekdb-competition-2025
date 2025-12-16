@@ -379,7 +379,7 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         if (!use_new_cache_memory && !g_fts_generic_cache.is_cache_file_opened()) {
           int ensure_ret = g_fts_generic_cache.ensure_ready();
           if (OB_SUCCESS == ensure_ret) {
-            LOG_INFO("[FTS_LOOKUP] Cache loaded from disk via ensure_ready");
+            // LOG_INFO("[FTS_LOOKUP] Cache loaded from disk via ensure_ready");
           } else if (OB_ENTRY_NOT_EXIST != ensure_ret) {
             LOG_WARN("[FTS_LOOKUP] Failed to ensure cache ready", K(ensure_ret));
           }
@@ -400,10 +400,10 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
                 break;
               }
             }
-            if (will_cache_hit) {
-              LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache Memory Mode)", 
-                       "doc_count", cached_doc_ids_.count());
-            }
+            // if (will_cache_hit) {
+            //   LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache Memory Mode)", 
+            //            "doc_count", cached_doc_ids_.count());
+            // }
           } else if (use_new_cache_kvcache) {
             // 新系统 KVCache 模式：使用持久化文件 + KVCache
             will_cache_hit = true;
@@ -415,11 +415,11 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
                 break;
               }
             }
-            if (will_cache_hit) {
-              LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache KVCache Mode)", 
-                       "doc_count", cached_doc_ids_.count(),
-                       "file_row_count", file_row_count);
-            }
+            // if (will_cache_hit) {
+            //   LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache KVCache Mode)", 
+            //            "doc_count", cached_doc_ids_.count(),
+            //            "file_row_count", file_row_count);
+            // }
           } else if (use_old_cache) {
             // 旧系统：使用 Scalar Cache
           will_cache_hit = true;
@@ -431,10 +431,10 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
               break;
               }
             }
-            if (will_cache_hit) {
-              LOG_INFO("[FTS_LOOKUP] Using OLD system (Scalar Cache)",
-                       "doc_count", cached_doc_ids_.count());
-            }
+            // if (will_cache_hit) {
+            //   LOG_INFO("[FTS_LOOKUP] Using OLD system (Scalar Cache)",
+            //            "doc_count", cached_doc_ids_.count());
+            // }
           }
           // 标记已通过缓存验证，OUTPUT_ROWS 阶段无需再检查
           cache_verified_ = will_cache_hit;
@@ -516,8 +516,8 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
           // ========== 优先使用新系统获取数据 ==========
           if (new_cache_memory_available) {
             // 新系统内存模式：使用 Generic Cache
-            LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system (Memory Mode) for data retrieval",
-                     K(cache_fill_count), K(output_col_count));
+            // LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system (Memory Mode) for data retrieval",
+            //          K(cache_fill_count), K(output_col_count));
             
             for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
               uint64_t doc_id = cached_doc_ids_.at(i);
@@ -575,8 +575,8 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             }
           } else if (new_cache_kvcache_available) {
             // 新系统 KVCache 模式：从文件/缓存加载行数据
-            LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system (KVCache Mode) for data retrieval",
-                     K(cache_fill_count), K(output_col_count));
+            // LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system (KVCache Mode) for data retrieval",
+            //          K(cache_fill_count), K(output_col_count));
             
             int64_t file_row_count = g_fts_generic_cache.get_file_header().row_count;
             
@@ -650,8 +650,8 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
             }
           } else {
             // 旧系统：使用 Scalar Cache
-            LOG_INFO("[FTS_LOOKUP_OUTPUT] Using OLD system for data retrieval",
-                     K(cache_fill_count), K(output_col_count));
+            // LOG_INFO("[FTS_LOOKUP_OUTPUT] Using OLD system for data retrieval",
+            //          K(cache_fill_count), K(output_col_count));
             
           for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
             uint64_t doc_id = cached_doc_ids_.at(i);

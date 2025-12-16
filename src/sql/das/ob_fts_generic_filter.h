@@ -9,8 +9,10 @@
 #include "lib/container/ob_array.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/oblog/ob_log_module.h"
+#include "share/cache/ob_kv_storecache.h"
 #include "sql/das/ob_fts_column_value.h"
 #include "sql/das/ob_fts_generic_cache.h"
+#include "sql/das/ob_fts_scalar_kvcache.h"
 #include "sql/engine/expr/ob_expr.h"
 
 namespace oceanbase
@@ -93,9 +95,60 @@ struct ObFtsFilterCondition
   }
 
   /**
-   * 检查单个值是否满足条件
+   * 检查单个值是否满足条件（内联以减少函数调用开销）
    */
-  bool check(const ObFtsColumnValue &col_value) const;
+  inline bool check(const ObFtsColumnValue &col_value) const
+  {
+    const int64_t val_count = values_.count();
+    if (op_type_ == FTS_OP_NONE) {
+      return true;  // 无效条件，默认通过
+    }
+
+    switch (op_type_) {
+      case FTS_OP_LT:
+        return val_count > 0 && col_value < values_.at(0);
+      case FTS_OP_LE:
+        return val_count > 0 && col_value <= values_.at(0);
+      case FTS_OP_GT:
+        return val_count > 0 && col_value > values_.at(0);
+      case FTS_OP_GE:
+        return val_count > 0 && col_value >= values_.at(0);
+      case FTS_OP_EQ:
+        return val_count > 0 && col_value == values_.at(0);
+      case FTS_OP_NE:
+        return val_count > 0 && col_value != values_.at(0);
+      case FTS_OP_IN: {
+        for (int64_t i = 0; i < val_count; ++i) {
+          if (col_value == values_.at(i)) {
+            return true;
+          }
+        }
+        return false;
+      }
+      case FTS_OP_NOT_IN: {
+        for (int64_t i = 0; i < val_count; ++i) {
+          if (col_value == values_.at(i)) {
+            return false;
+          }
+        }
+        return true;
+      }
+      case FTS_OP_IS_NULL:
+        return col_value.is_null();
+      case FTS_OP_IS_NOT_NULL:
+        return !col_value.is_null();
+      case FTS_OP_BETWEEN:
+        if (val_count >= 2) {
+          return col_value >= values_.at(0) && col_value <= values_.at(1);
+        }
+        return true;
+      case FTS_OP_LIKE:
+      case FTS_OP_NOT_LIKE:
+        return true;  // LIKE 操作暂不实现完整语义
+      default:
+        return true;
+    }
+  }
 
   TO_STRING_KV(K_(column_idx), "op", get_filter_op_name(op_type_), "value_count", values_.count());
 };
@@ -157,9 +210,79 @@ public:
   bool check_row(uint64_t doc_id, const ObFtsGenericCache &cache) const;
 
   /**
-   * 快速检查（使用 cache 的快速访问方法）
+   * 快速检查（支持内存模式和 KVCache 模式）
+   * 内联实现以减少函数调用开销
    */
-  bool check_row_fast(uint64_t doc_id, const ObFtsGenericCache &cache) const;
+  inline bool check_row_fast(uint64_t doc_id, ObFtsGenericCache &cache) const
+  {
+    if (condition_count_ == 0) {
+      return true;
+    }
+
+    if (doc_id == 0) {
+      return false;
+    }
+
+    // 判断使用哪种模式
+    const bool use_memory_mode = cache.is_inited();
+    const bool use_kvcache_mode = !use_memory_mode && cache.is_cache_file_opened();
+    
+    if (!use_memory_mode && !use_kvcache_mode) {
+      return true;  // 缓存不可用，跳过过滤
+    }
+    
+    // 检查 doc_id 范围
+    uint64_t max_doc_id = use_memory_mode ? 
+        static_cast<uint64_t>(cache.size()) : 
+        static_cast<uint64_t>(cache.get_file_header().row_count);
+    if (doc_id > max_doc_id) {
+      return false;
+    }
+
+    // 提前获取列数
+    const int64_t col_count = cache.column_count();
+    
+    if (use_memory_mode) {
+      // 内存模式：直接数组访问
+      for (int64_t i = 0; i < condition_count_; ++i) {
+        const ObFtsFilterCondition &cond = conditions_[i];
+        const int64_t col_idx = cond.column_idx_;
+        if (col_idx < 0 || col_idx >= col_count) continue;
+        
+        const ObFtsColumnValue &col_val = cache.get_column_fast(doc_id, col_idx);
+        if (!cond.check(col_val)) {
+          return false;
+        }
+      }
+    } else {
+      // KVCache 模式：从 KVCache 获取行数据
+      const ObFtsScalarCacheValue *row = nullptr;
+      common::ObKVCacheHandle handle;
+      int ret = cache.get_row_from_kvcache(doc_id, row, handle);
+      if (common::OB_SUCCESS != ret || row == nullptr) {
+        return true;  // 获取失败，跳过过滤
+      }
+      
+      // 检查每个条件
+      for (int64_t i = 0; i < condition_count_; ++i) {
+        const ObFtsFilterCondition &cond = conditions_[i];
+        const int64_t col_idx = cond.column_idx_;
+        if (col_idx < 0 || col_idx >= col_count) continue;
+        
+        // 从 KVCache 行数据获取列值
+        ObFtsColumnValue col_val;
+        if (common::OB_SUCCESS != row->get_column_value(col_idx, col_val)) {
+          continue;  // 获取失败，跳过这个条件
+        }
+        if (!cond.check(col_val)) {
+          return false;
+        }
+      }
+      // handle 析构时自动释放 KVCache 引用
+    }
+
+    return true;
+  }
 
   /**
    * V2: 从 KVCache 行数据检查过滤条件
@@ -231,7 +354,7 @@ private:
   int64_t limit_count_;
   bool has_limit_;
 
-  common::ObArenaAllocator allocator_;  // 用于存储比较值
+  common::ObArenaAllocator allocator_;         // 用于存储条件值（每次查询重置）
 };
 
 // 线程局部存储

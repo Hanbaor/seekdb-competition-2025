@@ -1212,16 +1212,16 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 验证过滤上下文是否正确传递（从 ob_table_scan_op.cpp）
     if (use_new_system) {
-      LOG_INFO("[FTS_NEW_SYSTEM] filter context in do_bm25s_search",
-               "condition_count", g_fts_generic_filter_ctx.condition_count(),
-               "has_limit", g_fts_generic_filter_ctx.has_limit(),
-               "limit_count", g_fts_generic_filter_ctx.get_limit());
+      // LOG_INFO("[FTS_NEW_SYSTEM] filter context in do_bm25s_search",
+      //          "condition_count", g_fts_generic_filter_ctx.condition_count(),
+      //          "has_limit", g_fts_generic_filter_ctx.has_limit(),
+      //          "limit_count", g_fts_generic_filter_ctx.get_limit());
     } else {
-      LOG_INFO("[FTS_OLD_SYSTEM] filter context in do_bm25s_search", 
-             "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
-             "id_limit", g_fts_filter_ctx.id_limit_,
-             "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
-               "base_id_count", g_fts_filter_ctx.base_id_count());
+      // LOG_INFO("[FTS_OLD_SYSTEM] filter context in do_bm25s_search", 
+      //        "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
+      //        "id_limit", g_fts_filter_ctx.id_limit_,
+      //        "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
+      //          "base_id_count", g_fts_filter_ctx.base_id_count());
     }
 
     if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
@@ -1261,18 +1261,18 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     int64_t id_limit = g_fts_filter_ctx.has_id_filter_ ? g_fts_filter_ctx.id_limit_ : INT64_MAX;
     
     // ========== 诊断日志：检查索引状态（KVCache 模式）==========
-    // 注意：get_posting_from_cache() 内部会自动调用 ensure_ready() 确保索引就绪
-    if (use_new_system) {
-      LOG_INFO("BM25S search: starting (KVCache mode, NEW SYSTEM)",
-               "query_tokens_count", query_tokens_.count(),
-               K(id_limit),
-               "generic_cache_size", g_fts_generic_cache.size());
-    } else {
-      LOG_INFO("BM25S search: starting (KVCache mode, OLD SYSTEM)",
-             "query_tokens_count", query_tokens_.count(),
-             K(id_limit),
-             "scalar_cache_size", g_fts_scalar_cache.size());
-    }
+    // 生产环境注释掉以提升 QPS
+    // if (use_new_system) {
+    //   LOG_INFO("BM25S search: starting (KVCache mode, NEW SYSTEM)",
+    //            "query_tokens_count", query_tokens_.count(),
+    //            K(id_limit),
+    //            "generic_cache_size", g_fts_generic_cache.size());
+    // } else {
+    //   LOG_INFO("BM25S search: starting (KVCache mode, OLD SYSTEM)",
+    //          "query_tokens_count", query_tokens_.count(),
+    //          K(id_limit),
+    //          "scalar_cache_size", g_fts_scalar_cache.size());
+    // }
     
     // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
     int64_t tokens_found = 0, tokens_not_found = 0;
@@ -1302,47 +1302,9 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       int64_t valid_count = posting->get_valid_count(id_limit);
       total_postings += valid_count;
       
-      // 遍历有效的 posting
+      // 遍历有效的 posting 
       for (int64_t i = 0; i < valid_count; i++) {
         uint32_t doc_id = posting->get_doc_id(i);
-        
-        // ========== 过滤检查：优先使用新系统 ==========
-        bool pass_filter = true;
-        
-        if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
-          // 新系统：优先使用内存模式，否则使用 KVCache 模式
-          if (use_new_system_memory) {
-            // 内存模式：直接访问内存缓存
-            pass_filter = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
-          } else if (use_new_system_kvcache) {
-            // KVCache 模式：从文件/缓存加载行数据
-            const ObFtsScalarCacheValue *row = nullptr;
-            common::ObKVCacheHandle handle;
-            int cache_ret = g_fts_generic_cache.get_row_from_kvcache(doc_id, row, handle);
-            if (OB_SUCCESS == cache_ret && OB_NOT_NULL(row)) {
-              pass_filter = g_fts_generic_filter_ctx.check_row_from_kvcache(row);
-            } else {
-              // 无法获取行数据，跳过过滤（保守策略，允许通过）
-              pass_filter = true;
-            }
-            // handle 析构时自动释放缓存引用
-          }
-          if (!pass_filter) {
-            filtered_by_base_id++;  // 复用计数器
-            continue;
-          }
-        } else if (use_old_system) {
-          // 旧系统：使用 Scalar Cache + FilterCtx
-        if (g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
-          const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
-          if (!g_fts_filter_ctx.check_base_id(base_id)) {
-            filtered_by_base_id++;
-            continue; // base_id 不匹配，跳过
-          }
-        }
-        }
-        // 如果两个系统都不可用，跳过过滤（允许所有文档通过）
-        
         float score = posting->get_score(i);
         
         if (scores_array[doc_id] == 0.0) {
@@ -1355,21 +1317,24 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     }
     
     // ========== 诊断日志：token 查找结果 ==========
-    LOG_INFO("BM25S search: token lookup summary",
-             K(tokens_found), K(tokens_not_found),
-             K(total_postings), K(filtered_by_base_id),
-             "touched_docs_count", touched_docs.count());
+    // 生产环境注释掉以提升 QPS
+    // LOG_INFO("BM25S search: token lookup summary",
+    //          K(tokens_found), K(tokens_not_found),
+    //          K(total_postings), K(filtered_by_base_id),
+    //          "touched_docs_count", touched_docs.count());
     
-    // 2. 收集并排序结果
+    // 2. 收集结果
     ObSEArray<ObFtsBM25SIndex::DocScore, 256> results;
     for (int64_t i = 0; i < touched_docs.count(); i++) {
       uint32_t doc_id = touched_docs.at(i);
       double score = scores_array[doc_id];
+      
+      // 清理已使用的位置，为下次查询做准备
+      scores_array[doc_id] = 0.0;
+      
       if (score > 0.0) {
         results.push_back(ObFtsBM25SIndex::DocScore(doc_id, score));
       }
-      // 清理已使用的位置，为下次查询做准备
-      scores_array[doc_id] = 0.0;
     }
     
     if (results.count() == 0) {
@@ -1377,12 +1342,10 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       return ret;
     }
     
-    // 直接从 IR 层获取 LIMIT 值（不依赖 topk_mode_）
-    int64_t effective_topk = 10; // 默认值
+    // 直接从 IR 层获取 LIMIT 值（进入 BM25S 模式时，topk 应该已下推）
+    int64_t effective_topk = topk_limit_;  // 优先使用已设置的值
     bool limit_from_expr = false;
-    if (topk_limit_ > 0) {
-      effective_topk = topk_limit_;
-    } else if (OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_) && OB_NOT_NULL(ir_rtdef_)) {
+    if (effective_topk <= 0 && OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_) && OB_NOT_NULL(ir_rtdef_)) {
       // 直接计算 topk_limit_expr_
       ObDatum *limit_datum = nullptr;
       if (OB_SUCCESS == ir_ctdef_->topk_limit_expr_->eval(*ir_rtdef_->eval_ctx_, limit_datum) && 
@@ -1404,10 +1367,13 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     //          "topk_expr", OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_),
     //          K(results.count()), K(capacity));
     
+    // 如果 topk 未下推（不应该发生），使用 results 数量作为 fallback
+    if (effective_topk <= 0) {
+      effective_topk = results.count();
+    }
+    
     int64_t k = std::min(effective_topk, (int64_t)results.count());
     k = std::min(k, capacity);
-    
-    // partial_sort 只排序前 k 个，比完整排序更高效
     if (results.count() > 1) {
       std::partial_sort(&results.at(0), 
                         &results.at(0) + k,
@@ -1416,7 +1382,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
                           return a.score > b.score;
                         });
     }
-    
+  
     // 3. 输出结果
     ObExpr *doc_id_expr = sr_iter_param_.id_proj_expr_; 
     ObExpr *score_expr = sr_iter_param_.relevance_proj_expr_;
@@ -1426,25 +1392,39 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("bm25s output expr is null", K(ret), KP(doc_id_expr), KP(score_expr), KP(eval_ctx));
     } else {
-      // 使用 locate_datums_for_update 来分配空间
       ObDatum *doc_id_datums = doc_id_expr->locate_datums_for_update(*eval_ctx, k);
       ObDatum *score_datums = score_expr->locate_datums_for_update(*eval_ctx, k);
       
       if (OB_ISNULL(doc_id_datums) || OB_ISNULL(score_datums)) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        for (int64_t i = 0; i < k; ++i) {
+        int64_t output_count = 0;
+        for (int64_t i = 0; i < k && output_count < capacity; ++i) {
           const auto &res = results.at(i);
-          doc_id_datums[i].set_int(res.doc_id);
-          score_datums[i].set_double(res.score);
+          uint32_t doc_id = res.doc_id;
+          bool pass = true;
+          if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
+            pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
+          } else if (use_old_system && g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
+            const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
+            pass = g_fts_filter_ctx.check_base_id(base_id);
+          }
+          
+          if (pass) {
+            doc_id_datums[output_count].set_int(doc_id);
+            score_datums[output_count].set_double(res.score);
+            output_count++;
+          } else {
+            filtered_by_base_id++;
+          }
         }
         
         ObBitVector &doc_eval_flags = doc_id_expr->get_evaluated_flags(*eval_ctx);
         ObBitVector &score_eval_flags = score_expr->get_evaluated_flags(*eval_ctx);
-        doc_eval_flags.set_all(k);
-        score_eval_flags.set_all(k);
+        doc_eval_flags.set_all(output_count);
+        score_eval_flags.set_all(output_count);
         
-        count = k;
+        count = output_count;
         bm25s_search_done_ = true;
       }
     }
@@ -1454,7 +1434,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
   int ObDASTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   {
     int ret = OB_SUCCESS;
-    // BM25S 模式：使用 TAAT 算法（索引加载已在 do_table_scan 中完成）
+    // BM25S 模式：使用 TAAT 算法
     if (g_bm25s_index.is_ready() && query_tokens_.count() > 0) {
       return do_bm25s_search(count, capacity);
     }
