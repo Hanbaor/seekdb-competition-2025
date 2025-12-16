@@ -1410,22 +1410,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
           bool pass = true;
           
           if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
-            // V3: 优先使用 KVCache 模式进行过滤检查
-            if (use_new_system_kvcache) {
-              // KVCache 模式：从缓存/文件获取行数据后检查
-              const ObFtsScalarCacheValue *row = nullptr;
-              common::ObKVCacheHandle handle;
-              int cache_ret = g_fts_generic_cache.get_row_from_kvcache(doc_id, row, handle);
-              if (OB_SUCCESS == cache_ret && OB_NOT_NULL(row)) {
-                pass = g_fts_generic_filter_ctx.check_row_from_kvcache(row);
-              } else {
-                // 缓存获取失败，默认通过（不做过滤）
-                pass = true;
-              }
-            } else {
-              // 内存模式：直接检查内存中的数据
-              pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
-            }
+            // V4: 统一使用 check_row_fast，内部会根据 use_hashmap_ 选择 HashMap 或 KVCache
+            pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
           } else if (use_old_system && g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
             const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
             pass = g_fts_filter_ctx.check_base_id(base_id);
