@@ -371,41 +371,32 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         }
 
         // 收集完毕后，统一检查缓存命中
-        // ========== 优先使用新系统（内存模式或 KVCache 模式）==========
+        // ========== V3: 优先使用 KVCache 模式 ==========
         bool will_cache_hit = false;
-        const bool use_new_cache_memory = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
         
-        // 如果内存缓存不可用，尝试加载持久化文件
-        if (!use_new_cache_memory && !g_fts_generic_cache.is_cache_file_opened()) {
+        // 先尝试加载持久化文件（如果尚未加载）
+        if (!g_fts_generic_cache.is_cache_file_opened()) {
           int ensure_ret = g_fts_generic_cache.ensure_ready();
           if (OB_SUCCESS == ensure_ret) {
-            // LOG_INFO("[FTS_LOOKUP] Cache loaded from disk via ensure_ready");
-          } else if (OB_ENTRY_NOT_EXIST != ensure_ret) {
+            // LOG_INFO("[FTS_LOOKUP] Cache loaded from disk via ensure_ready (KVCache Mode)");
+          } else if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
             LOG_WARN("[FTS_LOOKUP] Failed to ensure cache ready", K(ensure_ret));
           }
         }
         
+        // V3: 优先使用 KVCache 模式，内存模式作为备选
         const bool use_new_cache_kvcache = g_fts_generic_cache.is_cache_file_opened();
-        const bool use_new_cache = use_new_cache_memory || use_new_cache_kvcache;
-        const bool use_old_cache = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+        const bool use_new_cache_memory = !use_new_cache_kvcache && 
+                                          g_fts_generic_cache.is_inited() && 
+                                          g_fts_generic_cache.size() > 0;
+        const bool use_new_cache = use_new_cache_kvcache || use_new_cache_memory;
+        const bool use_old_cache = !use_new_cache && 
+                                   g_fts_scalar_cache.is_inited() && 
+                                   g_fts_scalar_cache.size() > 0;
         
         if (OB_SUCC(ret) && lookup_rowkey_cnt_ > 0) {
-          if (use_new_cache_memory) {
-            // 新系统内存模式：使用 Generic Cache
-            will_cache_hit = true;
-            for (int64_t i = 0; i < cached_doc_ids_.count(); ++i) {
-              uint64_t doc_id = cached_doc_ids_.at(i);
-              if (doc_id == 0 || doc_id > static_cast<uint64_t>(g_fts_generic_cache.size())) {
-                will_cache_hit = false;
-                break;
-              }
-            }
-            // if (will_cache_hit) {
-            //   LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache Memory Mode)", 
-            //            "doc_count", cached_doc_ids_.count());
-            // }
-          } else if (use_new_cache_kvcache) {
-            // 新系统 KVCache 模式：使用持久化文件 + KVCache
+          if (use_new_cache_kvcache) {
+            // V3: 优先使用 KVCache 模式
             will_cache_hit = true;
             int64_t file_row_count = g_fts_generic_cache.get_file_header().row_count;
             for (int64_t i = 0; i < cached_doc_ids_.count(); ++i) {
@@ -416,9 +407,23 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
               }
             }
             // if (will_cache_hit) {
-            //   LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache KVCache Mode)", 
+            //   LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache KVCache Mode - Preferred)", 
             //            "doc_count", cached_doc_ids_.count(),
             //            "file_row_count", file_row_count);
+            // }
+          } else if (use_new_cache_memory) {
+            // 内存模式作为备选
+            will_cache_hit = true;
+            for (int64_t i = 0; i < cached_doc_ids_.count(); ++i) {
+              uint64_t doc_id = cached_doc_ids_.at(i);
+              if (doc_id == 0 || doc_id > static_cast<uint64_t>(g_fts_generic_cache.size())) {
+                will_cache_hit = false;
+                break;
+              }
+            }
+            // if (will_cache_hit) {
+            //   LOG_INFO("[FTS_LOOKUP] Using NEW system (Generic Cache Memory Mode - Fallback)", 
+            //            "doc_count", cached_doc_ids_.count());
             // }
           } else if (use_old_cache) {
             // 旧系统：使用 Scalar Cache
@@ -470,14 +475,18 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         const ObDASScanCtDef *lookup_ctdef = static_cast<const ObDASScanCtDef*>(lookup_ctdef_);
         int64_t total_doc_ids = cached_doc_ids_.count();
         
-        // ========== 检测使用哪套缓存系统 ==========
-        const bool new_cache_memory_available = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
+        // ========== V3: 优先使用 KVCache 模式 ==========
         const bool new_cache_kvcache_available = g_fts_generic_cache.is_cache_file_opened();
-        const bool new_cache_available = new_cache_memory_available || new_cache_kvcache_available;
-        const bool old_cache_available = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+        const bool new_cache_memory_available = !new_cache_kvcache_available && 
+                                                g_fts_generic_cache.is_inited() && 
+                                                g_fts_generic_cache.size() > 0;
+        const bool new_cache_available = new_cache_kvcache_available || new_cache_memory_available;
+        const bool old_cache_available = !new_cache_available && 
+                                         g_fts_scalar_cache.is_inited() && 
+                                         g_fts_scalar_cache.size() > 0;
         const bool cache_inited = new_cache_available || old_cache_available;
-        const int64_t cache_size = new_cache_memory_available ? g_fts_generic_cache.size() : 
-                                   (new_cache_kvcache_available ? g_fts_generic_cache.get_file_header().row_count : 
+        const int64_t cache_size = new_cache_kvcache_available ? g_fts_generic_cache.get_file_header().row_count : 
+                                   (new_cache_memory_available ? g_fts_generic_cache.size() : 
                                     g_fts_scalar_cache.size());
         const bool cache_available = cache_inited && cache_size > 0;
         const int64_t output_col_count = OB_NOT_NULL(lookup_ctdef) ? lookup_ctdef->result_output_.count() : 0;
@@ -513,67 +522,8 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
           // 一次遍历：填充数据（如果 cache_verified_ 为 true，跳过检查）
           all_cache_hit = true;
           
-          // ========== 优先使用新系统获取数据 ==========
-          if (new_cache_memory_available) {
-            // 新系统内存模式：使用 Generic Cache
-            // LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system (Memory Mode) for data retrieval",
-            //          K(cache_fill_count), K(output_col_count));
-            
-            for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
-              uint64_t doc_id = cached_doc_ids_.at(i);
-              
-              // 检查 doc_id 是否有效
-              if (!cache_verified_ && (doc_id == 0 || doc_id > static_cast<uint64_t>(g_fts_generic_cache.size()))) {
-                all_cache_hit = false;
-                break;
-              }
-              
-              // 填充数据到 datum 数组
-              // 新系统使用类型签名匹配列
-              int64_t int_col_order = 0;
-              int64_t str_col_order = 0;
-              
-              for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
-                if (OB_ISNULL(col_datums[j])) continue;
-                
-                ObDatum &datum = col_datums[j][i];
-                ObObjType col_type = static_cast<ObObjType>(col_types[j]);
-                
-                if (ob_is_integer_type(col_type)) {
-                  // 整数类型：根据类型序号查找
-                  int64_t cache_col_idx = g_fts_generic_cache.find_column_by_type(col_type, int_col_order);
-                  if (cache_col_idx >= 0) {
-                    int64_t val = g_fts_generic_cache.get_int_column_fast(doc_id, cache_col_idx);
-                    datum.set_uint(static_cast<uint64_t>(val));
-                  } else {
-                    datum.set_uint(doc_id);  // fallback: 使用 doc_id
-                  }
-                  int_col_order++;
-                } else if (ob_is_string_type(col_type)) {
-                  // 字符串类型：根据类型序号查找
-                  int64_t cache_col_idx = g_fts_generic_cache.find_column_by_type(ObVarcharType, str_col_order);
-                  if (cache_col_idx >= 0) {
-                    ObString src = g_fts_generic_cache.get_string_column_fast(doc_id, cache_col_idx);
-                    if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
-                      char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
-                      if (OB_ISNULL(buf)) {
-                        ret = OB_ALLOCATE_MEMORY_FAILED;
-                        LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
-                      } else {
-                        MEMCPY(buf, src.ptr(), src.length());
-                        datum.set_string(buf, src.length());
-                      }
-                    } else {
-                      datum.set_string(nullptr, 0);
-                    }
-                  } else {
-                    datum.set_string(nullptr, 0);
-                  }
-                  str_col_order++;
-                }
-              }
-            }
-          } else if (new_cache_kvcache_available) {
+          // ========== V3: 优先使用 KVCache 模式获取数据 ==========
+          if (new_cache_kvcache_available) {
             // 新系统 KVCache 模式：从文件/缓存加载行数据
             // LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system (KVCache Mode) for data retrieval",
             //          K(cache_fill_count), K(output_col_count));
@@ -648,7 +598,66 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
               }
               // handle 析构时自动释放 KVCache 引用
             }
-          } else {
+          } else if (new_cache_memory_available) {
+            // 内存模式作为备选：使用 Generic Cache 内存数据
+            // LOG_INFO("[FTS_LOOKUP_OUTPUT] Using NEW system (Memory Mode - Fallback) for data retrieval",
+            //          K(cache_fill_count), K(output_col_count));
+            
+            for (int64_t i = 0; OB_SUCC(ret) && i < cache_fill_count; ++i) {
+              uint64_t doc_id = cached_doc_ids_.at(i);
+              
+              // 检查 doc_id 是否有效
+              if (!cache_verified_ && (doc_id == 0 || doc_id > static_cast<uint64_t>(g_fts_generic_cache.size()))) {
+                all_cache_hit = false;
+                break;
+              }
+              
+              // 填充数据到 datum 数组
+              // 新系统使用类型签名匹配列
+              int64_t int_col_order = 0;
+              int64_t str_col_order = 0;
+              
+              for (int64_t j = 0; OB_SUCC(ret) && j < output_col_count; ++j) {
+                if (OB_ISNULL(col_datums[j])) continue;
+                
+                ObDatum &datum = col_datums[j][i];
+                ObObjType col_type = static_cast<ObObjType>(col_types[j]);
+                
+                if (ob_is_integer_type(col_type)) {
+                  // 整数类型：根据类型序号查找
+                  int64_t cache_col_idx = g_fts_generic_cache.find_column_by_type(col_type, int_col_order);
+                  if (cache_col_idx >= 0) {
+                    int64_t val = g_fts_generic_cache.get_int_column_fast(doc_id, cache_col_idx);
+                    datum.set_uint(static_cast<uint64_t>(val));
+                  } else {
+                    datum.set_uint(doc_id);  // fallback: 使用 doc_id
+                  }
+                  int_col_order++;
+                } else if (ob_is_string_type(col_type)) {
+                  // 字符串类型：根据类型序号查找
+                  int64_t cache_col_idx = g_fts_generic_cache.find_column_by_type(ObVarcharType, str_col_order);
+                  if (cache_col_idx >= 0) {
+                    ObString src = g_fts_generic_cache.get_string_column_fast(doc_id, cache_col_idx);
+                    if (src.length() > 0 && OB_NOT_NULL(src.ptr())) {
+                      char *buf = static_cast<char*>(eval_ctx_->exec_ctx_.get_allocator().alloc(src.length()));
+                      if (OB_ISNULL(buf)) {
+                        ret = OB_ALLOCATE_MEMORY_FAILED;
+                        LOG_WARN("failed to allocate string memory", K(ret), K(src.length()));
+                      } else {
+                        MEMCPY(buf, src.ptr(), src.length());
+                        datum.set_string(buf, src.length());
+                      }
+                    } else {
+                      datum.set_string(nullptr, 0);
+                    }
+                  } else {
+                    datum.set_string(nullptr, 0);
+                  }
+                  str_col_order++;
+                }
+              }
+            }
+          } else if (old_cache_available) {
             // 旧系统：使用 Scalar Cache
             // LOG_INFO("[FTS_LOOKUP_OUTPUT] Using OLD system for data retrieval",
             //          K(cache_fill_count), K(output_col_count));

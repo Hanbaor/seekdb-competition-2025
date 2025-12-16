@@ -37,7 +37,13 @@ ObFtsGenericCache::ObFtsGenericCache()
     lock_(common::ObLatchIds::DEFAULT_SPIN_LOCK),
     persist_file_opened_(false),
     row_index_(nullptr),
-    cache_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "FtsGenKVCache"))
+    cache_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "FtsGenKVCache")),
+    streaming_mode_(false),
+    streaming_data_offset_(0),
+    streaming_row_data_start_(0),
+    streaming_row_index_(nullptr),
+    streaming_row_index_capacity_(0),
+    streaming_row_buf_(nullptr)
 {
   for (int64_t i = 0; i < MAX_COLUMNS; ++i) {
     column_data_[i] = nullptr;
@@ -437,6 +443,25 @@ void ObFtsGenericCache::destroy()
 
   // 关闭持久化文件
   close_cache_file();
+  
+  // 关闭流式写入文件
+  if (streaming_mode_ && streaming_fd_.is_normal_file()) {
+    share::ObIODeviceLocalFileOp::close(streaming_fd_);
+    streaming_mode_ = false;
+  }
+  
+  // 释放流式存储缓冲区
+  if (OB_NOT_NULL(streaming_row_index_)) {
+    ob_free(streaming_row_index_);
+    streaming_row_index_ = nullptr;
+    streaming_row_index_capacity_ = 0;
+  }
+  if (OB_NOT_NULL(streaming_row_buf_)) {
+    ob_free(streaming_row_buf_);
+    streaming_row_buf_ = nullptr;
+  }
+  streaming_data_offset_ = 0;
+  streaming_row_data_start_ = 0;
 
   column_count_ = 0;
   count_ = 0;
@@ -1137,6 +1162,439 @@ int ObFtsGenericCache::ensure_ready()
   } else {
     LOG_WARN("[FTS_GENERIC_CACHE] ensure_ready: fail to load from disk", K(ret));
   }
+  
+  return ret;
+}
+
+// ========================================================================
+// V3: 流式存储实现
+// ========================================================================
+
+int ObFtsGenericCache::init_streaming_persist(const char *cache_dir,
+                                              const common::ObIArray<ObFtsColumnMeta> &column_metas,
+                                              int64_t estimated_rows)
+{
+  int ret = common::OB_SUCCESS;
+  
+  if (streaming_mode_) {
+    ret = common::OB_INIT_TWICE;
+    LOG_WARN("[FTS_GENERIC_CACHE] streaming persist already initialized", K(ret));
+    return ret;
+  }
+  
+  if (OB_ISNULL(cache_dir)) {
+    ret = common::OB_INVALID_ARGUMENT;
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: cache_dir is null", K(ret));
+    return ret;
+  }
+  
+  if (column_metas.count() <= 0 || column_metas.count() > MAX_COLUMNS) {
+    ret = common::OB_INVALID_ARGUMENT;
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: invalid column count", 
+             K(ret), "count", column_metas.count());
+    return ret;
+  }
+  
+  LOG_INFO("[FTS_GENERIC_CACHE] init_streaming_persist: starting", 
+           K(cache_dir), "column_count", column_metas.count(), K(estimated_rows));
+  
+  // 1. 创建目录
+  if (OB_FAIL(share::ObIODeviceLocalFileOp::mkdir(cache_dir, 0755))) {
+    if (OB_FILE_OR_DIRECTORY_EXIST == ret) {
+      ret = common::OB_SUCCESS;
+    } else {
+      LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: fail to mkdir", K(ret), K(cache_dir));
+      return ret;
+    }
+  }
+  
+  // 2. 构建文件路径
+  char file_path[512];
+  int n = snprintf(file_path, sizeof(file_path), "%s/fts_scalar_cache.dat", cache_dir);
+  if (n < 0 || n >= static_cast<int>(sizeof(file_path))) {
+    ret = common::OB_SIZE_OVERFLOW;
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: path too long", K(ret));
+    return ret;
+  }
+  
+  // 3. 打开文件
+  if (OB_FAIL(share::ObIODeviceLocalFileOp::open(file_path, 
+                                          O_CREAT | O_WRONLY | O_TRUNC, 
+                                          0644, streaming_fd_))) {
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: fail to open file", K(ret), K(file_path));
+    return ret;
+  }
+  
+  // 4. 复制列元数据
+  column_count_ = column_metas.count();
+  for (int64_t i = 0; i < column_count_; ++i) {
+    column_metas_[i] = column_metas.at(i);
+  }
+  
+  // 5. 初始化文件头
+  file_header_.reset();
+  file_header_.magic = FtsScalarCacheFileHeader::MAGIC;
+  file_header_.version = FtsScalarCacheFileHeader::CURRENT_VERSION;
+  file_header_.row_count = 0;
+  file_header_.column_count = column_count_;
+  file_header_.max_doc_id = 0;
+  file_header_.create_timestamp = common::ObTimeUtility::current_time();
+  
+  // 计算各 section 的偏移
+  file_header_.column_meta_offset = FtsScalarCacheFileHeader::HEADER_SIZE;
+  file_header_.column_meta_size = column_count_ * sizeof(FtsColumnMetaEntry);
+  file_header_.row_index_offset = file_header_.column_meta_offset + file_header_.column_meta_size;
+  // row_index_size 在 finish_streaming_persist 中更新
+  // row_data_offset 在 finish_streaming_persist 中更新
+  
+  // 6. 写入初始 Header（占位）
+  int64_t write_size = 0;
+  if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(
+          streaming_fd_.second_id_, &file_header_, sizeof(file_header_), 0, write_size))) {
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: fail to write header", K(ret));
+    share::ObIODeviceLocalFileOp::close(streaming_fd_);
+    return ret;
+  }
+  
+  // 7. 写入 Column Meta
+  FtsColumnMetaEntry *entries = static_cast<FtsColumnMetaEntry*>(
+      ob_malloc(sizeof(FtsColumnMetaEntry) * column_count_, mem_attr_));
+  if (OB_ISNULL(entries)) {
+    ret = common::OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: fail to alloc column meta", K(ret));
+    share::ObIODeviceLocalFileOp::close(streaming_fd_);
+    return ret;
+  }
+  
+  for (int64_t i = 0; i < column_count_; ++i) {
+    entries[i].column_type = static_cast<int32_t>(column_metas_[i].obj_type_);
+    entries[i].type_order = static_cast<int32_t>(column_metas_[i].type_order_);
+    entries[i].type_signature = column_metas_[i].type_signature_;
+    entries[i].is_primary_key = column_metas_[i].is_primary_key_ ? 1 : 0;
+    entries[i].is_nullable = column_metas_[i].is_nullable_ ? 1 : 0;
+  }
+  
+  if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(
+          streaming_fd_.second_id_, entries, sizeof(FtsColumnMetaEntry) * column_count_,
+          file_header_.column_meta_offset, write_size))) {
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: fail to write column meta", K(ret));
+    ob_free(entries);
+    share::ObIODeviceLocalFileOp::close(streaming_fd_);
+    return ret;
+  }
+  ob_free(entries);
+  
+  // 8. 分配行索引缓冲区
+  streaming_row_index_capacity_ = estimated_rows > 0 ? estimated_rows : DEFAULT_CAPACITY;
+  streaming_row_index_ = static_cast<FtsRowIndexEntry*>(
+      ob_malloc(sizeof(FtsRowIndexEntry) * streaming_row_index_capacity_, mem_attr_));
+  if (OB_ISNULL(streaming_row_index_)) {
+    ret = common::OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: fail to alloc row index", K(ret));
+    share::ObIODeviceLocalFileOp::close(streaming_fd_);
+    return ret;
+  }
+  memset(streaming_row_index_, 0, sizeof(FtsRowIndexEntry) * streaming_row_index_capacity_);
+  
+  // 9. 分配行数据序列化缓冲区
+  streaming_row_buf_ = static_cast<char*>(ob_malloc(STREAMING_ROW_BUF_SIZE, mem_attr_));
+  if (OB_ISNULL(streaming_row_buf_)) {
+    ret = common::OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("[FTS_GENERIC_CACHE] init_streaming_persist: fail to alloc row buffer", K(ret));
+    ob_free(streaming_row_index_);
+    streaming_row_index_ = nullptr;
+    share::ObIODeviceLocalFileOp::close(streaming_fd_);
+    return ret;
+  }
+  
+  // 10. 初始化状态
+  // Row Data 起始位置 = Row Index 结束位置（预留空间，实际在 finish 时写入）
+  // 固定 Row Data 的起始位置，即使后续 Row Index 扩容也不会改变
+  streaming_row_data_start_ = file_header_.row_index_offset + 
+                              streaming_row_index_capacity_ * sizeof(FtsRowIndexEntry);
+  streaming_data_offset_ = 0;  // 相对于 Row Data 区域的偏移
+  count_ = 0;
+  streaming_mode_ = true;
+  MEMCPY(cache_file_path_, file_path, strlen(file_path) + 1);
+  
+  LOG_INFO("[FTS_GENERIC_CACHE] init_streaming_persist: completed successfully", 
+           K(file_path), K_(column_count), K_(streaming_row_index_capacity),
+           K_(streaming_row_data_start));
+  
+  return ret;
+}
+
+int ObFtsGenericCache::serialize_row_from_values(const ObFtsColumnValue *column_values,
+                                                  char *buf, int64_t buf_len, int64_t &row_size)
+{
+  int ret = common::OB_SUCCESS;
+  char *p = buf;
+  char *end = buf + buf_len;
+  
+  for (int64_t col_idx = 0; col_idx < column_count_ && p < end; ++col_idx) {
+    const ObFtsColumnValue &val = column_values[col_idx];
+    
+    // 写入类型标记
+    *p++ = static_cast<char>(val.type_);
+    
+    // 写入值
+    switch (val.type_) {
+      case ObFtsColumnValue::TYPE_NULL:
+        // 无额外数据
+        break;
+      case ObFtsColumnValue::TYPE_INT64:
+        if (p + sizeof(int64_t) <= end) {
+          memcpy(p, &val.int_val_, sizeof(int64_t));
+          p += sizeof(int64_t);
+        }
+        break;
+      case ObFtsColumnValue::TYPE_UINT64:
+        if (p + sizeof(uint64_t) <= end) {
+          memcpy(p, &val.uint_val_, sizeof(uint64_t));
+          p += sizeof(uint64_t);
+        }
+        break;
+      case ObFtsColumnValue::TYPE_DOUBLE:
+        if (p + sizeof(double) <= end) {
+          memcpy(p, &val.double_val_, sizeof(double));
+          p += sizeof(double);
+        }
+        break;
+      case ObFtsColumnValue::TYPE_STRING: {
+        int32_t len = val.str_val_.len_;
+        if (p + sizeof(int32_t) + len <= end) {
+          memcpy(p, &len, sizeof(int32_t));
+          p += sizeof(int32_t);
+          if (len > 0 && OB_NOT_NULL(val.str_val_.ptr_)) {
+            memcpy(p, val.str_val_.ptr_, len);
+            p += len;
+          }
+        }
+        break;
+      }
+      case ObFtsColumnValue::TYPE_DATETIME:
+        if (p + sizeof(int64_t) <= end) {
+          memcpy(p, &val.datetime_val_, sizeof(int64_t));
+          p += sizeof(int64_t);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  
+  row_size = p - buf;
+  return ret;
+}
+
+int ObFtsGenericCache::streaming_add_row(uint64_t doc_id, const ObFtsColumnValue *column_values)
+{
+  int ret = common::OB_SUCCESS;
+  
+  if (!streaming_mode_) {
+    ret = common::OB_NOT_INIT;
+    LOG_WARN("[FTS_GENERIC_CACHE] streaming_add_row: not in streaming mode", K(ret));
+    return ret;
+  }
+  
+  if (doc_id == 0 || OB_ISNULL(column_values)) {
+    ret = common::OB_INVALID_ARGUMENT;
+    LOG_WARN("[FTS_GENERIC_CACHE] streaming_add_row: invalid argument", K(ret), K(doc_id));
+    return ret;
+  }
+  
+  common::ObSpinLockGuard guard(lock_);
+  
+  // 确保行索引缓冲区容量足够
+  if (doc_id > static_cast<uint64_t>(streaming_row_index_capacity_)) {
+    int64_t new_capacity = streaming_row_index_capacity_ * 2;
+    while (new_capacity < static_cast<int64_t>(doc_id)) {
+      new_capacity *= 2;
+    }
+    
+    FtsRowIndexEntry *new_index = static_cast<FtsRowIndexEntry*>(
+        ob_malloc(sizeof(FtsRowIndexEntry) * new_capacity, mem_attr_));
+    if (OB_ISNULL(new_index)) {
+      ret = common::OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[FTS_GENERIC_CACHE] streaming_add_row: fail to expand row index", K(ret));
+      return ret;
+    }
+    
+    memset(new_index, 0, sizeof(FtsRowIndexEntry) * new_capacity);
+    if (OB_NOT_NULL(streaming_row_index_)) {
+      memcpy(new_index, streaming_row_index_, 
+             sizeof(FtsRowIndexEntry) * streaming_row_index_capacity_);
+      ob_free(streaming_row_index_);
+    }
+    streaming_row_index_ = new_index;
+    streaming_row_index_capacity_ = new_capacity;
+    
+    LOG_INFO("[FTS_GENERIC_CACHE] streaming_add_row: expanded row index capacity", 
+             K(new_capacity));
+  }
+  
+  // 序列化行数据
+  int64_t row_size = 0;
+  if (OB_FAIL(serialize_row_from_values(column_values, streaming_row_buf_, 
+                                        STREAMING_ROW_BUF_SIZE, row_size))) {
+    LOG_WARN("[FTS_GENERIC_CACHE] streaming_add_row: fail to serialize row", K(ret), K(doc_id));
+    return ret;
+  }
+  
+  // 记录行索引
+  uint64_t row_idx = doc_id - 1;
+  streaming_row_index_[row_idx].data_offset = streaming_data_offset_;
+  streaming_row_index_[row_idx].data_size = row_size;
+  
+  // 写入行数据到固定的 Row Data 区域
+  // 使用初始化时确定的 streaming_row_data_start_，避免扩容时位置跳变
+  int64_t write_offset = streaming_row_data_start_ + streaming_data_offset_;
+  int64_t write_size = 0;
+  if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(
+          streaming_fd_.second_id_, streaming_row_buf_, row_size, write_offset, write_size))) {
+    LOG_WARN("[FTS_GENERIC_CACHE] streaming_add_row: fail to write row", K(ret), K(doc_id));
+    return ret;
+  }
+  
+  streaming_data_offset_ += row_size;
+  
+  if (doc_id > count_) {
+    count_ = doc_id;
+  }
+  
+  // 采样日志
+  if (count_ == 1 || count_ % 50000 == 0) {
+    LOG_INFO("[FTS_GENERIC_CACHE] streaming_add_row: progress", 
+             K_(count), K_(streaming_data_offset));
+  }
+  
+  return ret;
+}
+
+int ObFtsGenericCache::streaming_add_row_from_exprs(uint64_t doc_id,
+                                                     const common::ObIArray<ObExpr*> &output_exprs,
+                                                     ObEvalCtx &eval_ctx)
+{
+  int ret = common::OB_SUCCESS;
+  
+  if (!streaming_mode_) {
+    ret = common::OB_NOT_INIT;
+    return ret;
+  }
+  
+  if (doc_id == 0) {
+    ret = common::OB_INVALID_ARGUMENT;
+    return ret;
+  }
+  
+  // 从表达式提取列值到临时数组
+  ObFtsColumnValue temp_values[MAX_COLUMNS];
+  
+  for (int64_t col_idx = 0; col_idx < column_count_; ++col_idx) {
+    const ObFtsColumnMeta &meta = column_metas_[col_idx];
+    
+    if (meta.output_idx_ < 0 || meta.output_idx_ >= output_exprs.count()) {
+      temp_values[col_idx] = ObFtsColumnValue::make_null();
+      continue;
+    }
+    
+    ObExpr *expr = output_exprs.at(meta.output_idx_);
+    if (OB_ISNULL(expr)) {
+      temp_values[col_idx] = ObFtsColumnValue::make_null();
+      continue;
+    }
+    
+    ObDatum *datum = nullptr;
+    int eval_ret = expr->eval(eval_ctx, datum);
+    if (OB_SUCCESS != eval_ret) {
+      temp_values[col_idx] = ObFtsColumnValue::make_null();
+      continue;
+    }
+    
+    if (OB_ISNULL(datum) || datum->is_null()) {
+      temp_values[col_idx] = ObFtsColumnValue::make_null();
+    } else {
+      // 注意：流式模式下不需要深拷贝字符串，因为会立即序列化到文件
+      int conv_ret = ObFtsColumnValue::from_datum(*datum, meta.obj_type_, allocator_, temp_values[col_idx]);
+      if (OB_SUCCESS != conv_ret) {
+        temp_values[col_idx] = ObFtsColumnValue::make_null();
+      }
+    }
+  }
+  
+  // 调用 streaming_add_row 写入
+  ret = streaming_add_row(doc_id, temp_values);
+  
+  return ret;
+}
+
+int ObFtsGenericCache::finish_streaming_persist()
+{
+  int ret = common::OB_SUCCESS;
+  
+  if (!streaming_mode_) {
+    ret = common::OB_NOT_INIT;
+    LOG_WARN("[FTS_GENERIC_CACHE] finish_streaming_persist: not in streaming mode", K(ret));
+    return ret;
+  }
+  
+  LOG_INFO("[FTS_GENERIC_CACHE] finish_streaming_persist: starting", 
+           K_(count), K_(streaming_data_offset));
+  
+  common::ObSpinLockGuard guard(lock_);
+  
+  // 1. 更新文件头
+  // 使用初始化时确定的固定起始位置，确保与写入时一致
+  file_header_.row_count = count_;
+  file_header_.max_doc_id = count_;
+  file_header_.row_index_size = count_ * sizeof(FtsRowIndexEntry);
+  file_header_.row_data_offset = streaming_row_data_start_;  // 使用固定的起始位置
+  file_header_.row_data_size = streaming_data_offset_;
+  
+  // 2. 写入 Row Index
+  int64_t write_size = 0;
+  if (count_ > 0 && OB_NOT_NULL(streaming_row_index_)) {
+    if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(
+            streaming_fd_.second_id_, streaming_row_index_, 
+            count_ * sizeof(FtsRowIndexEntry),
+            file_header_.row_index_offset, write_size))) {
+      LOG_WARN("[FTS_GENERIC_CACHE] finish_streaming_persist: fail to write row index", K(ret));
+      // 继续执行，尝试更新 header
+    }
+  }
+  
+  // 3. 更新 Header
+  if (OB_FAIL(share::ObIODeviceLocalFileOp::pwrite_impl(
+          streaming_fd_.second_id_, &file_header_, sizeof(file_header_), 0, write_size))) {
+    LOG_WARN("[FTS_GENERIC_CACHE] finish_streaming_persist: fail to update header", K(ret));
+  }
+  
+  // 4. 同步并关闭文件
+  if (streaming_fd_.is_normal_file()) {
+    share::ObIODeviceLocalFileOp::fsync(streaming_fd_);
+    share::ObIODeviceLocalFileOp::close(streaming_fd_);
+  }
+  
+  // 5. 释放流式存储缓冲区
+  if (OB_NOT_NULL(streaming_row_index_)) {
+    ob_free(streaming_row_index_);
+    streaming_row_index_ = nullptr;
+    streaming_row_index_capacity_ = 0;
+  }
+  if (OB_NOT_NULL(streaming_row_buf_)) {
+    ob_free(streaming_row_buf_);
+    streaming_row_buf_ = nullptr;
+  }
+  
+  // 6. 更新状态
+  streaming_mode_ = false;
+  streaming_data_offset_ = 0;
+  // 注意：不设置 is_inited_ = true，因为内存中没有数据
+  // 后续使用应该通过 KVCache 模式访问
+  
+  LOG_INFO("[FTS_GENERIC_CACHE] finish_streaming_persist: completed successfully",
+           K_(cache_file_path), K_(count), K_(column_count),
+           "row_data_size", file_header_.row_data_size);
   
   return ret;
 }

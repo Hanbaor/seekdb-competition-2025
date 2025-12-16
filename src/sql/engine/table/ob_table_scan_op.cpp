@@ -1765,24 +1765,20 @@
         }
       }
       
-      // ========== 新系统：从过滤表达式自动提取条件 ==========
-      // 内存模式或 KVCache 模式都需要提取过滤条件
-      // - is_inited() = true: 内存模式，列元数据在内存中
-      // - is_cache_file_opened() = true: KVCache 模式，列元数据从文件加载
-      const bool cache_ready_for_filter = g_fts_generic_cache.is_inited() || 
-                                          g_fts_generic_cache.is_cache_file_opened();
-      
-      // 如果缓存文件存在但未加载，尝试加载
-      if (!cache_ready_for_filter && !g_fts_generic_cache.is_cache_file_opened()) {
+      // ========== V3: 优先使用 KVCache 模式提取过滤条件 ==========
+      // 先尝试加载持久化文件（如果尚未加载）
+      if (!g_fts_generic_cache.is_cache_file_opened()) {
         int ensure_ret = g_fts_generic_cache.ensure_ready();
         if (OB_SUCCESS == ensure_ret) {
-          LOG_INFO("[FTS_NEW_SYSTEM] Cache loaded from disk for filter extraction");
+          LOG_INFO("[FTS_NEW_SYSTEM] Cache loaded from disk for filter extraction (KVCache Mode)");
         }
       }
       
-      // 重新检查缓存状态
-      const bool cache_available = g_fts_generic_cache.is_inited() || 
-                                   g_fts_generic_cache.is_cache_file_opened();
+      // 检查缓存状态（优先 KVCache 模式）
+      const bool cache_kvcache_available = g_fts_generic_cache.is_cache_file_opened();
+      const bool cache_memory_available = !cache_kvcache_available && 
+                                          g_fts_generic_cache.is_inited();
+      const bool cache_available = cache_kvcache_available || cache_memory_available;
       
       if (cache_available) {
         int extract_ret = g_fts_generic_filter_ctx.extract_from_filters(
@@ -1790,8 +1786,8 @@
         if (OB_SUCCESS == extract_ret) {
           LOG_INFO("[FTS_NEW_SYSTEM] filter extraction SUCCESS",
                    "condition_count", g_fts_generic_filter_ctx.condition_count(),
-                   "is_memory_mode", g_fts_generic_cache.is_inited(),
-                   "is_kvcache_mode", g_fts_generic_cache.is_cache_file_opened());
+                   "is_kvcache_mode", cache_kvcache_available,
+                   "is_memory_mode", cache_memory_available);
         } else {
           LOG_INFO("[FTS_NEW_SYSTEM] filter extraction FAILED, fallback to old system",
                    K(extract_ret));
@@ -4192,7 +4188,7 @@
      }
    }
    
-   // 新系统：初始化 Generic Cache（根据表结构动态配置列）
+   // 新系统：初始化 Generic Cache（使用流式存储，减少内存占用）
    if (!fts_generic_cache_initialized) {
      // 分析 MY_SPEC.output_ 获取需要缓存的列元数据
      common::ObArray<ObFtsColumnMeta> column_metas;
@@ -4226,13 +4222,19 @@
      }
      
      if (column_metas.count() > 0) {
-       int init_ret = g_fts_generic_cache.init(column_metas, 200000);
-       if (OB_SUCCESS == init_ret || OB_INIT_TWICE == init_ret) {
+       // V3: 使用流式存储模式，直接写入磁盘，减少内存占用
+       const char *persist_dir = "/data/obcluster/store/fts_scalar_cache";
+       int init_ret = g_fts_generic_cache.init_streaming_persist(persist_dir, column_metas, 200000);
+       if (OB_SUCCESS == init_ret) {
          fts_generic_cache_initialized = true;
-         LOG_INFO("[FTS_NEW_SYSTEM] Generic Cache initialized",
+         LOG_INFO("[FTS_NEW_SYSTEM] Generic Cache streaming mode initialized",
                   "column_count", column_metas.count());
+       } else if (OB_INIT_TWICE == init_ret) {
+         // 已经初始化过，可能是重启后，跳过
+         fts_generic_cache_initialized = true;
+         LOG_INFO("[FTS_NEW_SYSTEM] Generic Cache already initialized (streaming or loaded)");
        } else {
-         LOG_WARN("[FTS_NEW_SYSTEM] Generic Cache init FAILED", K(init_ret));
+         LOG_WARN("[FTS_NEW_SYSTEM] Generic Cache streaming init FAILED", K(init_ret));
        }
      } else {
        LOG_INFO("[FTS_NEW_SYSTEM] No cacheable columns found, Generic Cache SKIPPED");
@@ -4281,19 +4283,17 @@
                        "total_entries", g_bm25s_index.get_total_entries());
             }
             
-            // ========== FTS_V2: 持久化 Generic Cache ==========
-            if (g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0) {
-              // 使用与 BM25S 索引相同的目录
-              const char *persist_dir = "/data/obcluster/store/fts_scalar_cache";
-              int persist_ret = g_fts_generic_cache.persist_to_disk(persist_dir);
+            // ========== FTS_V3: 完成流式存储 ==========
+            if (g_fts_generic_cache.is_streaming_mode()) {
+              // V3: 流式存储模式，完成写入并关闭文件
+              int persist_ret = g_fts_generic_cache.finish_streaming_persist();
               if (OB_SUCCESS == persist_ret) {
-                LOG_INFO("[FTS_V2] Generic Cache persisted successfully",
-                         "cache_size", g_fts_generic_cache.size(),
-                         "column_count", g_fts_generic_cache.column_count(),
-                         K(persist_dir));
+                LOG_INFO("[FTS_V3] Generic Cache streaming persist completed successfully",
+                         "row_count", g_fts_generic_cache.get_file_header().row_count,
+                         "column_count", g_fts_generic_cache.column_count());
               } else {
-                LOG_WARN("[FTS_V2] Failed to persist Generic Cache (non-fatal)",
-                         K(persist_ret), K(persist_dir));
+                LOG_WARN("[FTS_V3] Failed to finish streaming persist (non-fatal)",
+                         K(persist_ret));
               }
             }
             // ================================================
@@ -4422,8 +4422,9 @@
          }
        }
        
-       // ========== 新系统：填充 Generic Cache ==========
-       if (fts_generic_cache_initialized && g_fts_generic_cache.is_inited()) {
+       // ========== 新系统：流式写入 Generic Cache ==========
+       // V3: 使用流式存储模式，直接写入磁盘，减少内存占用
+       if (fts_generic_cache_initialized && g_fts_generic_cache.is_streaming_mode()) {
          // 使用 id 列的值作为 doc_id（与旧系统保持一致）
          // 先找到 id 列的值
          uint64_t id_for_cache = 0;
@@ -4453,11 +4454,11 @@
          }
          
          if (id_for_cache > 0) {
-           // 使用 add_row_from_exprs 自动从表达式填充所有缓存列
-           int cache_ret = g_fts_generic_cache.add_row_from_exprs(
+           // V3: 使用流式写入，数据直接写入磁盘
+           int cache_ret = g_fts_generic_cache.streaming_add_row_from_exprs(
                id_for_cache, MY_SPEC.output_, eval_ctx_);
            if (OB_SUCCESS != cache_ret && OB_HASH_EXIST != cache_ret) {
-             LOG_WARN("[FTS_NEW_SYSTEM] Failed to add row", K(cache_ret), K(id_for_cache));
+             LOG_WARN("[FTS_NEW_SYSTEM] Failed to streaming add row", K(cache_ret), K(id_for_cache));
           }
         }
        }

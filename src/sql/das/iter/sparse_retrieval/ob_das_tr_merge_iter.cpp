@@ -1160,31 +1160,36 @@ ObDASTRMergeIter::ObDASTRMergeIter()
 
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
     
-    // ========== 检测使用哪套系统 ==========
-    // V2: 如果内存缓存不可用，尝试从持久化文件加载（启动 KVCache 模式）
-    const bool use_new_system_memory = g_fts_generic_cache.is_inited() && g_fts_generic_cache.size() > 0;
+    // ========== V3: 优先使用 KVCache 模式 ==========
+    // 由于流式存储不在内存中保留完整缓存，优先使用 KVCache 模式
     
-    // 如果内存缓存不可用，尝试加载持久化文件
-    if (!use_new_system_memory && !g_fts_generic_cache.is_cache_file_opened()) {
+    // 先尝试加载持久化文件（如果尚未加载）
+    if (!g_fts_generic_cache.is_cache_file_opened()) {
       int ensure_ret = g_fts_generic_cache.ensure_ready();
       if (OB_SUCCESS == ensure_ret) {
-        LOG_INFO("[FTS_FILTER] Cache loaded from disk via ensure_ready");
-      } else if (OB_ENTRY_NOT_EXIST != ensure_ret) {
+        LOG_INFO("[FTS_FILTER] Cache loaded from disk via ensure_ready (KVCache Mode)");
+      } else if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
         LOG_WARN("[FTS_FILTER] Failed to ensure cache ready", K(ensure_ret));
       }
     }
     
+    // V3: 优先使用 KVCache 模式，内存模式作为备选
     const bool use_new_system_kvcache = g_fts_generic_cache.is_cache_file_opened();
-    const bool use_new_system = use_new_system_memory || use_new_system_kvcache;
-    const bool use_old_system = g_fts_scalar_cache.is_inited() && g_fts_scalar_cache.size() > 0;
+    const bool use_new_system_memory = !use_new_system_kvcache && 
+                                       g_fts_generic_cache.is_inited() && 
+                                       g_fts_generic_cache.size() > 0;
+    const bool use_new_system = use_new_system_kvcache || use_new_system_memory;
+    const bool use_old_system = !use_new_system && 
+                                g_fts_scalar_cache.is_inited() && 
+                                g_fts_scalar_cache.size() > 0;
     
-    if (use_new_system_memory) {
-      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode)",
-               "cache_size", g_fts_generic_cache.size(),
-               "filter_count", g_fts_generic_filter_ctx.condition_count());
-    } else if (use_new_system_kvcache) {
-      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode)",
+    if (use_new_system_kvcache) {
+      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode - Preferred)",
                "file_row_count", g_fts_generic_cache.get_file_header().row_count,
+               "filter_count", g_fts_generic_filter_ctx.condition_count());
+    } else if (use_new_system_memory) {
+      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode - Fallback)",
+               "cache_size", g_fts_generic_cache.size(),
                "filter_count", g_fts_generic_filter_ctx.condition_count());
     } else if (use_old_system) {
       LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
@@ -1403,8 +1408,24 @@ ObDASTRMergeIter::ObDASTRMergeIter()
           const auto &res = results.at(i);
           uint32_t doc_id = res.doc_id;
           bool pass = true;
+          
           if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
-            pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
+            // V3: 优先使用 KVCache 模式进行过滤检查
+            if (use_new_system_kvcache) {
+              // KVCache 模式：从缓存/文件获取行数据后检查
+              const ObFtsScalarCacheValue *row = nullptr;
+              common::ObKVCacheHandle handle;
+              int cache_ret = g_fts_generic_cache.get_row_from_kvcache(doc_id, row, handle);
+              if (OB_SUCCESS == cache_ret && OB_NOT_NULL(row)) {
+                pass = g_fts_generic_filter_ctx.check_row_from_kvcache(row);
+              } else {
+                // 缓存获取失败，默认通过（不做过滤）
+                pass = true;
+              }
+            } else {
+              // 内存模式：直接检查内存中的数据
+              pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
+            }
           } else if (use_old_system && g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
             const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
             pass = g_fts_filter_ctx.check_base_id(base_id);

@@ -283,7 +283,7 @@ public:
   static int get_cache_path(char *path_buf, int64_t buf_len);
   
   /**
-   * 将缓存持久化到磁盘
+   * 将缓存持久化到磁盘（一次性写入，需要完整内存缓存）
    * @param cache_dir 缓存目录路径
    */
   int persist_to_disk(const char *cache_dir);
@@ -308,6 +308,45 @@ public:
    * 获取文件头信息
    */
   const FtsScalarCacheFileHeader& get_file_header() const { return file_header_; }
+  
+  // ========== V3: 流式存储接口（减少内存占用）==========
+  
+  /**
+   * 初始化流式写入
+   * 打开持久化文件，预留 Header 和 Column Meta 空间
+   * @param cache_dir 缓存目录路径
+   * @param column_metas 列元数据数组
+   * @param estimated_rows 预估行数（用于预分配 Row Index 缓冲区）
+   */
+  int init_streaming_persist(const char *cache_dir,
+                             const common::ObIArray<ObFtsColumnMeta> &column_metas,
+                             int64_t estimated_rows = DEFAULT_CAPACITY);
+  
+  /**
+   * 流式写入一行数据
+   * 数据直接写入文件，不在内存中保留
+   * @param doc_id 文档 ID（作为主键）
+   * @param column_values 列值数组，长度必须等于 column_count
+   */
+  int streaming_add_row(uint64_t doc_id, const ObFtsColumnValue *column_values);
+  
+  /**
+   * 从 ObExpr 和 ObEvalCtx 流式写入一行数据
+   */
+  int streaming_add_row_from_exprs(uint64_t doc_id,
+                                   const common::ObIArray<ObExpr*> &output_exprs,
+                                   ObEvalCtx &eval_ctx);
+  
+  /**
+   * 结束流式写入
+   * 写入 Row Index，更新 Header，关闭文件
+   */
+  int finish_streaming_persist();
+  
+  /**
+   * 检查是否处于流式写入模式
+   */
+  bool is_streaming_mode() const { return streaming_mode_; }
   
   // ========== V2: KVCache 查询接口 ==========
   
@@ -346,6 +385,10 @@ private:
   int load_row_to_kvcache(uint64_t doc_id,
                           const ObFtsScalarCacheValue *&row,
                           common::ObKVCacheHandle &handle);
+  
+  // ========== V3: 流式存储私有方法 ==========
+  int serialize_row_from_values(const ObFtsColumnValue *column_values, 
+                                char *buf, int64_t buf_len, int64_t &row_size);
 
 private:
   bool is_inited_;
@@ -372,6 +415,16 @@ private:
   FtsScalarCacheFileHeader file_header_;  // 文件头
   FtsRowIndexEntry *row_index_;           // 行索引
   common::ObArenaAllocator cache_allocator_;  // KVCache 查询时的临时内存分配器
+  
+  // ========== V3: 流式存储相关成员 ==========
+  bool streaming_mode_;                   // 是否处于流式写入模式
+  common::ObIOFd streaming_fd_;           // 流式写入文件描述符
+  int64_t streaming_data_offset_;         // 当前 Row Data 写入位置（相对于 row_data_start）
+  int64_t streaming_row_data_start_;      // Row Data 区域的固定起始位置（文件偏移）
+  FtsRowIndexEntry *streaming_row_index_; // 流式写入时的行索引缓冲区
+  int64_t streaming_row_index_capacity_;  // 行索引缓冲区容量
+  char *streaming_row_buf_;               // 行数据序列化缓冲区
+  static const int64_t STREAMING_ROW_BUF_SIZE = 8192;  // 单行最大 8KB
 };
 
 // 全局单例
