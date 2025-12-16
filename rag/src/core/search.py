@@ -69,7 +69,7 @@ SUMMARY_CACHE_DIR = os.getenv("SUMMARY_CACHE_DIR", "./cache/summaries")
 SUMMARY_TOP_N = _env_int("SUMMARY_TOP_N", 10)
 RERANK_CANDIDATES_K = _env_int("RERANK_CANDIDATES_K", TOP_K * 2)
 CONTEXT_TOP_N = _env_int("CONTEXT_TOP_N", 0)
-LLM_ANSWER_TEMPERATURE = _env_float("LLM_ANSWER_TEMPERATURE", 0.3)
+LLM_ANSWER_TEMPERATURE = _env_float("LLM_ANSWER_TEMPERATURE", 0.1)
 
 
 class SummaryCache:
@@ -559,39 +559,123 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50, q
         except Exception:
             idx = 0
 
-        if 1 <= idx <= len(top_results):
-            chosen = top_results[idx - 1]
-            chosen_fn = chosen.get("filename", "")
-            chosen_pg = int(chosen.get("page", 0) or 0)
-            logger.info(
-                "[qid=%s] LLM Rerank selected: idx=%d %s page %d",
-                qid,
-                idx,
-                os.path.basename(chosen_fn),
-                chosen_pg,
-            )
-            return chosen_fn, chosen_pg
-
         filename = str(parsed.get("filename", "") or "").strip()
         try:
             page = int(parsed.get("page", 0) or 0)
         except Exception:
             page = 0
 
-        for r in top_results:
-            cand_full = r.get("filename", "") or ""
-            cand_base = cand_full.split("/")[-1] if cand_full else ""
-            cand_page = int(r.get("page", 0) or 0)
-            if filename and cand_base == filename:
+        def _norm_filename(s: str) -> str:
+            return re.sub(r"\s+", "", str(s or ""))
+
+        filename_norm = _norm_filename(filename)
+
+        fp_choice = None
+        fp_pos = None
+        if filename_norm:
+            for pos, r in enumerate(top_results, 1):
+                cand_full = str(r.get("filename", "") or "")
+                cand_base = cand_full.split("/")[-1] if cand_full else ""
+                cand_page = int(r.get("page", 0) or 0)
+                if _norm_filename(cand_base) != filename_norm:
+                    continue
                 if page and cand_page != page:
                     continue
-                logger.info(
-                    "[qid=%s] LLM Rerank selected (fallback match): %s page %d",
+                fp_choice = r
+                fp_pos = pos
+                break
+
+            if fp_choice is None:
+                for pos, r in enumerate(top_results, 1):
+                    cand_full = str(r.get("filename", "") or "")
+                    cand_base = cand_full.split("/")[-1] if cand_full else ""
+                    if _norm_filename(cand_base) != filename_norm:
+                        continue
+                    fp_choice = r
+                    fp_pos = pos
+                    break
+
+        idx_choice = None
+        idx_pos = None
+        if 1 <= idx <= len(top_results):
+            idx_choice = top_results[idx - 1]
+            idx_pos = idx
+
+        chosen = None
+        chosen_pos = None
+        chosen_label = ""
+
+        if fp_choice is not None and idx_choice is not None:
+            if fp_choice is idx_choice:
+                chosen = fp_choice
+                chosen_pos = fp_pos
+                chosen_label = "filename/page+index"
+            else:
+                if int(fp_pos or 10**9) <= int(idx_pos or 10**9):
+                    chosen = fp_choice
+                    chosen_pos = fp_pos
+                    chosen_label = "filename/page"
+                else:
+                    chosen = idx_choice
+                    chosen_pos = idx_pos
+                    chosen_label = "index"
+                logger.warning(
+                    "[qid=%s] LLM Rerank: conflict between filename/page and index, resolved by %s",
                     qid,
-                    cand_base,
-                    cand_page,
+                    chosen_label,
                 )
-                return cand_full, cand_page
+        elif fp_choice is not None:
+            chosen = fp_choice
+            chosen_pos = fp_pos
+            chosen_label = "filename/page"
+        elif idx_choice is not None:
+            chosen = idx_choice
+            chosen_pos = idx_pos
+            chosen_label = "index"
+
+        if chosen is not None:
+            try:
+                best = top_results[0]
+                best_score = float(best.get("score", 0.0) or 0.0)
+                best_rank = int(best.get("best_rank", 10**9) or 10**9)
+            except Exception:
+                best = None
+                best_score = 0.0
+                best_rank = 10**9
+
+            try:
+                chosen_score = float(chosen.get("score", 0.0) or 0.0)
+                chosen_rank = int(chosen.get("best_rank", 10**9) or 10**9)
+            except Exception:
+                chosen_score = 0.0
+                chosen_rank = 10**9
+
+            if best is not None and chosen_pos and chosen_pos > 10 and best_score > 0.0:
+                ratio = chosen_score / best_score
+                if ratio < 0.7 or chosen_rank > best_rank + 30:
+                    logger.warning(
+                        "[qid=%s] LLM Rerank: selected candidate seems weak (pos=%s score=%.4f rank=%s) vs best (score=%.4f rank=%s), overriding to best",
+                        qid,
+                        chosen_pos,
+                        chosen_score,
+                        chosen_rank,
+                        best_score,
+                        best_rank,
+                    )
+                    chosen = best
+                    chosen_pos = 1
+                    chosen_label = "best_override"
+
+            chosen_fn = str(chosen.get("filename", "") or "")
+            chosen_pg = int(chosen.get("page", 0) or 0)
+            logger.info(
+                "[qid=%s] LLM Rerank selected (%s): %s page %d",
+                qid,
+                chosen_label,
+                os.path.basename(chosen_fn),
+                chosen_pg,
+            )
+            return chosen_fn, chosen_pg
 
         logger.warning(
             "[qid=%s] LLM Rerank: could not match parsed selection, falling back",
