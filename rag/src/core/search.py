@@ -103,24 +103,104 @@ class SummaryCache:
             pass
 
 
-def _search_with_retry(client, index: str, body: dict, max_retries: int = 3, backoff_base: float = 0.3):
+def _search_with_retry(
+    client,
+    index: str,
+    body: dict,
+    max_retries: int = 3,
+    backoff_base: float = 0.3,
+    qid: str = "",
+    tag: str = "",
+):
     last_exception = None
+
+    if isinstance(body, dict):
+        if not tag:
+            tag = str(body.get("_log_tag", "") or "")
+        if not qid:
+            qid = str(body.get("_log_qid", "") or "")
+
+    try:
+        size = int((body or {}).get("size", 0) or 0)
+    except Exception:
+        size = 0
+    knn = (body or {}).get("knn") or {}
+    try:
+        knn_k = int(knn.get("k", 0) or 0)
+    except Exception:
+        knn_k = 0
+    has_query = "query" in (body or {})
+    has_knn = bool(knn)
+
     for attempt in range(1, max_retries + 1):
+        attempt_start = time.time()
+        if attempt == 1:
+            logger.info(
+                "[qid=%s] OceanBase HybridSearch.search start tag=%s index=%s size=%d has_query=%s has_knn=%s knn_k=%d",
+                qid,
+                tag,
+                index,
+                size,
+                has_query,
+                has_knn,
+                knn_k,
+            )
+
         try:
-            return client.search(index=index, body=body)
+            res = client.search(index=index, body=body)
+            elapsed = time.time() - attempt_start
+            n = len(res) if isinstance(res, list) else -1
+            logger.info(
+                "[qid=%s] OceanBase HybridSearch.search ok tag=%s index=%s results=%d elapsed=%.3fs",
+                qid,
+                tag,
+                index,
+                n,
+                elapsed,
+            )
+            if isinstance(res, list) and res:
+                try:
+                    r0 = res[0] if isinstance(res[0], dict) else {}
+                    fn0 = os.path.basename(str(r0.get("filename", "") or ""))
+                    pg0 = r0.get("page", 0)
+                    sc0 = float(r0.get("_score", 0.0) or 0.0)
+                    logger.info(
+                        "[qid=%s] OceanBase HybridSearch.search top1 tag=%s file=%s page=%s score=%.4f",
+                        qid,
+                        tag,
+                        fn0,
+                        pg0,
+                        sc0,
+                    )
+                except Exception:
+                    pass
+            return res
         except Exception as e:
+            elapsed = time.time() - attempt_start
             last_exception = e
             if attempt >= max_retries:
                 logger.error(
-                    "Hybrid search failed after %d attempts: %s", attempt, e, exc_info=True
+                    "[qid=%s] OceanBase HybridSearch.search failed tag=%s index=%s attempt=%d/%d elapsed=%.3fs err=%s",
+                    qid,
+                    tag,
+                    index,
+                    attempt,
+                    max_retries,
+                    elapsed,
+                    e,
+                    exc_info=True,
                 )
                 raise
 
             sleep_time = backoff_base * (2 ** (attempt - 1))
             logger.warning(
-                "Hybrid search error on attempt %d/%d: %s, retrying in %.1fs",
+                "[qid=%s] OceanBase HybridSearch.search error tag=%s index=%s attempt=%d/%d elapsed=%.3fs err=%s, retrying in %.1fs",
+                qid,
+                tag,
+                index,
                 attempt,
                 max_retries,
+                elapsed,
                 e,
                 sleep_time,
             )
@@ -211,7 +291,7 @@ def _extract_key_facts(text: str) -> str:
     return " | ".join(facts)
 
 
-def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -> tuple:
+def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50, qid: str = "") -> tuple:
     """
     Use LLM to rerank top results and select the most relevant file and page.
     
@@ -467,7 +547,10 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
                 continue
 
         if not parsed:
-            logger.warning("LLM Rerank: invalid response format, falling back to hybrid strategy")
+            logger.warning(
+                "[qid=%s] LLM Rerank: invalid response format, falling back to hybrid strategy",
+                qid,
+            )
             return "", 0
 
         idx = 0
@@ -481,7 +564,8 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
             chosen_fn = chosen.get("filename", "")
             chosen_pg = int(chosen.get("page", 0) or 0)
             logger.info(
-                "LLM Rerank selected: idx=%d %s page %d",
+                "[qid=%s] LLM Rerank selected: idx=%d %s page %d",
+                qid,
                 idx,
                 os.path.basename(chosen_fn),
                 chosen_pg,
@@ -501,14 +585,27 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50) -
             if filename and cand_base == filename:
                 if page and cand_page != page:
                     continue
-                logger.info("LLM Rerank selected (fallback match): %s page %d", cand_base, cand_page)
+                logger.info(
+                    "[qid=%s] LLM Rerank selected (fallback match): %s page %d",
+                    qid,
+                    cand_base,
+                    cand_page,
+                )
                 return cand_full, cand_page
 
-        logger.warning("LLM Rerank: could not match parsed selection, falling back")
+        logger.warning(
+            "[qid=%s] LLM Rerank: could not match parsed selection, falling back",
+            qid,
+        )
         return "", 0
             
     except Exception as e:
-        logger.error(f"LLM Rerank error: {e}, falling back to hybrid strategy")
+        logger.error(
+            "[qid=%s] LLM Rerank error: %s, falling back to hybrid strategy",
+            qid,
+            e,
+            exc_info=True,
+        )
         return "", 0
 
 
@@ -524,6 +621,13 @@ def search(question: str) -> Answer:
     """
     answer = Answer(
         question=question,
+    )
+
+    qid = hashlib.md5((question or "").encode("utf-8")).hexdigest()[:8]
+    logger.info(
+        "[qid=%s] Search start: %s",
+        qid,
+        (question or "").replace("\n", " ")[:120],
     )
 
     logger.debug(f"Processing query: '{question[:100]}...'")
@@ -628,8 +732,18 @@ def search(question: str) -> Answer:
             "size": TOP_K,
         }
         
-        hypo_results = _search_with_retry(client, index=TABLE_NAME, body=hypo_search_request)
-        logger.info(f"Hypothetical answer retrieval: found {len(hypo_results)} results")
+        hypo_results = _search_with_retry(
+            client,
+            index=TABLE_NAME,
+            body=hypo_search_request,
+            qid=qid,
+            tag="hypothetical",
+        )
+        logger.info(
+            "[qid=%s] Hypothetical answer retrieval: found %d results",
+            qid,
+            len(hypo_results) if isinstance(hypo_results, list) else -1,
+        )
         
         # Path 2: Retrieve with original question (keyword-focused)
         logger.debug("Path 2: Retrieving with original question...")
@@ -660,8 +774,18 @@ def search(question: str) -> Answer:
             "size": TOP_K,
         }
         
-        question_results = _search_with_retry(client, index=TABLE_NAME, body=question_search_request)
-        logger.info(f"Original question retrieval: found {len(question_results)} results")
+        question_results = _search_with_retry(
+            client,
+            index=TABLE_NAME,
+            body=question_search_request,
+            qid=qid,
+            tag="question",
+        )
+        logger.info(
+            "[qid=%s] Original question retrieval: found %d results",
+            qid,
+            len(question_results) if isinstance(question_results, list) else -1,
+        )
         
         # Step 3: Tag each result with its source path
         for result in hypo_results:
@@ -672,7 +796,11 @@ def search(question: str) -> Answer:
         # For logging and sanity checks, still build merged list
         search_results = hypo_results + question_results
         logger.info(
-            f"Merged retrieval: {len(search_results)} total results (hypo: {len(hypo_results)}, question: {len(question_results)})"
+            "[qid=%s] Merged retrieval: %d total results (hypo: %d, question: %d)",
+            qid,
+            len(search_results),
+            len(hypo_results),
+            len(question_results),
         )
 
         if not search_results or len(search_results) == 0:
@@ -799,18 +927,26 @@ def search(question: str) -> Answer:
             
             if USE_LLM_RERANK:
                 # Strategy: LLM Rerank - Let LLM select the most relevant file and page
-                logger.info("Using LLM Rerank to select file and page")
+                logger.info("[qid=%s] Using LLM Rerank to select file and page", qid)
                 llm_k = min(TOP_K * 2, RERANK_CANDIDATES_K) if RERANK_CANDIDATES_K > 0 else TOP_K * 2
-                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=llm_k)
+                llm_filename, llm_page = llm_rerank_select(question, retrieval_results, top_k=llm_k, qid=qid)
                 
                 if llm_filename:
                     answer.filename = llm_filename
                     answer.page = llm_page
                     use_hybrid_strategy = False  # LLM succeeded, skip hybrid
-                    logger.info(f"LLM Rerank succeeded: {llm_filename} page {llm_page}")
+                    logger.info(
+                        "[qid=%s] LLM Rerank succeeded: %s page %d",
+                        qid,
+                        os.path.basename(str(llm_filename or "")),
+                        int(llm_page or 0),
+                    )
                 else:
                     # Fall back to hybrid strategy if LLM fails
-                    logger.warning("LLM Rerank failed, falling back to hybrid strategy")
+                    logger.warning(
+                        "[qid=%s] LLM Rerank failed, falling back to hybrid strategy",
+                        qid,
+                    )
             
             if use_hybrid_strategy:
                 # Strategy: Hybrid (Average score filtering + Top3 voting)
@@ -832,6 +968,11 @@ def search(question: str) -> Answer:
                     }
                     sorted_files = sorted(file_avg_scores.items(), key=lambda x: x[1], reverse=True)
                     top3_files = [f[0] for f in sorted_files[:3]]  # Get top 3 file names
+                    try:
+                        top3_bases = [os.path.basename(str(x or "")) for x in top3_files]
+                        logger.info("[qid=%s] Hybrid strategy top3_files=%s", qid, top3_bases)
+                    except Exception:
+                        pass
                     
                     # Step 2: In Top3 files, use majority voting (count chunks)
                     top3_chunks = [r for r in retrieval_results if r.get('filename') in top3_files]
@@ -848,6 +989,14 @@ def search(question: str) -> Answer:
                                 page_counter = Counter(r.get('page') for r in file_chunks if r.get('page') is not None)
                                 if page_counter:
                                     answer.page = page_counter.most_common(1)[0][0]
+
+                    if answer.filename:
+                        logger.info(
+                            "[qid=%s] Hybrid strategy selected: %s page %s",
+                            qid,
+                            os.path.basename(str(answer.filename or "")),
+                            answer.page,
+                        )
 
         # Save retrieval results to answer object
         answer.retrieval_results = retrieval_results
