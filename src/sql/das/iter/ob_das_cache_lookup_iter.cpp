@@ -484,9 +484,9 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
               common::ObKVCacheHandle handle;
               int cache_ret = g_fts_generic_cache.get_row_from_kvcache(doc_id, row, handle);
               if (OB_SUCCESS != cache_ret || OB_ISNULL(row)) {
-                // 缓存中不存在该 doc_id 的数据，跳过该行
-                // 这可能是建索引时该行未被写入（如 id=0 或 eval 失败）
-                continue;
+                // 缓存未命中，走正常回表流程
+                all_cache_hit = false;
+                break;
               }
               
               // 填充数据到 datum 数组
