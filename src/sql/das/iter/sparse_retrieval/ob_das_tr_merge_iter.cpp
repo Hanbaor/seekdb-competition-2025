@@ -1290,7 +1290,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     //          "scalar_cache_size", g_fts_scalar_cache.size());
     // }
     
-    // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
+    // 1. 遍历每个查询 token，从 LRU HashMap / KVCache 获取倒排链并累加分数
+    // V2: 优先使用 LRU HashMap 缓存，再回退到 KVCache
     int64_t tokens_found = 0, tokens_not_found = 0;
     int64_t total_postings = 0, filtered_by_base_id = 0;
     int64_t cache_hits = 0, cache_misses = 0;
@@ -1298,16 +1299,16 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     for (int64_t t = 0; t < query_tokens_.count(); t++) {
       const ObString &token = query_tokens_.at(t);
       
-      // ========== 从 KVCache 获取 posting（缓存未命中时从文件加载）==========
+      // ========== V2: LRU + 文件两级缓存（统一接口）==========
       const ObBM25SPostingValue *posting = nullptr;
-      common::ObKVCacheHandle handle;
       
-      int posting_ret = g_bm25s_index.get_posting_from_cache(token, posting, handle);
+      // 统一接口：内部先查 LRU 缓存，未命中则从文件加载
+      int posting_ret = g_bm25s_index.get_posting(token, posting);
       if (OB_ENTRY_NOT_EXIST == posting_ret) {
         tokens_not_found++;
         continue;
       } else if (OB_SUCCESS != posting_ret) {
-        LOG_WARN("BM25S search: fail to get posting from cache", K(posting_ret), K(token));
+        LOG_WARN("BM25S search: fail to get posting", K(posting_ret), K(token));
         tokens_not_found++;
         continue;
       }
@@ -1452,6 +1453,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         
         count = output_count;
         bm25s_search_done_ = true;
+        // 打印 LRU 缓存统计
+        g_bm25s_index.print_lru_stats();
       }
     }
     return ret;

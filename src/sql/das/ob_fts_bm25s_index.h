@@ -33,6 +33,7 @@
 #include "share/ob_io_device_helper.h"
 #include "common/storage/ob_io_device.h"
 #include "share/cache/ob_kv_storecache.h"
+#include "sql/das/ob_fts_bm25s_cache.h"  // PostingLRUNode, PostingLRUHashMap
 #include <fstream>
 #include <cstdio>
 #include <fcntl.h>
@@ -318,6 +319,37 @@ public:
    * @return OB_SUCCESS 如果索引已就绪或成功加载
    */
   int ensure_ready();
+  
+  // ========== V2: LRU + 文件两级缓存 ==========
+  /**
+   * @brief 获取 posting（先查 LRU 缓存，未命中则从文件加载）
+   * @param token 查询词
+   * @param posting 输出：posting 数据指针
+   * @return OB_SUCCESS 成功，OB_ENTRY_NOT_EXIST 未找到
+   */
+  int get_posting(const common::ObString &token, const ObBM25SPostingValue *&posting);
+  
+  /**
+   * @brief 初始化 LRU 缓存（在 ensure_ready 中调用）
+   */
+  int init_posting_lru_cache(int64_t capacity = DEFAULT_POSTING_LRU_CAPACITY);
+  
+  /**
+   * @brief 销毁 LRU 缓存
+   */
+  void destroy_posting_lru_cache();
+  
+  // LRU 缓存统计
+  int64_t lru_size() const { return lru_size_; }
+  int64_t lru_hit_count() const { return lru_hit_count_; }
+  int64_t lru_miss_count() const { return lru_miss_count_; }
+  int64_t lru_evict_count() const { return lru_evict_count_; }
+  void print_lru_stats() const;
+  
+  // 内部访问器
+  int64_t get_posting_data_offset() const { return file_header_.posting_data_offset; }
+  const common::ObIOFd& get_persist_fd() const;
+  int find_token_in_file(const common::ObString &token, int64_t &posting_offset, int64_t &posting_count);
 
 private:
   ObFtsBM25SIndex();
@@ -383,16 +415,6 @@ private:
                             const ObBM25SPostingValue *&posting,
                             common::ObKVCacheHandle &handle);
   
-  /**
-   * @brief 从文件查找 Token 的 posting 信息
-   * @param token 查询词
-   * @param posting_offset 输出：posting 在文件中的偏移
-   * @param posting_count 输出：posting 数量
-   */
-  int find_token_in_file(const common::ObString &token,
-                         int64_t &posting_offset,
-                         int64_t &posting_count);
-
 private:
   bool is_inited_;
   bool is_finalized_;
@@ -433,6 +455,29 @@ private:
   
   // ========== 并发控制 ==========
   mutable common::SpinRWLock lock_;
+  
+  // ========== V2: LRU HashMap 缓存 ==========
+  PostingLRUHashMap posting_lru_map_;        // token_hash -> PostingLRUNode*
+  common::ObArenaAllocator lru_allocator_;   // LRU 数据内存分配器
+  PostingLRUNode lru_head_;                  // LRU 链表头哨兵（最新）
+  PostingLRUNode lru_tail_;                  // LRU 链表尾哨兵（最旧）
+  int64_t lru_size_;                         // 当前缓存条目数
+  int64_t lru_capacity_;                     // LRU 容量上限
+  bool lru_inited_;                          // LRU 是否已初始化
+  mutable common::ObSpinLock lru_lock_;      // LRU 写锁
+  int64_t lru_hit_count_;                    // LRU 命中次数
+  int64_t lru_miss_count_;                   // LRU 未命中次数
+  int64_t lru_evict_count_;                  // LRU 淘汰次数
+  
+  // LRU 内部操作
+  void lru_move_to_head(PostingLRUNode *node);
+  void lru_remove_node(PostingLRUNode *node);
+  void lru_add_to_head(PostingLRUNode *node);
+  void lru_evict_oldest();
+  PostingLRUNode* lru_find_node(uint64_t token_hash, const common::ObString &token);
+  int lru_put_posting(const common::ObString &token, int64_t count, 
+                      const uint32_t *doc_ids, const float *scores);
+  int load_posting_from_file(const common::ObString &token, const ObBM25SPostingValue *&posting);
 
   DISALLOW_COPY_AND_ASSIGN(ObFtsBM25SIndex);
 };

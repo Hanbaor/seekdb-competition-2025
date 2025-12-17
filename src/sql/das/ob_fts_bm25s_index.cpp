@@ -63,7 +63,18 @@ ObFtsBM25SIndex::ObFtsBM25SIndex()
     total_docs_(0),
     avg_doc_len_(0.0),
     allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "BM25SIndex")),
-    lock_()
+    lock_(),
+    posting_lru_map_(),
+    lru_allocator_(lib::ObMemAttr(OB_SERVER_TENANT_ID, "BM25SLRU")),
+    lru_head_(),
+    lru_tail_(),
+    lru_size_(0),
+    lru_capacity_(DEFAULT_POSTING_LRU_CAPACITY),
+    lru_inited_(false),
+    lru_lock_(),
+    lru_hit_count_(0),
+    lru_miss_count_(0),
+    lru_evict_count_(0)
 {
   // 初始化 TmpFile 相关数组
   for (int64_t i = 0; i < NUM_BUCKETS; i++) {
@@ -74,6 +85,13 @@ ObFtsBM25SIndex::ObFtsBM25SIndex()
   // 初始化持久化相关
   memset(index_file_path_, 0, sizeof(index_file_path_));
   file_header_.reset();
+  
+  // 初始化 LRU 链表哨兵
+  lru_head_.prev = nullptr;
+  lru_head_.next = &lru_tail_;
+  lru_tail_.prev = &lru_head_;
+  lru_tail_.next = nullptr;
+  
   LOG_INFO("BM25S ObFtsBM25SIndex constructor called", K(NUM_BUCKETS));
 }
 
@@ -86,6 +104,11 @@ ObFtsBM25SIndex &ObFtsBM25SIndex::get_instance()
 {
   static ObFtsBM25SIndex instance;
   return instance;
+}
+
+const common::ObIOFd& ObFtsBM25SIndex::get_persist_fd() const
+{
+  return persist_fd_;
 }
 
 int ObFtsBM25SIndex::init()
@@ -556,6 +579,9 @@ void ObFtsBM25SIndex::destroy()
   LOG_INFO("BM25S destroy: starting destroy", K_(is_inited), K_(tmp_files_inited));
   
   SpinWLockGuard guard(lock_);
+  
+  // 销毁 LRU 缓存（需要在 lock_ 外先销毁，避免死锁）
+  destroy_posting_lru_cache();
   
   if (is_inited_) {
     // 清理 TmpFile
@@ -1277,11 +1303,11 @@ int ObFtsBM25SIndex::ensure_ready()
              "total_docs", file_header_.total_docs,
              "vocab_size", file_header_.vocab_size);
     
-    // 初始化 KVCache（如果还没初始化）
-    if (!is_bm25s_cache_inited()) {
-      int cache_ret = init_bm25s_cache();
+    // 初始化 LRU 缓存（如果还没初始化）
+    if (!lru_inited_) {
+      int cache_ret = init_posting_lru_cache();
       if (OB_SUCCESS != cache_ret) {
-        LOG_WARN("BM25S ensure_ready: fail to init KVCache (non-fatal)", K(cache_ret));
+        LOG_WARN("BM25S ensure_ready: fail to init LRU cache (non-fatal)", K(cache_ret));
       }
     }
   } else {
@@ -1620,10 +1646,10 @@ int ObFtsBM25SIndex::search_with_cache(const common::ObIArray<common::ObString> 
     return OB_SUCCESS;
   }
   
-  // 1. 初始化缓存（如果还没初始化）
-  if (!g_cache_inited) {
-    if (OB_FAIL(init_bm25s_cache())) {
-      LOG_WARN("BM25S search_with_cache: fail to init cache", K(ret));
+  // 1. 初始化 LRU 缓存（如果还没初始化）
+  if (!lru_inited_) {
+    if (OB_FAIL(init_posting_lru_cache())) {
+      LOG_WARN("BM25S search_with_cache: fail to init LRU cache", K(ret));
       return ret;
     }
   }
@@ -1647,11 +1673,10 @@ int ObFtsBM25SIndex::search_with_cache(const common::ObIArray<common::ObString> 
       continue;
     }
     
-    // 获取 posting（从缓存或文件）
+    // 获取 posting（从 LRU 缓存或文件）
     const ObBM25SPostingValue *posting = nullptr;
-    common::ObKVCacheHandle handle;
     
-    int posting_ret = get_posting_from_cache(token, posting, handle);
+    int posting_ret = get_posting(token, posting);
     if (OB_ENTRY_NOT_EXIST == posting_ret) {
       // 未知词，跳过
       tokens_not_found++;
@@ -1660,9 +1685,6 @@ int ObFtsBM25SIndex::search_with_cache(const common::ObIArray<common::ObString> 
       LOG_WARN("BM25S search_with_cache: fail to get posting", K(posting_ret), K(token));
       continue;
     }
-    
-    // 统计缓存命中
-    // 注：这里简单统计，实际上 get_posting_from_cache 内部会区分 hit/miss
     
     // 累加得分
     int64_t valid_count = posting->get_valid_count(id_limit);
@@ -1674,8 +1696,6 @@ int ObFtsBM25SIndex::search_with_cache(const common::ObIArray<common::ObString> 
       doc_scores.get_refactored(doc_id, existing);
       doc_scores.set_refactored(doc_id, existing + score, 1 /*overwrite*/);
     }
-    
-    // handle 析构时自动释放缓存引用
   }
   
   // 4. Top-K 排序（使用最小堆）
@@ -1749,6 +1769,314 @@ void ObFtsBM25SIndex::print_cache_stats()
   } else {
     LOG_INFO("BM25S PostingCache: not initialized");
   }
+}
+
+// ========================================================================
+// V2: ObFtsBM25SIndex LRU 缓存实现（合并到主类中）
+// ========================================================================
+
+int ObFtsBM25SIndex::init_posting_lru_cache(int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  
+  if (lru_inited_) {
+    return OB_SUCCESS;
+  }
+  
+  common::ObSpinLockGuard guard(lru_lock_);
+  
+  if (lru_inited_) {
+    return OB_SUCCESS;
+  }
+  
+  lru_capacity_ = capacity > 0 ? capacity : DEFAULT_POSTING_LRU_CAPACITY;
+  
+  // 初始化 LRU 链表哨兵
+  lru_head_.prev = nullptr;
+  lru_head_.next = &lru_tail_;
+  lru_tail_.prev = &lru_head_;
+  lru_tail_.next = nullptr;
+  lru_size_ = 0;
+  lru_hit_count_ = 0;
+  lru_miss_count_ = 0;
+  lru_evict_count_ = 0;
+  
+  // 创建 HashMap
+  if (OB_FAIL(posting_lru_map_.create(lru_capacity_, "PostingLRUMap"))) {
+    LOG_WARN("[BM25S_LRU] init: create HashMap failed", K(ret), K(lru_capacity_));
+    return ret;
+  }
+  
+  lru_inited_ = true;
+  LOG_INFO("[BM25S_LRU] init: success", K(lru_capacity_));
+  
+  return ret;
+}
+
+void ObFtsBM25SIndex::destroy_posting_lru_cache()
+{
+  if (!lru_inited_) {
+    return;
+  }
+  
+  common::ObSpinLockGuard guard(lru_lock_);
+  
+  // 清理所有节点（内存由 lru_allocator_ 统一管理）
+  posting_lru_map_.destroy();
+  lru_allocator_.reset();
+  
+  // 重置 LRU 链表
+  lru_head_.next = &lru_tail_;
+  lru_tail_.prev = &lru_head_;
+  lru_size_ = 0;
+  lru_inited_ = false;
+  
+  LOG_INFO("[BM25S_LRU] destroy: done");
+}
+
+PostingLRUNode* ObFtsBM25SIndex::lru_find_node(uint64_t token_hash, const common::ObString &token)
+{
+  PostingLRUNode *node = nullptr;
+  if (OB_SUCCESS == posting_lru_map_.get_refactored(token_hash, node)) {
+    if (OB_NOT_NULL(node) && node->token_equals(token)) {
+      return node;
+    }
+  }
+  return nullptr;
+}
+
+void ObFtsBM25SIndex::lru_move_to_head(PostingLRUNode *node)
+{
+  if (OB_ISNULL(node) || node == lru_head_.next) {
+    return;
+  }
+  lru_remove_node(node);
+  lru_add_to_head(node);
+}
+
+void ObFtsBM25SIndex::lru_remove_node(PostingLRUNode *node)
+{
+  if (OB_ISNULL(node) || OB_ISNULL(node->prev) || OB_ISNULL(node->next)) {
+    return;
+  }
+  node->prev->next = node->next;
+  node->next->prev = node->prev;
+}
+
+void ObFtsBM25SIndex::lru_add_to_head(PostingLRUNode *node)
+{
+  if (OB_ISNULL(node)) {
+    return;
+  }
+  node->next = lru_head_.next;
+  node->prev = &lru_head_;
+  lru_head_.next->prev = node;
+  lru_head_.next = node;
+}
+
+void ObFtsBM25SIndex::lru_evict_oldest()
+{
+  PostingLRUNode *oldest = lru_tail_.prev;
+  if (OB_ISNULL(oldest) || oldest == &lru_head_) {
+    return;
+  }
+  lru_remove_node(oldest);
+  posting_lru_map_.erase_refactored(oldest->token_hash);
+  lru_size_--;
+  lru_evict_count_++;
+}
+
+int ObFtsBM25SIndex::get_posting(const common::ObString &token,
+                                  const ObBM25SPostingValue *&posting)
+{
+  int ret = OB_SUCCESS;
+  posting = nullptr;
+  
+  // 确保 LRU 已初始化
+  if (!lru_inited_) {
+    if (OB_FAIL(init_posting_lru_cache())) {
+      return ret;
+    }
+  }
+  
+  // 计算 token hash
+  uint64_t token_hash = 0;
+  if (token.length() > 0 && OB_NOT_NULL(token.ptr())) {
+    token_hash = common::murmurhash(token.ptr(), token.length(), 0);
+  }
+  
+  // 1. 先尝试从 LRU 缓存获取
+  PostingLRUNode *node = lru_find_node(token_hash, token);
+  if (OB_NOT_NULL(node)) {
+    common::ObSpinLockGuard guard(lru_lock_);
+    lru_move_to_head(node);
+    posting = node->posting;
+    lru_hit_count_++;
+    return OB_SUCCESS;
+  }
+  
+  // 2. LRU 未命中，直接从文件加载
+  lru_miss_count_++;
+  ret = load_posting_from_file(token, posting);
+  
+  return ret;
+}
+
+int ObFtsBM25SIndex::load_posting_from_file(const common::ObString &token,
+                                             const ObBM25SPostingValue *&posting)
+{
+  int ret = OB_SUCCESS;
+  posting = nullptr;
+  
+  // 确保索引文件已打开
+  if (!is_ready()) {
+    ret = ensure_ready();
+    if (OB_FAIL(ret)) {
+      return ret;
+    }
+  }
+  
+  // 1. 从文件查找 token 的 posting 位置
+  int64_t posting_offset = 0;
+  int64_t posting_count = 0;
+  
+  if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      lru_put_posting(token, 0, nullptr, nullptr);  // 负缓存
+    }
+    return ret;
+  }
+  
+  if (posting_count == 0) {
+    lru_put_posting(token, 0, nullptr, nullptr);
+    return OB_ENTRY_NOT_EXIST;
+  }
+  
+  // 2. 计算数据大小和文件偏移
+  int64_t doc_ids_size = posting_count * sizeof(uint32_t);
+  int64_t scores_size = posting_count * sizeof(float);
+  int64_t total_size = doc_ids_size + scores_size;
+  int64_t file_offset = get_posting_data_offset() + posting_offset;
+  
+  // 3. 分配临时缓冲区
+  char *buf = static_cast<char*>(ob_malloc(total_size, "PostingLRUTmp"));
+  if (OB_ISNULL(buf)) {
+    return OB_ALLOCATE_MEMORY_FAILED;
+  }
+  
+  // 4. 从文件读取
+  int64_t read_size = 0;
+  ret = share::ObIODeviceLocalFileOp::pread_impl(
+      persist_fd_.second_id_, buf, total_size, file_offset, read_size);
+  if (OB_FAIL(ret)) {
+    ob_free(buf);
+    return ret;
+  }
+  
+  // 5. 添加到 LRU 缓存
+  uint32_t *doc_ids = reinterpret_cast<uint32_t*>(buf);
+  float *scores = reinterpret_cast<float*>(buf + doc_ids_size);
+  ret = lru_put_posting(token, posting_count, doc_ids, scores);
+  ob_free(buf);
+  
+  if (OB_SUCC(ret)) {
+    uint64_t token_hash = common::murmurhash(token.ptr(), token.length(), 0);
+    PostingLRUNode *node = lru_find_node(token_hash, token);
+    if (OB_NOT_NULL(node)) {
+      posting = node->posting;
+    }
+  }
+  
+  return ret;
+}
+
+int ObFtsBM25SIndex::lru_put_posting(const common::ObString &token,
+                                      int64_t count, 
+                                      const uint32_t *doc_ids, 
+                                      const float *scores)
+{
+  int ret = OB_SUCCESS;
+  
+  if (!lru_inited_) {
+    return OB_NOT_INIT;
+  }
+  
+  uint64_t token_hash = 0;
+  if (token.length() > 0 && OB_NOT_NULL(token.ptr())) {
+    token_hash = common::murmurhash(token.ptr(), token.length(), 0);
+  }
+  
+  common::ObSpinLockGuard guard(lru_lock_);
+  
+  // 检查是否已存在
+  PostingLRUNode *existing = lru_find_node(token_hash, token);
+  if (OB_NOT_NULL(existing)) {
+    lru_move_to_head(existing);
+    return OB_SUCCESS;
+  }
+  
+  // 检查容量，必要时淘汰
+  while (lru_size_ >= lru_capacity_) {
+    lru_evict_oldest();
+  }
+  
+  // 计算所需内存
+  int64_t token_size = token.length();
+  int64_t posting_data_size = count * (sizeof(uint32_t) + sizeof(float));
+  int64_t total_size = sizeof(PostingLRUNode) + token_size + 
+                       sizeof(ObBM25SPostingValue) + posting_data_size;
+  
+  // 分配内存
+  char *buf = static_cast<char*>(lru_allocator_.alloc(total_size));
+  if (OB_ISNULL(buf)) {
+    return OB_ALLOCATE_MEMORY_FAILED;
+  }
+  
+  // 构建节点
+  PostingLRUNode *new_node = new (buf) PostingLRUNode();
+  char *data_ptr = buf + sizeof(PostingLRUNode);
+  
+  new_node->token_hash = token_hash;
+  new_node->token_len = token.length();
+  new_node->token_data = data_ptr;
+  if (token.length() > 0 && OB_NOT_NULL(token.ptr())) {
+    MEMCPY(new_node->token_data, token.ptr(), token.length());
+  }
+  data_ptr += token.length();
+  
+  new_node->posting = new (data_ptr) ObBM25SPostingValue();
+  data_ptr += sizeof(ObBM25SPostingValue);
+  
+  uint32_t *new_doc_ids = reinterpret_cast<uint32_t*>(data_ptr);
+  data_ptr += count * sizeof(uint32_t);
+  float *new_scores = reinterpret_cast<float*>(data_ptr);
+  
+  if (count > 0 && OB_NOT_NULL(doc_ids) && OB_NOT_NULL(scores)) {
+    MEMCPY(new_doc_ids, doc_ids, count * sizeof(uint32_t));
+    MEMCPY(new_scores, scores, count * sizeof(float));
+  }
+  new_node->posting->set(count, new_doc_ids, new_scores);
+  
+  if (OB_FAIL(posting_lru_map_.set_refactored(token_hash, new_node))) {
+    return ret;
+  }
+  
+  lru_add_to_head(new_node);
+  lru_size_++;
+  
+  return OB_SUCCESS;
+}
+
+void ObFtsBM25SIndex::print_lru_stats() const
+{
+  double hit_rate = (lru_hit_count_ + lru_miss_count_) > 0 
+      ? (double)lru_hit_count_ / (lru_hit_count_ + lru_miss_count_) * 100.0 
+      : 0.0;
+  LOG_INFO("[BM25S_LRU] stats",
+           K_(lru_size), K_(lru_capacity),
+           K_(lru_hit_count), K_(lru_miss_count),
+           K_(lru_evict_count),
+           "hit_rate", hit_rate);
 }
 
 } // end namespace sql

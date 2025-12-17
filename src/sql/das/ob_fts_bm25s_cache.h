@@ -21,6 +21,7 @@
 #include "share/cache/ob_kv_storecache.h"
 #include "lib/string/ob_string.h"
 #include "lib/hash/ob_hashutils.h"
+#include "lib/hash/ob_hashmap.h"
 #include "lib/utility/ob_print_utils.h"
 
 namespace oceanbase
@@ -31,7 +32,7 @@ namespace sql
 // ========================================================================
 // Phase 3: BM25S KVCache 定义
 // 一级缓存：PostingCache - 直接 token → posting
-// 注意：当前比赛场景为全局单例，无需 tenant_id/table_id
+
 // ========================================================================
 
 /**
@@ -257,28 +258,36 @@ public:
 typedef common::ObKVCache<ObBM25SPostingKey, ObBM25SPostingValue> ObBM25SPostingCache;
 
 // ========================================================================
-// 全局缓存管理函数声明
+// V2: LRU HashMap 缓存数据结构（比 KVCache 更高效的内存缓存）
 // ========================================================================
 
 /**
- * @brief 初始化 BM25S Posting 缓存
+ * @brief LRU 缓存节点 - 存储 token 和对应的 posting
  */
-int init_bm25s_cache();
+struct PostingLRUNode {
+  uint64_t token_hash;           // token 的 hash 值（用于快速比较）
+  int32_t token_len;             // token 长度
+  char *token_data;              // token 数据（深拷贝）
+  ObBM25SPostingValue *posting;  // posting 数据（深拷贝）
+  PostingLRUNode *prev;          // LRU 链表前驱
+  PostingLRUNode *next;          // LRU 链表后继
+  
+  PostingLRUNode() 
+      : token_hash(0), token_len(0), token_data(nullptr), 
+        posting(nullptr), prev(nullptr), next(nullptr) {}
+  
+  bool token_equals(const common::ObString &token) const {
+    if (token_len != token.length()) return false;
+    if (token_len == 0) return true;
+    return 0 == MEMCMP(token_data, token.ptr(), token_len);
+  }
+};
 
-/**
- * @brief 销毁 BM25S Posting 缓存
- */
-void destroy_bm25s_cache();
+// LRU HashMap 类型定义（供 ObFtsBM25SIndex 使用）
+typedef common::hash::ObHashMap<uint64_t, PostingLRUNode*, 
+                                 common::hash::NoPthreadDefendMode> PostingLRUHashMap;
 
-/**
- * @brief 检查缓存是否已初始化
- */
-bool is_bm25s_cache_inited();
-
-/**
- * @brief 获取全局 PostingCache 实例
- */
-ObBM25SPostingCache* get_bm25s_posting_cache();
+static const int64_t DEFAULT_POSTING_LRU_CAPACITY = 10000;
 
 } // namespace sql
 } // namespace oceanbase
