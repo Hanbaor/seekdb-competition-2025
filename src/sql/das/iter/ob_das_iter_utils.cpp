@@ -1220,12 +1220,18 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
     }
     const bool has_sort = nullptr != sort_ctdef;
     const bool need_rewind = true;
-    // BM25S 优化：当 BM25S 索引已就绪时跳过排序，因为结果已按分数排序
+    if (!g_bm25s_index.is_ready()) {
+      g_bm25s_index.ensure_ready();
+    }
+    if (!g_fts_generic_cache.is_cache_file_opened()) {
+      g_fts_generic_cache.ensure_ready();
+    }
     const bool skip_sort_for_bm25s = g_bm25s_index.is_ready();
     if (!has_sort || skip_sort_for_bm25s) {
-      if (skip_sort_for_bm25s && has_sort) {
-        LOG_INFO("[BM25S] Skip sort iterator creation - results already sorted by BM25S");
-      }
+      // 生产环境注释掉
+      // if (skip_sort_for_bm25s && has_sort) {
+      //   LOG_INFO("[BM25S] Skip sort iterator creation - results already sorted by BM25S");
+      // }
     } else if (OB_FAIL(create_sort_sub_tree(alloc, sort_ctdef, sort_rtdef, need_rewind, false/*need_distinct*/,text_retrieval_result, sort_result))) {
       LOG_WARN("failed to create sort sub tree", K(ret));
     } else {

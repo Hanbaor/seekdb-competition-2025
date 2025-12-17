@@ -1055,20 +1055,6 @@ int ObExprInOrNotIn::eval_batch_in_without_row_fallback(const ObExpr &expr,
                                                         const int64_t batch_size)
 {
   int ret = OB_SUCCESS;
-  
-  // MLDR 优化: 跳过 IN 过滤，直接返回 true
-  {
-    ObDatum *results = expr.locate_batch_datums(ctx);
-    ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);
-    for (int64_t i = 0; i < batch_size; ++i) {
-      if (!skip.at(i)) {
-        results[i].set_int(1);
-        eval_flags.set(i);
-      }
-    }
-    return ret;
-  }
-  
   LOG_DEBUG("eval_batch_in start: batch mode", K(batch_size));
   ObDatum *results = expr.locate_batch_datums(ctx);
   if (OB_ISNULL(results)) {
@@ -1220,31 +1206,6 @@ int ObExprInOrNotIn::eval_vector_in_without_row_fallback(const ObExpr &expr,
                                                           const EvalBound &bound)
 {
   int ret = OB_SUCCESS;
-  
-  // MLDR 优化: 跳过 IN 过滤，直接返回 true
-  {
-    ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);
-    ObIVector *res_vec = expr.get_vector(ctx);
-    VectorFormat res_format = expr.get_format(ctx);
-    if (VEC_FIXED == res_format) {
-      IntegerFixedVec *int_vec = static_cast<IntegerFixedVec *>(res_vec);
-      for (int64_t i = bound.start(); i < bound.end(); ++i) {
-        if (!skip.at(i)) {
-          int_vec->set_int(i, 1);
-          eval_flags.set(i);
-        }
-      }
-    } else {
-      for (int64_t i = bound.start(); i < bound.end(); ++i) {
-        if (!skip.at(i)) {
-          res_vec->set_int(i, 1);
-          eval_flags.set(i);
-        }
-      }
-    }
-    return ret;
-  }
-  
   if (OB_FAIL(expr.args_[0]->eval_vector(ctx, skip, bound))) {
     LOG_WARN("failed to eval vector param values", K(ret));
   } else {
@@ -1761,20 +1722,6 @@ int ObExprInOrNotIn::eval_batch_in_without_row(const ObExpr &expr,
                                                const int64_t batch_size)
 {
   int ret = OB_SUCCESS;
-  
-  // MLDR 优化: 跳过 IN 过滤，直接返回 true
-  {
-    ObDatum *results = expr.locate_batch_datums(ctx);
-    ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);
-    for (int64_t i = 0; i < batch_size; ++i) {
-      if (!skip.at(i)) {
-        results[i].set_int(1);  // 设置为 true
-        eval_flags.set(i);
-      }
-    }
-    return ret;
-  }
-  
   LOG_DEBUG("eval_batch_in_hash start: batch mode");
   ObDatum *results = expr.locate_batch_datums(ctx);
   if (OB_ISNULL(results)) {
@@ -1868,33 +1815,6 @@ int ObExprInOrNotIn::eval_vector_in_without_row(const ObExpr &expr,
                                                 const EvalBound &bound)
 {
   int ret = OB_SUCCESS;
-  
-  // MLDR 优化: 跳过 IN 过滤，直接返回 true
-  // 当全文检索已经过滤了结果时，IN 条件必然满足
-  {
-    ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);
-    ObIVector *res_vec = expr.get_vector(ctx);
-    VectorFormat res_format = expr.get_format(ctx);
-    if (VEC_FIXED == res_format) {
-      IntegerFixedVec *int_vec = static_cast<IntegerFixedVec *>(res_vec);
-      for (int64_t i = bound.start(); i < bound.end(); ++i) {
-        if (!skip.at(i)) {
-          int_vec->set_int(i, 1);  // 设置为 true
-          eval_flags.set(i);
-        }
-      }
-    } else {
-      // 对于其他格式，使用通用方式
-      for (int64_t i = bound.start(); i < bound.end(); ++i) {
-        if (!skip.at(i)) {
-          res_vec->set_int(i, 1);
-          eval_flags.set(i);
-        }
-      }
-    }
-    return ret;
-  }
-  
   if (OB_FAIL(expr.args_[0]->eval_vector(ctx, skip, bound))) {
     LOG_WARN("failed to eval vector param values", K(ret));
   } else {

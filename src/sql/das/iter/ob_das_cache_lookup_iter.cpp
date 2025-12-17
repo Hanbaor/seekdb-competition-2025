@@ -371,20 +371,9 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         }
 
         // 收集完毕后，统一检查缓存命中
-        // ========== V3: 优先使用 KVCache 模式 ==========
+        // ========== V3: 使用 KVCache 模式 ==========
+        // 注意：缓存已在 create_text_retrieval_tree 入口处统一加载
         bool will_cache_hit = false;
-        
-        // 先尝试加载持久化文件（如果尚未加载）
-        if (!g_fts_generic_cache.is_cache_file_opened()) {
-          int ensure_ret = g_fts_generic_cache.ensure_ready();
-          if (OB_SUCCESS == ensure_ret) {
-            // LOG_INFO("[FTS_LOOKUP] Cache loaded from disk via ensure_ready (KVCache Mode)");
-          } else if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
-            LOG_WARN("[FTS_LOOKUP] Failed to ensure cache ready", K(ensure_ret));
-          }
-        }
-        
-        // 只使用新系统 KVCache 模式（磁盘持久化）
         const bool use_cache = g_fts_generic_cache.is_cache_file_opened();
         
         if (OB_SUCC(ret) && lookup_rowkey_cnt_ > 0 && use_cache) {

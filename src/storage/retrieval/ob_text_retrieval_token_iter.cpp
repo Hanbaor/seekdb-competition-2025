@@ -423,40 +423,14 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
     LOG_WARN("retrieval token iterator not inited", K(ret));
   } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
     LOG_WARN("failed to estimate token doc cnt", K(ret));
-  } else if (reached_docid_limit_) {
-    // already reached docid/id upper limit, no more rows for this token
-    ret = OB_ITER_END;
   } else {
     const int64_t requested = OB_MIN(max_batch_size_, capacity);
     int tmp_ret = inv_idx_scan_iter_->get_next_rows(count, requested);
-    //LOG_DEBUG("FTS get_next_rows result", K(requested), K(tmp_ret), K(count));
     if (OB_FAIL(tmp_ret)) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
         LOG_WARN("failed to get next rows from inverted index", K(ret), KPC_(inv_idx_scan_param), KPC_(inv_idx_scan_iter));
       } else if (count != 0) {
         ret = OB_SUCCESS;
-      }
-    } 
-    else if (count > 0 && OB_NOT_NULL(inv_scan_domain_id_col_)) {
-      // hard-coded docid/id upper bound for MLDR: id < 1000
-      const uint64_t DOCID_LIMIT = 1000;
-      const ObDatumVector &doc_id_vec = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
-      int64_t new_count = count;
-      for (int64_t i = 0; i < count; ++i) {
-        uint64_t d = doc_id_vec.at(i)->get_uint64();
-        if (d >= DOCID_LIMIT) {
-          new_count = i;
-          reached_docid_limit_ = true;
-          break;
-        }
-      }
-      if (new_count == 0) {
-        // current batch all exceed limit, treat as end
-        ret = OB_ITER_END;
-        count = 0;
-      } else if (new_count < count) {
-        // shrink current batch size, upper part will be ignored by callers
-        count = new_count;
       }
     }
   }
@@ -796,12 +770,6 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
         relevance_[i] = relevance_datum.at(i)->get_double();
         if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
           LOG_WARN("failed to get doc id", K(ret), K(doc_id_datum.at(i)));
-        } else if (doc_id_[i].get_datum().get_uint64() >= 1000) {
-          token_iter_->get_skip()->set(i);
-          LOG_INFO("FTS_SKIP_DOCID_BATCH",
-                   K(i),
-                   "doc_id", doc_id_[i].get_datum().get_uint64(),
-                   "reason", "ge_1000");
         }
       }
     }
@@ -812,7 +780,6 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
 int ObTextRetrievalDaaTTokenIter::save_docids()
 {
   int ret = OB_SUCCESS;
-  LOG_INFO("FTS_DEBUG_SAVE_DOCIDS_ENTRY", K(count_), K(cur_idx_));
   if (OB_ISNULL(inv_scan_domain_id_col_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid relevance or doc id expr", K(ret));
@@ -823,16 +790,6 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
         if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
           LOG_WARN("failed to get doc id", K(ret));
-        } else {
-          uint64_t doc_id = doc_id_[i].get_datum().get_uint64();
-          LOG_INFO("FTS_DEBUG_DOCID", K(i), K(doc_id));
-          if (doc_id >= 1000) {
-            token_iter_->get_skip()->set(i);
-            LOG_INFO("FTS_SKIP_DOCID_BATCH",
-                     K(i),
-                     K(doc_id),
-                     "reason", "ge_1000");
-          }
         }
       }
     }

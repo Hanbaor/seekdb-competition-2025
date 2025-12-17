@@ -908,20 +908,11 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
     } else {
-      // BM25S 模式检查：先尝试加载索引，再决定是否跳过迭代器初始化
-      if (query_tokens_.count() > 0) {
-        if (!g_bm25s_index.is_ready()) {
-          // 重启后索引未加载，尝试从磁盘加载
-          int load_ret = g_bm25s_index.ensure_ready();
-          if (OB_SUCCESS != load_ret) {
-            LOG_WARN("BM25S index load failed in do_table_scan", K(load_ret));
-          }
-        }
-        if (g_bm25s_index.is_ready()) {
-          bm25s_skip_init_ = true;
-          LOG_DEBUG("BM25S mode: skip iterator init");
-          return ret;
-        }
+      // BM25S 模式检查：索引已在 create_text_retrieval_tree 入口处加载
+      if (query_tokens_.count() > 0 && g_bm25s_index.is_ready()) {
+        bm25s_skip_init_ = true;
+        LOG_DEBUG("BM25S mode: skip iterator init");
+        return ret;
       }
       
       if (function_lookup_mode_) {
@@ -1150,39 +1141,19 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     }
 
 
-     /*// 模拟延迟，降低 QPS（目标 1000 QPS）
-     struct timeval start, end;
-     gettimeofday(&start, NULL);
-     usleep(620);  // 620 微秒
-     gettimeofday(&end, NULL);
-     int64_t actual = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
-     LOG_INFO("usleep(620) actual delay", K(actual));*/
 
-    // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
+    // ========== TAAT 算法在存储层实现==========
     
     // ========== V3: 优先使用 KVCache 模式 ==========
-    // 由于流式存储不在内存中保留完整缓存，优先使用 KVCache 模式
-    
-    // 先尝试加载持久化文件（如果尚未加载）
-    if (!g_fts_generic_cache.is_cache_file_opened()) {
-      int ensure_ret = g_fts_generic_cache.ensure_ready();
-      if (OB_SUCCESS == ensure_ret) {
-        LOG_INFO("[FTS_FILTER] Cache loaded from disk via ensure_ready (KVCache Mode)");
-      } else if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
-        LOG_WARN("[FTS_FILTER] Failed to ensure cache ready", K(ensure_ret));
-      }
-    }
-    
-    // 只使用新系统 KVCache 模式（磁盘持久化）
+    // 使用 KVCache 模式（缓存已在 create_text_retrieval_tree 入口处加载）
     const bool use_new_system = g_fts_generic_cache.is_cache_file_opened();
     
-    if (use_new_system) {
-      LOG_INFO("[FTS_FILTER] Using Generic Cache KVCache Mode",
-               "file_row_count", g_fts_generic_cache.get_file_header().row_count,
-               "filter_count", g_fts_generic_filter_ctx.condition_count());
-    } else {
-      LOG_INFO("[FTS_FILTER] No cache available, filtering DISABLED");
-    }
+    // 生产环境注释掉以提升 QPS
+    // if (use_new_system) {
+    //   LOG_INFO("[FTS_FILTER] Using Generic Cache KVCache Mode",
+    //            "file_row_count", g_fts_generic_cache.get_file_header().row_count,
+    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
+    // }
     
     // scores_array 需要按 doc_id 直接索引，手动管理
     // touched_docs 使用 ObArray 自动扩容
@@ -1222,20 +1193,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 使用全局过滤上下文中的 id_limit
     int64_t id_limit = g_fts_filter_ctx.has_id_filter_ ? g_fts_filter_ctx.id_limit_ : INT64_MAX;
-    
-    // ========== 诊断日志：检查索引状态（KVCache 模式）==========
-    // 生产环境注释掉以提升 QPS
-    // if (use_new_system) {
-    //   LOG_INFO("BM25S search: starting (KVCache mode, NEW SYSTEM)",
-    //            "query_tokens_count", query_tokens_.count(),
-    //            K(id_limit),
-    //            "generic_cache_size", g_fts_generic_cache.size());
-    // } else {
-    //   LOG_INFO("BM25S search: starting (KVCache mode, OLD SYSTEM)",
-    //          "query_tokens_count", query_tokens_.count(),
-    //          K(id_limit),
-    //          "scalar_cache_size", g_fts_scalar_cache.size());
-    // }
     
     // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
     int64_t tokens_found = 0, tokens_not_found = 0;
