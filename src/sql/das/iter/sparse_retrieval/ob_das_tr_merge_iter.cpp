@@ -1218,10 +1218,14 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       int64_t valid_count = posting->get_valid_count(id_limit);
       total_postings += valid_count;
       
-      // 遍历有效的 posting 
+      // 获取数组指针，避免循环中重复函数调用
+      const uint32_t *doc_ids = posting->get_doc_ids();
+      const float *scores = posting->get_scores();
+      
+      // 遍历有效的 posting（直接数组访问）
       for (int64_t i = 0; i < valid_count; i++) {
-        uint32_t doc_id = posting->get_doc_id(i);
-        float score = posting->get_score(i);
+        uint32_t doc_id = doc_ids[i];
+        float score = scores[i];
         
         if (scores_array[doc_id] == 0.0) {
           touched_docs.push_back(doc_id);
@@ -1240,7 +1244,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     //          "touched_docs_count", touched_docs.count());
     
     // 2. 收集结果
-    ObSEArray<ObFtsBM25SIndex::DocScore, 256> results;
+    ObSEArray<ObFtsBM25SIndex::DocScore, 1024> results;
     for (int64_t i = 0; i < touched_docs.count(); i++) {
       uint32_t doc_id = touched_docs.at(i);
       double score = scores_array[doc_id];
@@ -1278,12 +1282,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         }
       }
     }
-    // LOG_INFO("FTS BM25S topk", K(topk_limit_), K(effective_topk), K(limit_from_expr),
-    //          "ir_ctdef", OB_NOT_NULL(ir_ctdef_), 
-    //          "topk_expr", OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_),
-    //          K(results.count()), K(capacity));
-    
-    // 如果 topk 未下推（不应该发生），使用 results 数量作为 fallback
     if (effective_topk <= 0) {
       effective_topk = results.count();
     }
@@ -1321,7 +1319,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
           bool pass = true;
           
           if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
-            // 使用 KVCache 模式检查过滤条件
             pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
           }
           
