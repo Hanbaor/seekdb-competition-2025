@@ -1227,6 +1227,16 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
     if (!g_fts_generic_cache.is_cache_file_opened()) {
       g_fts_generic_cache.ensure_ready();
     }
+    // 状态验证日志（首次查询时打印）
+    static bool cache_status_logged = false;
+    if (!cache_status_logged) {
+      cache_status_logged = true;
+      LOG_INFO("[FTS_CACHE_STATUS] Cache state at first query",
+               "bm25s_ready", g_bm25s_index.is_ready(),
+               "generic_cache_file_opened", g_fts_generic_cache.is_cache_file_opened(),
+               "generic_cache_row_count", g_fts_generic_cache.get_file_header().row_count,
+               "generic_cache_streaming_mode", g_fts_generic_cache.is_streaming_mode());
+    }
     const bool skip_sort_for_bm25s = g_bm25s_index.is_ready();
     if (!has_sort || skip_sort_for_bm25s) {
       // skip - BM25S 模式下数据已排序，无需重复排序

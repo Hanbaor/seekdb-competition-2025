@@ -16,7 +16,6 @@
 #include "share/ob_io_device_helper.h"
 #include "common/storage/ob_io_device.h"
 #include "share/cache/ob_kv_storecache.h"
-#include "lib/hash/ob_hashmap.h"
 
 namespace oceanbase
 {
@@ -371,15 +370,6 @@ public:
    */
   int ensure_ready();
 
-  // ========== V4: HashMap 缓存查询接口 ==========
-  
-  /**
-   * 从 HashMap 获取行数据（轻量级缓存，读不加锁）
-   * @param doc_id 文档 ID
-   * @param row_data 输出：行数据指针
-   */
-  int get_row_from_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data);
-
 private:
   int ensure_capacity(uint64_t required);
   int copy_column_value(const ObFtsColumnValue &src, ObFtsColumnValue &dst);
@@ -399,10 +389,6 @@ private:
   // ========== V3: 流式存储私有方法 ==========
   int serialize_row_from_values(const ObFtsColumnValue *column_values, 
                                 char *buf, int64_t buf_len, int64_t &row_size);
-
-  // ========== V4: HashMap 缓存私有方法 ==========
-  int init_hashmap();
-  int load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data);
 
 private:
   bool is_inited_;
@@ -440,17 +426,21 @@ private:
   char *streaming_row_buf_;               // 行数据序列化缓冲区
   static const int64_t STREAMING_ROW_BUF_SIZE = 8192;  // 单行最大 8KB
   
-  // ========== V4: HashMap 缓存相关成员 ==========
-  typedef common::hash::ObHashMap<uint64_t, ObFtsRowData*, common::hash::NoPthreadDefendMode> RowHashMap;
-  RowHashMap row_hashmap_;                // doc_id -> ObFtsRowData* 的映射
-  common::ObArenaAllocator hashmap_allocator_;  // HashMap 数据的内存分配器
-  bool hashmap_inited_;                   // HashMap 是否已初始化
-  bool use_hashmap_;                      // 是否启用 HashMap 模式
-  mutable common::ObSpinLock hashmap_lock_;  // HashMap 写锁
-
+  // ========== 并行任务计数 ==========
+  int64_t active_collectors_;             // 活跃的收集任务数
+  
 public:
-  void set_use_hashmap(bool v) { use_hashmap_ = v; }
-  bool is_use_hashmap() const { return use_hashmap_; }
+  // ========== 统一状态检查 ==========
+  // IDLE:      !streaming_mode_ && !persist_file_opened_
+  // STREAMING: streaming_mode_
+  // READY:     !streaming_mode_ && persist_file_opened_
+  bool is_idle() const { return !streaming_mode_ && !persist_file_opened_; }
+  bool is_ready() const { return !streaming_mode_ && persist_file_opened_; }
+  
+  // ========== 并行任务管理（与 BM25S 同步）==========
+  void begin_collect() { ATOMIC_AAF(&active_collectors_, 1); }
+  bool end_collect() { return ATOMIC_SAF(&active_collectors_, 1) == 0; }
+  bool can_finalize() const { return ATOMIC_LOAD(&active_collectors_) == 0; }
 };
 
 // 全局单例

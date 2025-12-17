@@ -210,7 +210,7 @@ public:
   bool check_row(uint64_t doc_id, const ObFtsGenericCache &cache) const;
 
   /**
-   * 快速检查（支持内存模式和 KVCache 模式）
+   * 快速检查（仅使用 KVCache 模式）
    * 内联实现以减少函数调用开销
    */
   inline bool check_row_fast(uint64_t doc_id, ObFtsGenericCache &cache) const
@@ -223,83 +223,42 @@ public:
       return false;
     }
 
-    // 判断使用哪种模式
-    const bool use_memory_mode = cache.is_inited();
-    const bool use_kvcache_mode = !use_memory_mode && cache.is_cache_file_opened();
-    
-    if (!use_memory_mode && !use_kvcache_mode) {
+    // 仅使用 KVCache 模式
+    if (!cache.is_ready()) {
       return true;  // 缓存不可用，跳过过滤
     }
     
     // 检查 doc_id 范围
-    uint64_t max_doc_id = use_memory_mode ? 
-        static_cast<uint64_t>(cache.size()) : 
-        static_cast<uint64_t>(cache.get_file_header().row_count);
+    uint64_t max_doc_id = static_cast<uint64_t>(cache.get_file_header().row_count);
     if (doc_id > max_doc_id) {
       return false;
     }
 
-    // 提前获取列数
-    const int64_t col_count = cache.column_count();
-    
-    if (use_memory_mode) {
-      // 内存模式：直接数组访问
-      for (int64_t i = 0; i < condition_count_; ++i) {
-        const ObFtsFilterCondition &cond = conditions_[i];
-        const int64_t col_idx = cond.column_idx_;
-        if (col_idx < 0 || col_idx >= col_count) continue;
-        
-        const ObFtsColumnValue &col_val = cache.get_column_fast(doc_id, col_idx);
-        if (!cond.check(col_val)) {
-          return false;
-        }
-      }
-    } else if (cache.is_use_hashmap()) {
-      // HashMap 模式：轻量级缓存，读不加锁
-      const ObFtsRowData *row_data = nullptr;
-      int ret = cache.get_row_from_hashmap(doc_id, row_data);
-      if (common::OB_SUCCESS != ret || row_data == nullptr) {
-        return true;  // 获取失败，跳过过滤
-      }
-      
-      // 检查每个条件
-      for (int64_t i = 0; i < condition_count_; ++i) {
-        const ObFtsFilterCondition &cond = conditions_[i];
-        const int64_t col_idx = cond.column_idx_;
-        if (col_idx < 0 || col_idx >= col_count) continue;
-        
-        const ObFtsColumnValue &col_val = row_data->get_column(col_idx);
-        if (!cond.check(col_val)) {
-          return false;
-        }
-      }
-    // } else {
-    //   // KVCache 模式：从 KVCache 获取行数据
-    //   const ObFtsScalarCacheValue *row = nullptr;
-    //   common::ObKVCacheHandle handle;
-    //   int ret = cache.get_row_from_kvcache(doc_id, row, handle);
-    //   if (common::OB_SUCCESS != ret || row == nullptr) {
-    //     return true;  // 获取失败，跳过过滤
-    //   }
-      
-    //   // 检查每个条件
-    //   for (int64_t i = 0; i < condition_count_; ++i) {
-    //     const ObFtsFilterCondition &cond = conditions_[i];
-    //     const int64_t col_idx = cond.column_idx_;
-    //     if (col_idx < 0 || col_idx >= col_count) continue;
-        
-    //     // 从 KVCache 行数据获取列值
-    //     ObFtsColumnValue col_val;
-    //     if (common::OB_SUCCESS != row->get_column_value(col_idx, col_val)) {
-    //       continue;  // 获取失败，跳过这个条件
-    //     }
-    //     if (!cond.check(col_val)) {
-    //       return false;
-    //     }
-    //   }
-    //   // handle 析构时自动释放 KVCache 引用
+    // 从 KVCache 获取行数据
+    const ObFtsScalarCacheValue *row = nullptr;
+    common::ObKVCacheHandle handle;
+    int ret = cache.get_row_from_kvcache(doc_id, row, handle);
+    if (common::OB_SUCCESS != ret || row == nullptr) {
+      return true;  // 获取失败，跳过过滤
     }
-
+    
+    // 检查每个条件
+    const int64_t col_count = cache.column_count();
+    for (int64_t i = 0; i < condition_count_; ++i) {
+      const ObFtsFilterCondition &cond = conditions_[i];
+      const int64_t col_idx = cond.column_idx_;
+      if (col_idx < 0 || col_idx >= col_count) continue;
+      
+      // 从 KVCache 行数据获取列值
+      ObFtsColumnValue col_val;
+      if (common::OB_SUCCESS != row->get_column_value(col_idx, col_val)) {
+        continue;  // 获取失败，跳过这个条件
+      }
+      if (!cond.check(col_val)) {
+        return false;
+      }
+    }
+    // handle 析构时自动释放 KVCache 引用
     return true;
   }
 

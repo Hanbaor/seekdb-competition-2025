@@ -44,10 +44,7 @@ ObFtsGenericCache::ObFtsGenericCache()
     streaming_row_index_(nullptr),
     streaming_row_index_capacity_(0),
     streaming_row_buf_(nullptr),
-    hashmap_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "FtsHashMap")),
-    hashmap_inited_(false),
-    use_hashmap_(true),  // 默认启用 HashMap 模式
-    hashmap_lock_(common::ObLatchIds::DEFAULT_SPIN_LOCK)
+    active_collectors_(0)
 {
   for (int64_t i = 0; i < MAX_COLUMNS; ++i) {
     column_data_[i] = nullptr;
@@ -1176,11 +1173,21 @@ int ObFtsGenericCache::init_streaming_persist(const char *cache_dir,
 {
   int ret = common::OB_SUCCESS;
   
+  // 如果正在流式模式，返回错误
   if (streaming_mode_) {
     ret = common::OB_INIT_TWICE;
     LOG_WARN("[FTS_GENERIC_CACHE] streaming persist already initialized", K(ret));
     return ret;
   }
+  
+  // 如果之前的索引已完成（文件已打开），先关闭并重置状态
+  if (persist_file_opened_) {
+    LOG_INFO("[FTS_GENERIC_CACHE] init_streaming_persist: closing previous cache file for rebuild");
+    close_cache_file();
+  }
+  
+  // 重置并行任务计数器
+  ATOMIC_SET(&active_collectors_, 0);
   
   if (OB_ISNULL(cache_dir)) {
     ret = common::OB_INVALID_ARGUMENT;
@@ -1625,226 +1632,6 @@ int ObFtsGenericCache::finish_streaming_persist()
   LOG_INFO("[FTS_GENERIC_CACHE] finish_streaming_persist: completed successfully",
            K_(cache_file_path), K_(count), K_(column_count),
            "row_data_size", file_header_.row_data_size);
-  
-  return ret;
-}
-
-// ========================================================================
-// V4: HashMap 缓存实现
-// ========================================================================
-
-int ObFtsGenericCache::init_hashmap()
-{
-  int ret = common::OB_SUCCESS;
-  
-  if (hashmap_inited_) {
-    return common::OB_SUCCESS;
-  }
-  
-  common::ObSpinLockGuard guard(hashmap_lock_);
-  
-  // Double check
-  if (hashmap_inited_) {
-    return common::OB_SUCCESS;
-  }
-  
-  // 预分配足够的 bucket 避免 rehash（1.5倍行数）
-  int64_t bucket_count = file_header_.row_count > 0 ? 
-      static_cast<int64_t>(file_header_.row_count * 1.5) : 10000;
-  if (OB_FAIL(row_hashmap_.create(bucket_count, "FtsRowHashMap", "FtsRowHashMap"))) {
-    LOG_WARN("[FTS_GENERIC_CACHE] init_hashmap: 创建 hashmap 失败", K(ret), K(bucket_count));
-    return ret;
-  }
-  
-  hashmap_inited_ = true;
-  LOG_INFO("[FTS_GENERIC_CACHE] init_hashmap: hashmap 初始化完成", K(bucket_count));
-  
-  return ret;
-}
-
-int ObFtsGenericCache::get_row_from_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data)
-{
-  int ret = common::OB_SUCCESS;
-  row_data = nullptr;
-  
-  // 确保 HashMap 已初始化
-  if (!hashmap_inited_) {
-    if (OB_FAIL(init_hashmap())) {
-      return ret;
-    }
-  }
-  
-  // 读不加锁（查询是单线程的）
-  ObFtsRowData *found_row = nullptr;
-  ret = row_hashmap_.get_refactored(doc_id, found_row);
-  
-  if (common::OB_SUCCESS == ret && OB_NOT_NULL(found_row)) {
-    row_data = found_row;
-    return common::OB_SUCCESS;
-  }
-  
-  // HashMap 未命中，从磁盘加载
-  if (common::OB_HASH_NOT_EXIST == ret) {
-    ret = load_row_to_hashmap(doc_id, row_data);
-  }
-  
-  return ret;
-}
-
-int ObFtsGenericCache::load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data)
-{
-  int ret = common::OB_SUCCESS;
-  row_data = nullptr;
-  
-  // 检查文件是否已打开
-  if (!persist_file_opened_) {
-    ret = ensure_ready();
-    if (OB_FAIL(ret)) {
-      return ret;
-    }
-  }
-  
-  // 检查 doc_id 有效性
-  if (doc_id == 0 || doc_id > static_cast<uint64_t>(file_header_.row_count)) {
-    return common::OB_ENTRY_NOT_EXIST;
-  }
-  
-  // 检查行索引
-  if (OB_ISNULL(row_index_)) {
-    return common::OB_NOT_INIT;
-  }
-  
-  const FtsRowIndexEntry &index_entry = row_index_[doc_id - 1];
-  if (index_entry.data_size == 0) {
-    return common::OB_ENTRY_NOT_EXIST;
-  }
-  
-  // 1. 使用临时 buffer 读取磁盘数据（不加锁，IO 耗时）
-  char *temp_buf = static_cast<char*>(ob_malloc(index_entry.data_size, "FtsTmpRow"));
-  if (OB_ISNULL(temp_buf)) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 分配临时 buffer 失败", K(ret));
-    return common::OB_ALLOCATE_MEMORY_FAILED;
-  }
-  
-  int64_t data_offset = file_header_.row_data_offset + index_entry.data_offset;
-  int64_t read_size = 0;
-  if (OB_FAIL(share::ObIODeviceLocalFileOp::pread_impl(
-          persist_fd_.second_id_, temp_buf, index_entry.data_size,
-          data_offset, read_size))) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 读取磁盘失败", K(ret), K(doc_id));
-    ob_free(temp_buf);
-    return ret;
-  }
-  
-  // 2. 加锁进行内存分配和反序列化
-  common::ObSpinLockGuard guard(hashmap_lock_);
-  
-  // Double check: 可能其他线程已经加载了
-  ObFtsRowData *existing_row = nullptr;
-  if (common::OB_SUCCESS == row_hashmap_.get_refactored(doc_id, existing_row)) {
-    row_data = existing_row;
-    ob_free(temp_buf);
-    return common::OB_SUCCESS;
-  }
-  
-  // 3. 分配 ObFtsRowData
-  ObFtsRowData *new_row = static_cast<ObFtsRowData*>(
-      hashmap_allocator_.alloc(sizeof(ObFtsRowData)));
-  if (OB_ISNULL(new_row)) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 分配 ObFtsRowData 失败", K(ret));
-    ob_free(temp_buf);
-    return common::OB_ALLOCATE_MEMORY_FAILED;
-  }
-  new (new_row) ObFtsRowData();
-  
-  // 4. 初始化并反序列化
-  if (OB_FAIL(new_row->init(file_header_.column_count, hashmap_allocator_))) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 初始化行失败", K(ret));
-    ob_free(temp_buf);
-    return ret;
-  }
-  
-  // 反序列化（格式与 KVCache 相同）
-  const char *p = temp_buf;
-  const char *end = temp_buf + index_entry.data_size;
-  
-  for (int64_t col = 0; col < file_header_.column_count && p < end; ++col) {
-    ObFtsColumnValue col_val;
-    
-    // 读取类型标记
-    col_val.type_ = static_cast<ObFtsColumnValue::Type>(*p++);
-    
-    switch (col_val.type_) {
-      case ObFtsColumnValue::TYPE_NULL:
-        // 无数据
-        break;
-      case ObFtsColumnValue::TYPE_INT64:
-        if (p + sizeof(int64_t) <= end) {
-          memcpy(&col_val.int_val_, p, sizeof(int64_t));
-          p += sizeof(int64_t);
-        }
-        break;
-      case ObFtsColumnValue::TYPE_UINT64:
-        if (p + sizeof(uint64_t) <= end) {
-          memcpy(&col_val.uint_val_, p, sizeof(uint64_t));
-          p += sizeof(uint64_t);
-        }
-        break;
-      case ObFtsColumnValue::TYPE_DOUBLE:
-        if (p + sizeof(double) <= end) {
-          memcpy(&col_val.double_val_, p, sizeof(double));
-          p += sizeof(double);
-        }
-        break;
-      case ObFtsColumnValue::TYPE_STRING: {
-        if (p + sizeof(int32_t) <= end) {
-          int32_t len = 0;
-          memcpy(&len, p, sizeof(int32_t));
-          p += sizeof(int32_t);
-          if (len > 0 && p + len <= end) {
-            // 深拷贝字符串到 hashmap_allocator_
-            char *str_buf = static_cast<char*>(hashmap_allocator_.alloc(len));
-            if (OB_NOT_NULL(str_buf)) {
-              memcpy(str_buf, p, len);
-              col_val.str_val_.ptr_ = str_buf;
-              col_val.str_val_.len_ = len;
-            }
-            p += len;
-          }
-        }
-        break;
-      }
-      case ObFtsColumnValue::TYPE_DATETIME:
-        if (p + sizeof(int64_t) <= end) {
-          memcpy(&col_val.datetime_val_, p, sizeof(int64_t));
-          p += sizeof(int64_t);
-        }
-        break;
-      default:
-        col_val.type_ = ObFtsColumnValue::TYPE_NULL;
-        break;
-    }
-    
-    new_row->set_column(col, col_val);
-  }
-  
-  // 5. 放入 HashMap
-  if (OB_FAIL(row_hashmap_.set_refactored(doc_id, new_row))) {
-    if (common::OB_HASH_EXIST == ret) {
-      // 已存在（并发场景），获取已有的
-      ret = common::OB_SUCCESS;
-      if (OB_SUCC(row_hashmap_.get_refactored(doc_id, existing_row))) {
-        row_data = existing_row;
-      }
-    } else {
-      LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 插入 hashmap 失败", K(ret), K(doc_id));
-    }
-  } else {
-    row_data = new_row;
-  }
-  
-  // 6. 释放临时 buffer
-  ob_free(temp_buf);
   
   return ret;
 }

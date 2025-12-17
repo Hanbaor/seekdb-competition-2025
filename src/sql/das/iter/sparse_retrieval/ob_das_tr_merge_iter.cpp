@@ -1151,40 +1151,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
 
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
     
-    // 缓存已在 do_table_scan 入口处加载，这里直接使用状态
-    // V3: 优先使用 KVCache 模式，内存模式作为备选
-    const bool use_new_system_kvcache = g_fts_generic_cache.is_cache_file_opened();
-    const bool use_new_system_memory = !use_new_system_kvcache && 
-                                       g_fts_generic_cache.is_inited() && 
-                                       g_fts_generic_cache.size() > 0;
-    const bool use_new_system = use_new_system_kvcache || use_new_system_memory;
-    const bool use_old_system = !use_new_system && 
-                                g_fts_scalar_cache.is_inited() && 
-                                g_fts_scalar_cache.size() > 0;
-    
-    // 生产环境注释掉以提升 QPS
-    // if (use_new_system_kvcache) {
-    //   LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode - Preferred)",
-    //            "file_row_count", g_fts_generic_cache.get_file_header().row_count,
-    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
-    // } else if (use_new_system_memory) {
-    //   LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode - Fallback)",
-    //            "cache_size", g_fts_generic_cache.size(),
-    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
-    // } else if (use_old_system) {
-    //   LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
-    //            "cache_size", g_fts_scalar_cache.size());
-    // } else {
-    //   LOG_INFO("[FTS_FILTER] No cache available, filtering DISABLED");
-    // }
-    
-    // 确保缓存已加载（旧系统兼容）
-    if (use_old_system && !g_fts_scalar_cache.is_loaded()) {
-      int load_ret = g_fts_scalar_cache.load_to_memory();
-      if (OB_SUCCESS != load_ret) {
-        LOG_WARN("failed to load scalar cache to memory", K(load_ret));
-      }
-    }
+    // 缓存状态检查（仅使用 KVCache 磁盘模式）
+    const bool use_cache = g_fts_generic_cache.is_ready();
     
     // scores_array 需要按 doc_id 直接索引，手动管理
     // touched_docs 使用 ObArray 自动扩容
@@ -1195,35 +1163,17 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     // 确保 scores_array 容量足够
     int64_t required_capacity;
     
-    // 验证过滤上下文是否正确传递（从 ob_table_scan_op.cpp）
-    if (use_new_system) {
-      // LOG_INFO("[FTS_NEW_SYSTEM] filter context in do_bm25s_search",
-      //          "condition_count", g_fts_generic_filter_ctx.condition_count(),
-      //          "has_limit", g_fts_generic_filter_ctx.has_limit(),
-      //          "limit_count", g_fts_generic_filter_ctx.get_limit());
-    } else {
-      // LOG_INFO("[FTS_OLD_SYSTEM] filter context in do_bm25s_search", 
-      //        "has_id_filter", g_fts_filter_ctx.has_id_filter_, 
-      //        "id_limit", g_fts_filter_ctx.id_limit_,
-      //        "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
-      //          "base_id_count", g_fts_filter_ctx.base_id_count());
-    }
-
+    // 确定 scores_array 容量
     if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
       // 有 id 过滤，用 id_limit 作为容量（更省内存）
       required_capacity = g_fts_filter_ctx.id_limit_;
-    } else if (use_new_system_memory) {
-      // 新系统内存模式：用 generic cache 容量
-      required_capacity = g_fts_generic_cache.capacity();
-      if (required_capacity <= 0) required_capacity = 2000;
-    } else if (use_new_system_kvcache) {
-      // 新系统 KVCache 模式：用文件头中的行数
+    } else if (use_cache) {
+      // 使用文件头中的行数
       required_capacity = g_fts_generic_cache.get_file_header().row_count + 1;
       if (required_capacity <= 0) required_capacity = 2000;
     } else {
-      // 旧系统：用 scalar cache 容量
-      required_capacity = g_fts_scalar_cache.capacity();
-      if (required_capacity <= 0) required_capacity = 2000;
+      // 无缓存：使用默认容量
+      required_capacity = 2000;
     }
     
     if (scores_capacity < required_capacity) {
@@ -1389,12 +1339,9 @@ ObDASTRMergeIter::ObDASTRMergeIter()
           uint32_t doc_id = res.doc_id;
           bool pass = true;
           
-          if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
-            // V4: 统一使用 check_row_fast，内部会根据 use_hashmap_ 选择 HashMap 或 KVCache
+          if (use_cache && g_fts_generic_filter_ctx.has_conditions()) {
+            // 使用 check_row_fast，内部会根据 use_hashmap_ 选择 HashMap 或 KVCache
             pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
-          } else if (use_old_system && g_fts_filter_ctx.has_base_id_filter_ && g_fts_scalar_cache.size() > 0) {
-            const common::ObString &base_id = g_fts_scalar_cache.get_base_id_fast(doc_id);
-            pass = g_fts_filter_ctx.check_base_id(base_id);
           }
           
           if (pass) {
