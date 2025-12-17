@@ -4173,12 +4173,12 @@
    // ========== FTS Generic Cache：追踪当前任务是否参与缓存创建 ==========
    static thread_local bool generic_cache_task_started = false;
    
-   // 与 BM25S 同步：只有当 BM25S 索引正在创建时才初始化 Generic Cache
-   // 条件：BM25S 已初始化但未完成，且当前任务还没开始参与缓存创建
-   const bool need_init_cache = g_bm25s_index.is_inited() && 
-                                 !g_bm25s_index.is_finalized() && 
-                                 !generic_cache_task_started;
-   if (need_init_cache) {
+   // 与 BM25S 同步：Generic Cache 初始化移到 while 循环内部
+   // 确保第一行数据也能被正确处理
+   auto try_init_generic_cache = [&]() {
+     if (generic_cache_task_started) return;  // 已经初始化过
+     if (!g_bm25s_index.is_inited() || g_bm25s_index.is_finalized()) return;  // BM25S 未就绪
+     
      // 分析 MY_SPEC.output_ 获取需要缓存的列元数据
      common::ObArray<ObFtsColumnMeta> column_metas;
      int64_t type_orders[64] = {0};  // 每种类型的计数器
@@ -4228,8 +4228,10 @@
          LOG_WARN("[FTS_CACHE] Generic Cache init FAILED", K(init_ret));
        }
      }
-   }
+   };
    // ==========================================================
+   // 首次尝试初始化
+   try_init_generic_cache();
   
   // ========== BM25S 索引：标记一个并行任务开始 ==========
   static thread_local bool bm25s_task_started = false;
@@ -4339,14 +4341,34 @@
            }
          }
        }
-       // ========== 新系统：流式写入 Generic Cache ==========
-       // 仅在当前任务参与缓存创建时写入数据
-       static thread_local uint64_t cache_row_seq = 0;  // 递增序号，用于诊断
+       // Generic Cache 写入移到 segment 之后，确保 BM25S 已初始化
+       
+       ObString ft = ft_datum->get_string();
+       ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+       if (OB_FAIL(ObTextStringHelper::read_real_string_data(tmp_allocator,
+                                                             *ft_datum,
+                                                             ft_expr->datum_meta_,
+                                                             ft_expr->obj_meta_.has_lob_header(),
+                                                             ft))) {
+         LOG_WARN("fail to read real string data", K(ret));
+       } else if (OB_FAIL(fts_index_.segment(ft_expr->obj_meta_, *doc_id_datum, ft, real_pk_for_cache)) && OB_ITER_END != ret) {
+         LOG_WARN("fail to segment fulltext", K(ret), K(doc_id_datum), K(ft));
+       } else if (OB_ITER_END == ret) {
+         has_segment_word = false;
+         ret = OB_SUCCESS;
+       } else {
+         has_segment_word = true;
+       }
+       
+       // ========== Generic Cache 写入（移到 segment 之后）==========
+       // 此时 BM25S 已通过 segment->collect_raw_data 初始化
+       try_init_generic_cache();
+       
+       static thread_local uint64_t cache_row_seq = 0;
        if (generic_cache_task_started) {
          ++cache_row_seq;
          
-         // 使用 id 列的值作为 doc_id（与旧系统保持一致）
-         // 先找到 id 列的值
+         // 使用 id 列的值作为 doc_id
          uint64_t id_for_cache = 0;
          const ExprFixedArray &output_exprs = MY_SPEC.output_;
          
@@ -4373,39 +4395,21 @@
            }
          }
          
-         // 诊断：打印前几行的 id 获取情况
+         // 诊断日志
          if (cache_row_seq <= 5 || id_for_cache == 0) {
-           LOG_INFO("[FTS_CACHE_DEBUG] Row id extraction",
+           LOG_INFO("[FTS_CACHE_DEBUG] Row id extraction (after segment)",
                     K(cache_row_seq), K(id_for_cache), "output_count", output_exprs.count());
          }
          
          if (id_for_cache > 0) {
-           // V3: 使用流式写入，数据直接写入磁盘
            int cache_ret = g_fts_generic_cache.streaming_add_row_from_exprs(
                id_for_cache, MY_SPEC.output_, eval_ctx_);
            if (OB_SUCCESS != cache_ret && OB_HASH_EXIST != cache_ret) {
-             LOG_WARN("[FTS_NEW_SYSTEM] Failed to streaming add row", K(cache_ret), K(id_for_cache));
-          }
-        }
+             LOG_WARN("[FTS_CACHE] Failed to streaming add row", K(cache_ret), K(id_for_cache));
+           }
+         }
        }
-       // ========== FTS 缓存填充：结束 ==========
-       
-       ObString ft = ft_datum->get_string();
-       ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-       if (OB_FAIL(ObTextStringHelper::read_real_string_data(tmp_allocator,
-                                                             *ft_datum,
-                                                             ft_expr->datum_meta_,
-                                                             ft_expr->obj_meta_.has_lob_header(),
-                                                             ft))) {
-         LOG_WARN("fail to read real string data", K(ret));
-       } else if (OB_FAIL(fts_index_.segment(ft_expr->obj_meta_, *doc_id_datum, ft, real_pk_for_cache)) && OB_ITER_END != ret) {
-         LOG_WARN("fail to segment fulltext", K(ret), K(doc_id_datum), K(ft));
-       } else if (OB_ITER_END == ret) {
-         has_segment_word = false;
-         ret = OB_SUCCESS;
-       } else {
-         has_segment_word = true;
-       }
+       // ========== Generic Cache 写入结束 ==========
      }
    }
    return ret;
