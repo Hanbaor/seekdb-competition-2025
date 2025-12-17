@@ -44,6 +44,7 @@ ObFtsGenericCache::ObFtsGenericCache()
     streaming_row_index_(nullptr),
     streaming_row_index_capacity_(0),
     streaming_row_buf_(nullptr),
+    active_collectors_(0),
     hashmap_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "FtsHashMap")),
     hashmap_inited_(false),
     use_hashmap_(true),  // 默认启用 HashMap 模式
@@ -1181,6 +1182,15 @@ int ObFtsGenericCache::init_streaming_persist(const char *cache_dir,
     LOG_WARN("[FTS_GENERIC_CACHE] streaming persist already initialized", K(ret));
     return ret;
   }
+  
+  // 如果之前已经完成过（READY 状态），关闭旧文件准备重建
+  if (persist_file_opened_) {
+    close_cache_file();
+    LOG_INFO("[FTS_GENERIC_CACHE] init_streaming_persist: closed existing cache file for rebuild");
+  }
+  
+  // 重置并行任务计数器
+  ATOMIC_SET(&active_collectors_, 0);
   
   if (OB_ISNULL(cache_dir)) {
     ret = common::OB_INVALID_ARGUMENT;

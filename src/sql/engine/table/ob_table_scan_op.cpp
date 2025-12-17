@@ -4170,26 +4170,15 @@
    int ret = OB_SUCCESS;
    bool has_segment_word = false;
    
-   // ========== FTS 缓存初始化：同时支持新旧两套系统 ==========
-   // 状态变量
-   static bool fts_cache_initialized = false;
-   static bool fts_generic_cache_initialized = false;
-   static int64_t fts_cache_fill_count = 0;
-   static int64_t fts_row_process_count = 0;  // 处理的行数
+   // ========== FTS Generic Cache：追踪当前任务是否参与缓存创建 ==========
+   static thread_local bool generic_cache_task_started = false;
    
-   // 旧系统：初始化 Scalar Cache
-   if (!fts_cache_initialized) {
-     int init_ret = g_fts_scalar_cache.init(200000);  // 使用默认容量，需要时自动扩容
-     if (OB_SUCCESS == init_ret || OB_INIT_TWICE == init_ret) {
-       fts_cache_initialized = true;
-       LOG_INFO("[FTS_OLD_SYSTEM] Scalar Cache initialized");
-     } else {
-       LOG_WARN("[FTS_OLD_SYSTEM] Scalar Cache init FAILED", K(init_ret));
-     }
-   }
-   
-   // 新系统：初始化 Generic Cache（使用流式存储，减少内存占用）
-   if (!fts_generic_cache_initialized) {
+   // 与 BM25S 同步：只有当 BM25S 索引正在创建时才初始化 Generic Cache
+   // 条件：BM25S 已初始化但未完成，且当前任务还没开始参与缓存创建
+   const bool need_init_cache = g_bm25s_index.is_inited() && 
+                                 !g_bm25s_index.is_finalized() && 
+                                 !generic_cache_task_started;
+   if (need_init_cache) {
      // 分析 MY_SPEC.output_ 获取需要缓存的列元数据
      common::ObArray<ObFtsColumnMeta> column_metas;
      int64_t type_orders[64] = {0};  // 每种类型的计数器
@@ -4222,22 +4211,22 @@
      }
      
      if (column_metas.count() > 0) {
-       // V3: 使用流式存储模式，直接写入磁盘，减少内存占用
        const char *persist_dir = "/data/obcluster/store/fts_scalar_cache";
        int init_ret = g_fts_generic_cache.init_streaming_persist(persist_dir, column_metas, 200000);
        if (OB_SUCCESS == init_ret) {
-         fts_generic_cache_initialized = true;
-         LOG_INFO("[FTS_NEW_SYSTEM] Generic Cache streaming mode initialized",
+         // 初始化成功，开始收集任务
+         g_fts_generic_cache.begin_collect();
+         generic_cache_task_started = true;
+         LOG_INFO("[FTS_CACHE] Generic Cache initialized, begin_collect called",
                   "column_count", column_metas.count());
        } else if (OB_INIT_TWICE == init_ret) {
-         // 已经初始化过，可能是重启后，跳过
-         fts_generic_cache_initialized = true;
-         LOG_INFO("[FTS_NEW_SYSTEM] Generic Cache already initialized (streaming or loaded)");
+         // 已在流式模式，当前任务也参与收集
+         g_fts_generic_cache.begin_collect();
+         generic_cache_task_started = true;
+         LOG_INFO("[FTS_CACHE] Generic Cache already streaming, join collect");
        } else {
-         LOG_WARN("[FTS_NEW_SYSTEM] Generic Cache streaming init FAILED", K(init_ret));
+         LOG_WARN("[FTS_CACHE] Generic Cache init FAILED", K(init_ret));
        }
-     } else {
-       LOG_INFO("[FTS_NEW_SYSTEM] No cacheable columns found, Generic Cache SKIPPED");
      }
    }
    // ==========================================================
@@ -4259,6 +4248,23 @@
 
     if (OB_FAIL(ObTableScanOp::inner_get_next_row_implement())) {
       if (OB_ITER_END == ret) {
+        // ========== FTS Generic Cache：并行任务结束 ==========
+        if (generic_cache_task_started) {
+          generic_cache_task_started = false;
+          if (g_fts_generic_cache.end_collect()) {
+            // 所有任务完成，写入文件头
+            int persist_ret = g_fts_generic_cache.finish_streaming_persist();
+            if (OB_SUCCESS == persist_ret) {
+              LOG_INFO("[FTS_CACHE] Generic Cache finalize completed",
+                       "row_count", g_fts_generic_cache.get_file_header().row_count,
+                       "column_count", g_fts_generic_cache.column_count());
+            } else {
+              LOG_WARN("[FTS_CACHE] Failed to finish streaming persist", K(persist_ret));
+            }
+          }
+        }
+        // ============================================================
+        
         // ========== BM25S 索引：并行任务结束，尝试 finalize ==========
         if (bm25s_task_started && g_bm25s_index.is_inited() && !g_bm25s_index.is_finalized()) {
           bm25s_task_started = false;
@@ -4282,24 +4288,8 @@
                        "vocab_size", g_bm25s_index.get_vocab_size(),
                        "total_entries", g_bm25s_index.get_total_entries());
             }
-            
-            // ========== FTS_V3: 完成流式存储 ==========
-            if (g_fts_generic_cache.is_streaming_mode()) {
-              // V3: 流式存储模式，完成写入并关闭文件
-              int persist_ret = g_fts_generic_cache.finish_streaming_persist();
-              if (OB_SUCCESS == persist_ret) {
-                LOG_INFO("[FTS_V3] Generic Cache streaming persist completed successfully",
-                         "row_count", g_fts_generic_cache.get_file_header().row_count,
-                         "column_count", g_fts_generic_cache.column_count());
-              } else {
-                LOG_WARN("[FTS_V3] Failed to finish streaming persist (non-fatal)",
-                         K(persist_ret));
-              }
-            }
-            // ================================================
           } else {
             bm25s_log("END_COLLECT: waiting for other parallel tasks");
-            // LOG_INFO("BM25S task ended, waiting for other parallel tasks");
           }
         }
         // ============================================================
@@ -4349,82 +4339,12 @@
            }
          }
        }
-       // ========== FTS 缓存填充：同时写入新旧两套系统 ==========
-       // 此时已经读取了主表的一行数据，可以访问所有列
-       ++fts_row_process_count;  // 记录处理的行数
-         
-       // 从 doc_id_datum 获取 doc_id
-       uint64_t doc_id_val = 0;
-        if (!doc_id_datum->is_null()) {
-          doc_id_val = doc_id_datum->get_uint64();
-        }
-       
-       // ========== 旧系统：填充 Scalar Cache ==========
-       if (fts_cache_initialized && g_fts_scalar_cache.is_inited()) {
-         uint64_t id_val = 0;      // 主表的 id 字段
-         ObString base_id_val;
-         ObString docid_col_val;
-         
-        // 从输出列中查找并获取标量字段
-        const ExprFixedArray &output_exprs = MY_SPEC.output_;
-        
-        // 遍历 MY_SPEC.output_ 找到标量列（跳过 FTS 生成列）
-        int64_t varchar_col_after_id = 0;
-        bool id_found = false;
-        
-        for (int64_t i = 0; i < output_exprs.count() && doc_id_val > 0; ++i) {
-          ObExpr *expr = output_exprs.at(i);
-          if (OB_ISNULL(expr)) continue;
-          
-          // 跳过 FTS 生成列（doc_id, word_segment, word_count, doc_length）
-          if (expr->type_ == T_FUN_SYS_DOC_ID || 
-              expr->type_ == T_FUN_SYS_WORD_SEGMENT ||
-              expr->type_ == T_FUN_SYS_WORD_COUNT ||
-              expr->type_ == T_FUN_SYS_DOC_LENGTH) {
-            continue;
-          }
-          
-          // 尝试获取列值
-          ObDatum *col_datum = nullptr;
-          int eval_ret = expr->eval(eval_ctx_, col_datum);
-          
-          if (OB_SUCCESS == eval_ret && OB_NOT_NULL(col_datum) && !col_datum->is_null()) {
-            ObObjType dtype = expr->datum_meta_.type_;
-            
-            if ((dtype == ObIntType || dtype == ObUInt64Type) && !id_found) {
-               // 整数类型 → id 列
-              id_val = col_datum->get_uint64();
-              id_found = true;
-            } else if (dtype == ObVarcharType && id_found) {
-              // 只有在找到 id 之后的 varchar 列才可能是 base_id 或 docid_col
-              ObString str_val = col_datum->get_string();
-              
-               // 通过内容前缀判断列类型
-              if (str_val.prefix_match("base_id_")) {
-                base_id_val = str_val;
-              } else if (str_val.prefix_match("doc-")) {
-                docid_col_val = str_val;
-               }
-             }
-                }
-         }
-
-         uint64_t cache_doc_id = id_val;  // 使用 id 作为 doc_id
-  
-         // 添加到 HashMap
-         if (cache_doc_id > 0 && id_found) {
-           int cache_ret = g_fts_scalar_cache.add_mapping(cache_doc_id, id_val, base_id_val, docid_col_val);
-          if (OB_SUCCESS == cache_ret) {
-            ++fts_cache_fill_count;
-           } else if (OB_HASH_EXIST != cache_ret) {
-             LOG_WARN("[FTS_OLD_SYSTEM] Failed to add mapping", K(cache_ret), K(cache_doc_id));
-           }
-         }
-       }
-       
        // ========== 新系统：流式写入 Generic Cache ==========
-       // V3: 使用流式存储模式，直接写入磁盘，减少内存占用
-       if (fts_generic_cache_initialized && g_fts_generic_cache.is_streaming_mode()) {
+       // 仅在当前任务参与缓存创建时写入数据
+       static thread_local uint64_t cache_row_seq = 0;  // 递增序号，用于诊断
+       if (generic_cache_task_started) {
+         ++cache_row_seq;
+         
          // 使用 id 列的值作为 doc_id（与旧系统保持一致）
          // 先找到 id 列的值
          uint64_t id_for_cache = 0;
@@ -4451,6 +4371,12 @@
                break;
              }
            }
+         }
+         
+         // 诊断：打印前几行的 id 获取情况
+         if (cache_row_seq <= 5 || id_for_cache == 0) {
+           LOG_INFO("[FTS_CACHE_DEBUG] Row id extraction",
+                    K(cache_row_seq), K(id_for_cache), "output_count", output_exprs.count());
          }
          
          if (id_for_cache > 0) {

@@ -440,6 +440,16 @@ private:
   char *streaming_row_buf_;               // 行数据序列化缓冲区
   static const int64_t STREAMING_ROW_BUF_SIZE = 8192;  // 单行最大 8KB
   
+  // ========== 并行任务计数 ==========
+  int64_t active_collectors_;             // 活跃的收集任务数
+
+public:
+  // ========== 并行任务管理（与 BM25S 同步）==========
+  void begin_collect() { ATOMIC_AAF(&active_collectors_, 1); }
+  bool end_collect() { return ATOMIC_SAF(&active_collectors_, 1) == 0; }
+  bool can_finalize() const { return ATOMIC_LOAD(&active_collectors_) == 0; }
+
+private:
   // ========== V4: HashMap 缓存相关成员 ==========
   typedef common::hash::ObHashMap<uint64_t, ObFtsRowData*, common::hash::NoPthreadDefendMode> RowHashMap;
   RowHashMap row_hashmap_;                // doc_id -> ObFtsRowData* 的映射
