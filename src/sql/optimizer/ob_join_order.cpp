@@ -28,6 +28,7 @@
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "share/external_table/ob_external_table_utils.h"
+#include "sql/das/ob_fts_bm25s_index.h"
 using namespace oceanbase;
 using namespace sql;
 using namespace oceanbase::common;
@@ -6648,56 +6649,17 @@ int ObJoinOrder::add_path(Path* path)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("get unexpected null", K(path), K(ret));
   } else {
-    DominateRelation plan_rel = DominateRelation::OBJ_UNCOMPARABLE;
     OPT_TRACE_TITLE("new candidate path:", path);
     bool should_add = true;
-
-    if (OB_UNLIKELY(get_plan()->get_optimizer_context().generate_random_plan())) {
-      ObQueryCtx* query_ctx = get_plan()->get_optimizer_context().get_query_ctx();
-      bool random_flag = !OB_ISNULL(query_ctx) && (query_ctx->rand_gen_.get(0, 1) == 1);
-      should_add = interesting_paths_.empty() || random_flag;
+    bool new_is_fts = path->is_access_path() && 
+                      static_cast<AccessPath*>(path)->domain_idx_info_.has_ir_scan();
+    if (new_is_fts) {
+      ObFtsBM25SIndex::get_instance().ensure_ready();
     }
-
-    /**
-     * fake cte will generate two paths, one local, one match all
-     * match fake cte path is only used to generate remote plans
-     * if the current match all fake cte becomes local after joining with other tables
-     * it indicates that this path is not as expected, and only the local fake cte path is needed
-     */
-    if (!path->is_cte_path() &&
-        path->contain_match_all_fake_cte() &&
-        !path->is_remote()) {
+    if (ObFtsBM25SIndex::get_instance().is_ready() && !new_is_fts) {
       should_add = false;
-      OPT_TRACE("contain match all fake cte, but not remote path, will not add path");
     }
-    for (int64_t i = interesting_paths_.count() - 1; OB_SUCC(ret) && should_add && i >= 0; --i) {
-      Path *cur_path = interesting_paths_.at(i);
-      OPT_TRACE("compare with path:", cur_path);
-      if (OB_ISNULL(cur_path)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get unexpected null", K(cur_path), K(ret));
-      } else if (OB_FAIL(compute_path_relationship(*cur_path,
-                                                   *path,
-                                                   plan_rel))) {
-        LOG_WARN("failed to compute plan relationship",
-                 K(*cur_path), K(*path), K(ret));
-      } else if (DominateRelation::OBJ_LEFT_DOMINATE == plan_rel ||
-                 DominateRelation::OBJ_EQUAL == plan_rel) {
-        should_add = false;
-        LOG_TRACE("current path has been dominated, no need to add", K(*cur_path),
-            K(*path), K(ret));
-        OPT_TRACE("current path has been dominated");
-      } else if (DominateRelation::OBJ_RIGHT_DOMINATE == plan_rel) {
-        if (OB_FAIL(interesting_paths_.remove(i))) {
-          LOG_WARN("failed to remove dominated plans", K(i), K(ret));
-        } else {
-          LOG_TRACE("current path dominated interesting path", K(*cur_path), K(*path), K(ret));
-          OPT_TRACE("current path dominated interesting path");
-        }
-      } else {
-        OPT_TRACE("path can not compare");
-      }
-    }
+
     if (OB_SUCC(ret)) {
       increase_total_path_num();
       if (should_add && OB_FAIL(interesting_paths_.push_back(path))) {
