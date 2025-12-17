@@ -98,9 +98,7 @@ int ObFtsBM25SIndex::init()
     SpinWLockGuard guard(lock_);
     if (!is_inited_) {
       LOG_INFO("BM25S init: starting initialization", K(NUM_BUCKETS));
-      
-      // 创建 HashMap
-      if (OB_FAIL(unique_docs_.create(DEFAULT_BUCKET_COUNT,
+      if (OB_FAIL(unique_docs_.create(65536,
                                               ObMemAttr(OB_SERVER_TENANT_ID, "BM25SDocSet")))) {
         LOG_WARN("BM25S init: fail to create unique docs set", K(ret));
       } else {

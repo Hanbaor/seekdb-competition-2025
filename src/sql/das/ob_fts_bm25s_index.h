@@ -96,10 +96,9 @@ struct BM25SIndexFileHeader {
   static const uint64_t MAGIC = 0x424D32355349445A;  // "BM25SIDZ"
   static const int32_t CURRENT_VERSION = 2;  // V2 设计
   static const int64_t HEADER_SIZE = 256;
-  static const int32_t DEFAULT_BUCKET_NUM = 1024;  // V2: 统一 1024 个桶
   
   void reset() { memset(this, 0, sizeof(*this)); }
-  bool is_valid() const { return magic == MAGIC && version == CURRENT_VERSION; }  // 只支持 V2
+  bool is_valid() const { return magic == MAGIC && version == CURRENT_VERSION; }  
   
   TO_STRING_KV(K(magic), K(version), K(total_docs), K(avg_doc_len), K(vocab_size), 
                K(total_postings), K(bucket_dir_offset), K(vocab_buckets_offset), 
@@ -185,8 +184,7 @@ public:
   
   typedef common::hash::ObHashSet<int64_t, common::hash::NoPthreadDefendMode> DocIdSet;
 
-  static const int64_t DEFAULT_BUCKET_COUNT = 100000;
-  static const int64_t NUM_BUCKETS = 1024;  // 分桶数量（使用 TmpFile），减少 WBP 内存压力
+  static const int64_t NUM_BUCKETS = 4096;  // 分桶数量（使用 TmpFile），减少 WBP 内存压力
   
   // BM25 参数（与 ObExprBM25 保持一致）
   static constexpr double K1 = 1.2;
