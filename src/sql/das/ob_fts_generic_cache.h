@@ -371,14 +371,26 @@ public:
    */
   int ensure_ready();
 
-  // ========== V4: HashMap 缓存查询接口 ==========
+  // ========== V4: LRU HashMap 缓存查询接口 ==========
   
   /**
-   * 从 HashMap 获取行数据（轻量级缓存，读不加锁）
+   * 从 LRU HashMap 获取行数据（轻量级缓存，读不加锁）
    * @param doc_id 文档 ID
    * @param row_data 输出：行数据指针
    */
   int get_row_from_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data);
+  
+  /**
+   * 统一接口：获取指定列的值（自动选择 LRU HashMap 或 KVCache）
+   * @param doc_id 文档 ID
+   * @param col_type 列类型（ObIntType 或 ObVarcharType）
+   * @param col_type_order 同类型列的顺序（0-based）
+   * @param out_val 输出：列值
+   */
+  int get_column_value(uint64_t doc_id, 
+                       common::ObObjType col_type, 
+                       int64_t col_type_order, 
+                       ObFtsColumnValue &out_val);
 
 private:
   int ensure_capacity(uint64_t required);
@@ -440,17 +452,45 @@ private:
   char *streaming_row_buf_;               // 行数据序列化缓冲区
   static const int64_t STREAMING_ROW_BUF_SIZE = 8192;  // 单行最大 8KB
   
-  // ========== V4: HashMap 缓存相关成员 ==========
-  typedef common::hash::ObHashMap<uint64_t, ObFtsRowData*, common::hash::NoPthreadDefendMode> RowHashMap;
-  RowHashMap row_hashmap_;                // doc_id -> ObFtsRowData* 的映射
-  common::ObArenaAllocator hashmap_allocator_;  // HashMap 数据的内存分配器
-  bool hashmap_inited_;                   // HashMap 是否已初始化
+  // ========== V4: LRU HashMap 缓存相关成员 ==========
+  
+  // LRU 节点结构
+  struct LRUNode {
+    uint64_t doc_id;
+    ObFtsRowData *row_data;
+    LRUNode *prev;
+    LRUNode *next;
+    
+    LRUNode() : doc_id(0), row_data(nullptr), prev(nullptr), next(nullptr) {}
+    LRUNode(uint64_t id, ObFtsRowData *data) 
+        : doc_id(id), row_data(data), prev(nullptr), next(nullptr) {}
+  };
+  
+  typedef common::hash::ObHashMap<uint64_t, LRUNode*, common::hash::NoPthreadDefendMode> LRUHashMap;
+  LRUHashMap lru_map_;                    // doc_id -> LRUNode* 的映射
+  common::ObArenaAllocator lru_allocator_;  // LRU 数据的内存分配器
+  LRUNode lru_head_;                      // LRU 链表头哨兵（最新）
+  LRUNode lru_tail_;                      // LRU 链表尾哨兵（最旧）
+  int64_t lru_size_;                      // 当前缓存条目数
+  int64_t lru_capacity_;                  // LRU 容量上限
+  bool lru_inited_;                       // LRU 是否已初始化
   bool use_hashmap_;                      // 是否启用 HashMap 模式
-  mutable common::ObSpinLock hashmap_lock_;  // HashMap 写锁
+  mutable common::ObSpinLock lru_lock_;   // LRU 写锁
+  
+  static const int64_t DEFAULT_LRU_CAPACITY = 10000;  // 默认容量 1 万条
+  
+  // LRU 内部操作
+  void lru_move_to_head(LRUNode *node);   // 移动节点到头部
+  void lru_remove_node(LRUNode *node);    // 从链表中移除节点
+  void lru_add_to_head(LRUNode *node);    // 添加节点到头部
+  void lru_evict_oldest();                // 淘汰最旧节点
 
 public:
   void set_use_hashmap(bool v) { use_hashmap_ = v; }
   bool is_use_hashmap() const { return use_hashmap_; }
+  void set_lru_capacity(int64_t capacity) { lru_capacity_ = capacity; }
+  int64_t get_lru_capacity() const { return lru_capacity_; }
+  int64_t get_lru_size() const { return lru_size_; }
 };
 
 // 全局单例

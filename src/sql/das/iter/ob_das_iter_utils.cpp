@@ -23,6 +23,7 @@
 #include "sql/das/iter/ob_das_spiv_scan_iter.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_match_iter.h"
+#include "sql/das/ob_fts_bm25s_cache.h"  // BM25S 模式检测
 
 namespace oceanbase
 {
@@ -1218,8 +1219,18 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
     }
     const bool has_sort = nullptr != sort_ctdef;
     const bool need_rewind = true;
-    if (!has_sort) {
-      // skip
+    // BM25S 模式已在 do_bm25s_search 中完成排序，跳过 sort iter 创建以减少初始化开销
+    // 注意：ensure_ready() 只加载 Header + Bucket Directory（很小），
+    // 实际的 posting 数据是查询时按需加载到 KVCache 的，不会全量加载到内存
+    if (!g_bm25s_index.is_ready()) {
+      g_bm25s_index.ensure_ready();  // 尝试加载元数据（失败也没关系）
+    }
+    const bool skip_sort_for_bm25s = g_bm25s_index.is_ready();
+    if (!has_sort || skip_sort_for_bm25s) {
+      // skip - BM25S 模式下数据已排序，无需重复排序
+      if (skip_sort_for_bm25s && has_sort) {
+        LOG_DEBUG("skip sort iter creation for BM25S mode (data already sorted)");
+      }
     } else if (OB_FAIL(create_sort_sub_tree(alloc, sort_ctdef, sort_rtdef, need_rewind, false/*need_distinct*/,text_retrieval_result, sort_result))) {
       LOG_WARN("failed to create sort sub tree", K(ret));
     } else {

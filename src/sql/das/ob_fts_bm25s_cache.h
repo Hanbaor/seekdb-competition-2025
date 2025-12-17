@@ -174,7 +174,7 @@ public:
     return ret;
   }
   
-  // ========== 查询辅助函数 ==========
+  // ========== 查询辅助函数（内联优化）==========
   
   // 获取 posting 数量
   int64_t count() const { return count_; }

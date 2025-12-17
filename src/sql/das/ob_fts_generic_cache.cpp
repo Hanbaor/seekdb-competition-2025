@@ -44,16 +44,24 @@ ObFtsGenericCache::ObFtsGenericCache()
     streaming_row_index_(nullptr),
     streaming_row_index_capacity_(0),
     streaming_row_buf_(nullptr),
-    hashmap_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "FtsHashMap")),
-    hashmap_inited_(false),
+    lru_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "FtsLRUCache")),
+    lru_size_(0),
+    lru_capacity_(DEFAULT_LRU_CAPACITY),
+    lru_inited_(false),
     use_hashmap_(true),  // 默认启用 HashMap 模式
-    hashmap_lock_(common::ObLatchIds::DEFAULT_SPIN_LOCK)
+    lru_lock_(common::ObLatchIds::DEFAULT_SPIN_LOCK)
 {
   for (int64_t i = 0; i < MAX_COLUMNS; ++i) {
     column_data_[i] = nullptr;
   }
   memset(cache_file_path_, 0, sizeof(cache_file_path_));
   file_header_.reset();
+  
+  // 初始化 LRU 哨兵节点
+  lru_head_.next = &lru_tail_;
+  lru_head_.prev = nullptr;
+  lru_tail_.prev = &lru_head_;
+  lru_tail_.next = nullptr;
 }
 
 ObFtsGenericCache::~ObFtsGenericCache()
@@ -1600,34 +1608,93 @@ int ObFtsGenericCache::finish_streaming_persist()
 }
 
 // ========================================================================
-// V4: HashMap 缓存实现
+// V4: LRU ObHashMap 缓存实现
 // ========================================================================
+
+// LRU 内部操作：从链表中移除节点
+void ObFtsGenericCache::lru_remove_node(LRUNode *node)
+{
+  if (OB_ISNULL(node) || OB_ISNULL(node->prev) || OB_ISNULL(node->next)) {
+    return;
+  }
+  node->prev->next = node->next;
+  node->next->prev = node->prev;
+}
+
+// LRU 内部操作：添加节点到头部（最新）
+void ObFtsGenericCache::lru_add_to_head(LRUNode *node)
+{
+  if (OB_ISNULL(node)) {
+    return;
+  }
+  node->next = lru_head_.next;
+  node->prev = &lru_head_;
+  lru_head_.next->prev = node;
+  lru_head_.next = node;
+}
+
+// LRU 内部操作：移动节点到头部（表示最近访问）
+void ObFtsGenericCache::lru_move_to_head(LRUNode *node)
+{
+  lru_remove_node(node);
+  lru_add_to_head(node);
+}
+
+// LRU 内部操作：淘汰最旧节点
+void ObFtsGenericCache::lru_evict_oldest()
+{
+  // 获取尾部节点（最旧）
+  LRUNode *oldest = lru_tail_.prev;
+  if (oldest == &lru_head_) {
+    // 空链表
+    return;
+  }
+  
+  // 从链表中移除
+  lru_remove_node(oldest);
+  
+  // 从 HashMap 中删除
+  lru_map_.erase_refactored(oldest->doc_id);
+  
+  // 更新计数
+  lru_size_--;
+  
+  // 注意：内存由 lru_allocator_ 管理，不单独释放
+  // 当 allocator reset/reuse 时统一释放
+}
 
 int ObFtsGenericCache::init_hashmap()
 {
   int ret = common::OB_SUCCESS;
   
-  if (hashmap_inited_) {
+  if (lru_inited_) {
     return common::OB_SUCCESS;
   }
   
-  common::ObSpinLockGuard guard(hashmap_lock_);
+  common::ObSpinLockGuard guard(lru_lock_);
   
   // Double check
-  if (hashmap_inited_) {
+  if (lru_inited_) {
     return common::OB_SUCCESS;
   }
   
-  // 预分配足够的 bucket 避免 rehash（1.5倍行数）
-  int64_t bucket_count = file_header_.row_count > 0 ? 
-      static_cast<int64_t>(file_header_.row_count * 1.5) : 10000;
-  if (OB_FAIL(row_hashmap_.create(bucket_count, "FtsRowHashMap", "FtsRowHashMap"))) {
-    LOG_WARN("[FTS_GENERIC_CACHE] init_hashmap: 创建 hashmap 失败", K(ret), K(bucket_count));
+  // 预分配 bucket（使用 LRU 容量的 1.5 倍）
+  int64_t bucket_count = static_cast<int64_t>(lru_capacity_ * 1.5);
+  if (OB_FAIL(lru_map_.create(bucket_count, "FtsLRUMap", "FtsLRUMap"))) {
+    LOG_WARN("[FTS_LRU_CACHE] init_hashmap: 创建 LRU map 失败", K(ret), K(bucket_count));
     return ret;
   }
   
-  hashmap_inited_ = true;
-  LOG_INFO("[FTS_GENERIC_CACHE] init_hashmap: hashmap 初始化完成", K(bucket_count));
+  // 重置 LRU 链表
+  lru_head_.next = &lru_tail_;
+  lru_head_.prev = nullptr;
+  lru_tail_.prev = &lru_head_;
+  lru_tail_.next = nullptr;
+  lru_size_ = 0;
+  
+  lru_inited_ = true;
+  LOG_INFO("[FTS_LRU_CACHE] init_hashmap: LRU 缓存初始化完成", 
+           K(bucket_count), K_(lru_capacity));
   
   return ret;
 }
@@ -1637,23 +1704,26 @@ int ObFtsGenericCache::get_row_from_hashmap(uint64_t doc_id, const ObFtsRowData 
   int ret = common::OB_SUCCESS;
   row_data = nullptr;
   
-  // 确保 HashMap 已初始化
-  if (!hashmap_inited_) {
+  // 确保 LRU 已初始化
+  if (!lru_inited_) {
     if (OB_FAIL(init_hashmap())) {
       return ret;
     }
   }
   
-  // 读不加锁（查询是单线程的）
-  ObFtsRowData *found_row = nullptr;
-  ret = row_hashmap_.get_refactored(doc_id, found_row);
+  // 查找 LRU map
+  LRUNode *node = nullptr;
+  ret = lru_map_.get_refactored(doc_id, node);
   
-  if (common::OB_SUCCESS == ret && OB_NOT_NULL(found_row)) {
-    row_data = found_row;
+  if (common::OB_SUCCESS == ret && OB_NOT_NULL(node)) {
+    // 缓存命中，移动到头部（表示最近访问）
+    common::ObSpinLockGuard guard(lru_lock_);
+    lru_move_to_head(node);
+    row_data = node->row_data;
     return common::OB_SUCCESS;
   }
   
-  // HashMap 未命中，从磁盘加载
+  // 缓存未命中，从磁盘加载
   if (common::OB_HASH_NOT_EXIST == ret) {
     ret = load_row_to_hashmap(doc_id, row_data);
   }
@@ -1692,7 +1762,7 @@ int ObFtsGenericCache::load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *
   // 1. 使用临时 buffer 读取磁盘数据（不加锁，IO 耗时）
   char *temp_buf = static_cast<char*>(ob_malloc(index_entry.data_size, "FtsTmpRow"));
   if (OB_ISNULL(temp_buf)) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 分配临时 buffer 失败", K(ret));
+    LOG_WARN("[FTS_LRU_CACHE] load_row_to_hashmap: 分配临时 buffer 失败", K(ret));
     return common::OB_ALLOCATE_MEMORY_FAILED;
   }
   
@@ -1701,35 +1771,46 @@ int ObFtsGenericCache::load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *
   if (OB_FAIL(share::ObIODeviceLocalFileOp::pread_impl(
           persist_fd_.second_id_, temp_buf, index_entry.data_size,
           data_offset, read_size))) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 读取磁盘失败", K(ret), K(doc_id));
+    LOG_WARN("[FTS_LRU_CACHE] load_row_to_hashmap: 读取磁盘失败", K(ret), K(doc_id));
     ob_free(temp_buf);
     return ret;
   }
   
-  // 2. 加锁进行内存分配和反序列化
-  common::ObSpinLockGuard guard(hashmap_lock_);
+  // 2. 加锁进行内存分配和 LRU 操作
+  common::ObSpinLockGuard guard(lru_lock_);
   
   // Double check: 可能其他线程已经加载了
-  ObFtsRowData *existing_row = nullptr;
-  if (common::OB_SUCCESS == row_hashmap_.get_refactored(doc_id, existing_row)) {
-    row_data = existing_row;
+  LRUNode *existing_node = nullptr;
+  if (common::OB_SUCCESS == lru_map_.get_refactored(doc_id, existing_node)) {
+    lru_move_to_head(existing_node);
+    row_data = existing_node->row_data;
     ob_free(temp_buf);
     return common::OB_SUCCESS;
   }
   
-  // 3. 分配 ObFtsRowData
+  // 3. 检查是否需要淘汰
+  while (lru_size_ >= lru_capacity_) {
+    lru_evict_oldest();
+  }
+  
+  // 4. 分配 LRUNode 和 ObFtsRowData
+  LRUNode *new_node = static_cast<LRUNode*>(
+      lru_allocator_.alloc(sizeof(LRUNode)));
   ObFtsRowData *new_row = static_cast<ObFtsRowData*>(
-      hashmap_allocator_.alloc(sizeof(ObFtsRowData)));
-  if (OB_ISNULL(new_row)) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 分配 ObFtsRowData 失败", K(ret));
+      lru_allocator_.alloc(sizeof(ObFtsRowData)));
+  
+  if (OB_ISNULL(new_node) || OB_ISNULL(new_row)) {
+    LOG_WARN("[FTS_LRU_CACHE] load_row_to_hashmap: 分配内存失败", K(ret));
     ob_free(temp_buf);
     return common::OB_ALLOCATE_MEMORY_FAILED;
   }
+  
+  new (new_node) LRUNode(doc_id, nullptr);
   new (new_row) ObFtsRowData();
   
-  // 4. 初始化并反序列化
-  if (OB_FAIL(new_row->init(file_header_.column_count, hashmap_allocator_))) {
-    LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 初始化行失败", K(ret));
+  // 5. 初始化并反序列化
+  if (OB_FAIL(new_row->init(file_header_.column_count, lru_allocator_))) {
+    LOG_WARN("[FTS_LRU_CACHE] load_row_to_hashmap: 初始化行失败", K(ret));
     ob_free(temp_buf);
     return ret;
   }
@@ -1746,7 +1827,6 @@ int ObFtsGenericCache::load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *
     
     switch (col_val.type_) {
       case ObFtsColumnValue::TYPE_NULL:
-        // 无数据
         break;
       case ObFtsColumnValue::TYPE_INT64:
         if (p + sizeof(int64_t) <= end) {
@@ -1772,8 +1852,8 @@ int ObFtsGenericCache::load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *
           memcpy(&len, p, sizeof(int32_t));
           p += sizeof(int32_t);
           if (len > 0 && p + len <= end) {
-            // 深拷贝字符串到 hashmap_allocator_
-            char *str_buf = static_cast<char*>(hashmap_allocator_.alloc(len));
+            // 深拷贝字符串到 lru_allocator_
+            char *str_buf = static_cast<char*>(lru_allocator_.alloc(len));
             if (OB_NOT_NULL(str_buf)) {
               memcpy(str_buf, p, len);
               col_val.str_val_.ptr_ = str_buf;
@@ -1798,23 +1878,83 @@ int ObFtsGenericCache::load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *
     new_row->set_column(col, col_val);
   }
   
-  // 5. 放入 HashMap
-  if (OB_FAIL(row_hashmap_.set_refactored(doc_id, new_row))) {
+  // 6. 建立节点关联
+  new_node->row_data = new_row;
+  
+  // 7. 放入 HashMap
+  if (OB_FAIL(lru_map_.set_refactored(doc_id, new_node))) {
     if (common::OB_HASH_EXIST == ret) {
       // 已存在（并发场景），获取已有的
       ret = common::OB_SUCCESS;
-      if (OB_SUCC(row_hashmap_.get_refactored(doc_id, existing_row))) {
-        row_data = existing_row;
+      if (OB_SUCC(lru_map_.get_refactored(doc_id, existing_node))) {
+        lru_move_to_head(existing_node);
+        row_data = existing_node->row_data;
       }
     } else {
-      LOG_WARN("[FTS_GENERIC_CACHE] load_row_to_hashmap: 插入 hashmap 失败", K(ret), K(doc_id));
+      LOG_WARN("[FTS_LRU_CACHE] load_row_to_hashmap: 插入 LRU map 失败", K(ret), K(doc_id));
     }
   } else {
+    // 8. 添加到 LRU 链表头部
+    lru_add_to_head(new_node);
+    lru_size_++;
     row_data = new_row;
   }
   
-  // 6. 释放临时 buffer
+  // 9. 释放临时 buffer
   ob_free(temp_buf);
+  
+  return ret;
+}
+
+int ObFtsGenericCache::get_column_value(uint64_t doc_id,
+                                        common::ObObjType col_type,
+                                        int64_t col_type_order,
+                                        ObFtsColumnValue &out_val)
+{
+  int ret = common::OB_SUCCESS;
+  out_val = ObFtsColumnValue::make_null();
+  
+  // 获取缓存中的列索引
+  int64_t cache_col_idx = find_column_by_type(col_type, col_type_order);
+  if (cache_col_idx < 0) {
+    return common::OB_ENTRY_NOT_EXIST;
+  }
+  
+  // 优先使用 LRU HashMap 模式
+  if (use_hashmap_ && is_cache_file_opened()) {
+    const ObFtsRowData *row_data = nullptr;
+    ret = get_row_from_hashmap(doc_id, row_data);
+    if (OB_SUCC(ret) && OB_NOT_NULL(row_data)) {
+      out_val = row_data->get_column(cache_col_idx);
+      return common::OB_SUCCESS;
+    }
+  }
+  
+  // 备选：KVCache 模式
+  if (is_cache_file_opened()) {
+    const ObFtsScalarCacheValue *row = nullptr;
+    common::ObKVCacheHandle handle;
+    ret = get_row_from_kvcache(doc_id, row, handle);
+    if (OB_SUCC(ret) && OB_NOT_NULL(row)) {
+      // 从 KVCache 值转换为 ObFtsColumnValue
+      if (col_type == common::ObIntType || ob_is_integer_type(col_type)) {
+        out_val.type_ = ObFtsColumnValue::TYPE_INT64;
+        out_val.int_val_ = row->get_int_column_fast(cache_col_idx);
+      } else if (col_type == common::ObVarcharType || ob_is_string_type(col_type)) {
+        ObString str = row->get_string_column_fast(cache_col_idx);
+        out_val.type_ = ObFtsColumnValue::TYPE_STRING;
+        out_val.str_val_.ptr_ = str.ptr();
+        out_val.str_val_.len_ = str.length();
+      }
+      return common::OB_SUCCESS;
+    }
+  }
+  
+  // 内存模式
+  if (is_inited() && doc_id > 0 && doc_id <= static_cast<uint64_t>(count_)) {
+    out_val = get_column_fast(doc_id, cache_col_idx);
+    return common::OB_SUCCESS;
+  }
   
   return ret;
 }

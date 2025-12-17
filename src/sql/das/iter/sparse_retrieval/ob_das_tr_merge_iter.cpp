@@ -908,10 +908,11 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
     } else {
-      // BM25S 模式检查：先尝试加载索引，再决定是否跳过迭代器初始化
+      // BM25S 模式检查：先尝试加载索引元数据，再决定是否跳过迭代器初始化
+      // 注意：ensure_ready() 只加载 Header + Bucket Directory（很小），
+      // 实际的 posting 数据是查询时按需加载到 KVCache 的，不会全量加载到内存
       if (query_tokens_.count() > 0) {
         if (!g_bm25s_index.is_ready()) {
-          // 重启后索引未加载，尝试从磁盘加载
           int load_ret = g_bm25s_index.ensure_ready();
           if (OB_SUCCESS != load_ret) {
             LOG_WARN("BM25S index load failed in do_table_scan", K(load_ret));
@@ -1166,9 +1167,11 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     // 先尝试加载持久化文件（如果尚未加载）
     if (!g_fts_generic_cache.is_cache_file_opened()) {
       int ensure_ret = g_fts_generic_cache.ensure_ready();
-      if (OB_SUCCESS == ensure_ret) {
-        LOG_INFO("[FTS_FILTER] Cache loaded from disk via ensure_ready (KVCache Mode)");
-      } else if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
+      // 生产环境注释掉以提升 QPS
+      // if (OB_SUCCESS == ensure_ret) {
+      //   LOG_INFO("[FTS_FILTER] Cache loaded from disk via ensure_ready (KVCache Mode)");
+      // } else 
+      if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
         LOG_WARN("[FTS_FILTER] Failed to ensure cache ready", K(ensure_ret));
       }
     }
@@ -1183,20 +1186,21 @@ ObDASTRMergeIter::ObDASTRMergeIter()
                                 g_fts_scalar_cache.is_inited() && 
                                 g_fts_scalar_cache.size() > 0;
     
-    if (use_new_system_kvcache) {
-      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode - Preferred)",
-               "file_row_count", g_fts_generic_cache.get_file_header().row_count,
-               "filter_count", g_fts_generic_filter_ctx.condition_count());
-    } else if (use_new_system_memory) {
-      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode - Fallback)",
-               "cache_size", g_fts_generic_cache.size(),
-               "filter_count", g_fts_generic_filter_ctx.condition_count());
-    } else if (use_old_system) {
-      LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
-               "cache_size", g_fts_scalar_cache.size());
-    } else {
-      LOG_INFO("[FTS_FILTER] No cache available, filtering DISABLED");
-    }
+    // 生产环境注释掉以提升 QPS
+    // if (use_new_system_kvcache) {
+    //   LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode - Preferred)",
+    //            "file_row_count", g_fts_generic_cache.get_file_header().row_count,
+    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
+    // } else if (use_new_system_memory) {
+    //   LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode - Fallback)",
+    //            "cache_size", g_fts_generic_cache.size(),
+    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
+    // } else if (use_old_system) {
+    //   LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
+    //            "cache_size", g_fts_scalar_cache.size());
+    // } else {
+    //   LOG_INFO("[FTS_FILTER] No cache available, filtering DISABLED");
+    // }
     
     // 确保缓存已加载（旧系统兼容）
     if (use_old_system && !g_fts_scalar_cache.is_loaded()) {
@@ -1261,6 +1265,13 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 清空 touched_docs（保留容量）
     touched_docs.reuse();
+    // 预分配 touched_docs 容量（减少 push_back 时的容量检查开销）
+    // 用传入的 capacity 参数预分配（首次会分配，后续 reuse 保留）
+    static thread_local int64_t touched_docs_reserved_size = 0;
+    if (touched_docs_reserved_size < capacity) {
+      touched_docs.reserve(capacity);
+      touched_docs_reserved_size = capacity;
+    }
     
     // 使用全局过滤上下文中的 id_limit
     int64_t id_limit = g_fts_filter_ctx.has_id_filter_ ? g_fts_filter_ctx.id_limit_ : INT64_MAX;
@@ -1307,10 +1318,14 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       int64_t valid_count = posting->get_valid_count(id_limit);
       total_postings += valid_count;
       
-      // 遍历有效的 posting 
+      // 获取数组指针，避免循环中重复函数调用
+      const uint32_t *doc_ids = posting->get_doc_ids();
+      const float *scores = posting->get_scores();
+      
+      // 遍历有效的 posting（直接数组访问，避免函数调用开销）
       for (int64_t i = 0; i < valid_count; i++) {
-        uint32_t doc_id = posting->get_doc_id(i);
-        float score = posting->get_score(i);
+        uint32_t doc_id = doc_ids[i];
+        float score = scores[i];
         
         if (scores_array[doc_id] == 0.0) {
           touched_docs.push_back(doc_id);
@@ -1330,6 +1345,10 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 2. 收集结果
     ObSEArray<ObFtsBM25SIndex::DocScore, 256> results;
+    // 预分配 results 容量（减少 push_back 开销）
+    if (touched_docs.count() > 256) {
+      results.reserve(touched_docs.count());
+    }
     for (int64_t i = 0; i < touched_docs.count(); i++) {
       uint32_t doc_id = touched_docs.at(i);
       double score = scores_array[doc_id];
