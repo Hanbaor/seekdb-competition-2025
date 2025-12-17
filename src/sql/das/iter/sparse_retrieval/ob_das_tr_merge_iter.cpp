@@ -908,20 +908,11 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
     } else {
-      // BM25S 模式检查：先尝试加载索引，再决定是否跳过迭代器初始化
-      if (query_tokens_.count() > 0) {
-        if (!g_bm25s_index.is_ready()) {
-          // 重启后索引未加载，尝试从磁盘加载
-          int load_ret = g_bm25s_index.ensure_ready();
-          if (OB_SUCCESS != load_ret) {
-            LOG_WARN("BM25S index load failed in do_table_scan", K(load_ret));
-          }
-        }
-        if (g_bm25s_index.is_ready()) {
-          bm25s_skip_init_ = true;
-          LOG_DEBUG("BM25S mode: skip iterator init");
-          return ret;
-        }
+      // BM25S 模式检查：缓存已在 create_text_retrieval_tree 入口处加载
+      if (query_tokens_.count() > 0 && g_bm25s_index.is_ready()) {
+        bm25s_skip_init_ = true;
+        LOG_DEBUG("BM25S mode: skip iterator init");
+        return ret;
       }
       
       if (function_lookup_mode_) {
@@ -1160,19 +1151,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
 
     // ========== TAAT 算法在存储层实现（单次执行，直接返回所有结果）==========
     
-    // ========== V3: 优先使用 KVCache 模式 ==========
-    // 由于流式存储不在内存中保留完整缓存，优先使用 KVCache 模式
-    
-    // 先尝试加载持久化文件（如果尚未加载）
-    if (!g_fts_generic_cache.is_cache_file_opened()) {
-      int ensure_ret = g_fts_generic_cache.ensure_ready();
-      if (OB_SUCCESS == ensure_ret) {
-        LOG_INFO("[FTS_FILTER] Cache loaded from disk via ensure_ready (KVCache Mode)");
-      } else if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
-        LOG_WARN("[FTS_FILTER] Failed to ensure cache ready", K(ensure_ret));
-      }
-    }
-    
+    // 缓存已在 do_table_scan 入口处加载，这里直接使用状态
     // V3: 优先使用 KVCache 模式，内存模式作为备选
     const bool use_new_system_kvcache = g_fts_generic_cache.is_cache_file_opened();
     const bool use_new_system_memory = !use_new_system_kvcache && 
@@ -1183,20 +1162,21 @@ ObDASTRMergeIter::ObDASTRMergeIter()
                                 g_fts_scalar_cache.is_inited() && 
                                 g_fts_scalar_cache.size() > 0;
     
-    if (use_new_system_kvcache) {
-      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode - Preferred)",
-               "file_row_count", g_fts_generic_cache.get_file_header().row_count,
-               "filter_count", g_fts_generic_filter_ctx.condition_count());
-    } else if (use_new_system_memory) {
-      LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode - Fallback)",
-               "cache_size", g_fts_generic_cache.size(),
-               "filter_count", g_fts_generic_filter_ctx.condition_count());
-    } else if (use_old_system) {
-      LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
-               "cache_size", g_fts_scalar_cache.size());
-    } else {
-      LOG_INFO("[FTS_FILTER] No cache available, filtering DISABLED");
-    }
+    // 生产环境注释掉以提升 QPS
+    // if (use_new_system_kvcache) {
+    //   LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache KVCache Mode - Preferred)",
+    //            "file_row_count", g_fts_generic_cache.get_file_header().row_count,
+    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
+    // } else if (use_new_system_memory) {
+    //   LOG_INFO("[FTS_FILTER] Using NEW system (Generic Cache Memory Mode - Fallback)",
+    //            "cache_size", g_fts_generic_cache.size(),
+    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
+    // } else if (use_old_system) {
+    //   LOG_INFO("[FTS_FILTER] Using OLD system (Scalar Cache + FilterCtx)",
+    //            "cache_size", g_fts_scalar_cache.size());
+    // } else {
+    //   LOG_INFO("[FTS_FILTER] No cache available, filtering DISABLED");
+    // }
     
     // 确保缓存已加载（旧系统兼容）
     if (use_old_system && !g_fts_scalar_cache.is_loaded()) {

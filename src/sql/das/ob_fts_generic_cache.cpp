@@ -1428,9 +1428,16 @@ int ObFtsGenericCache::streaming_add_row(uint64_t doc_id, const ObFtsColumnValue
     }
     streaming_row_index_ = new_index;
     streaming_row_index_capacity_ = new_capacity;
+    int64_t new_required_space = new_capacity * sizeof(FtsRowIndexEntry);
+    int64_t available_space = streaming_row_data_start_ - file_header_.row_index_offset;
+    if (new_required_space > available_space) {
+      LOG_WARN("[FTS_GENERIC_CACHE] streaming_add_row: expanded capacity exceeds reserved space! "
+               "Row index may overflow into row data area",
+               K(new_capacity), K(new_required_space), K(available_space));
+    }
     
     LOG_INFO("[FTS_GENERIC_CACHE] streaming_add_row: expanded row index capacity", 
-             K(new_capacity));
+             K(new_capacity), K(available_space));
   }
   
   // 序列化行数据
@@ -1532,10 +1539,23 @@ int ObFtsGenericCache::finish_streaming_persist()
 {
   int ret = common::OB_SUCCESS;
   
-  if (!streaming_mode_) {
+  // 核心前置条件检查：必须有有效的文件描述符和数据
+  // streaming_mode_ 可能在并发情况下被重置，所以主要依赖 fd 和 count 判断
+  const bool has_valid_fd = streaming_fd_.is_normal_file();
+  const bool has_data = (count_ > 0);
+  
+  if (!has_valid_fd || !has_data) {
     ret = common::OB_NOT_INIT;
-    LOG_WARN("[FTS_GENERIC_CACHE] finish_streaming_persist: not in streaming mode", K(ret));
+    LOG_WARN("[FTS_GENERIC_CACHE] finish_streaming_persist: precondition not met",
+             K(ret), K(has_valid_fd), K(has_data), K_(streaming_mode), K_(count));
     return ret;
+  }
+  
+  // 确保 streaming_mode_ 正确（可能在并发中被意外重置）
+  if (!streaming_mode_) {
+    LOG_INFO("[FTS_GENERIC_CACHE] finish_streaming_persist: restoring streaming_mode",
+             K_(count), K_(streaming_mode));
+    streaming_mode_ = true;
   }
   
   LOG_INFO("[FTS_GENERIC_CACHE] finish_streaming_persist: starting", 
@@ -1543,11 +1563,21 @@ int ObFtsGenericCache::finish_streaming_persist()
   
   common::ObSpinLockGuard guard(lock_);
   
+  // 检查 Row Index 是否会覆盖 Row Data
+  int64_t required_row_index_size = count_ * sizeof(FtsRowIndexEntry);
+  int64_t available_row_index_space = streaming_row_data_start_ - file_header_.row_index_offset;
+  if (required_row_index_size > available_row_index_space) {
+    LOG_ERROR("[FTS_GENERIC_CACHE] finish_streaming_persist: row index overflow! "
+              "This is a critical bug - row index would overwrite row data",
+              K_(count), K(required_row_index_size), K(available_row_index_space),
+              K_(streaming_row_data_start), K(file_header_.row_index_offset));
+  }
+  
   // 1. 更新文件头
   // 使用初始化时确定的固定起始位置，确保与写入时一致
   file_header_.row_count = count_;
   file_header_.max_doc_id = count_;
-  file_header_.row_index_size = count_ * sizeof(FtsRowIndexEntry);
+  file_header_.row_index_size = required_row_index_size;
   file_header_.row_data_offset = streaming_row_data_start_;  // 使用固定的起始位置
   file_header_.row_data_size = streaming_data_offset_;
   

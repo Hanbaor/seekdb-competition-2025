@@ -4224,7 +4224,7 @@
      if (column_metas.count() > 0) {
        // V3: 使用流式存储模式，直接写入磁盘，减少内存占用
        const char *persist_dir = "/data/obcluster/store/fts_scalar_cache";
-       int init_ret = g_fts_generic_cache.init_streaming_persist(persist_dir, column_metas, 200000);
+       int init_ret = g_fts_generic_cache.init_streaming_persist(persist_dir, column_metas, 500000);
        if (OB_SUCCESS == init_ret) {
          fts_generic_cache_initialized = true;
          LOG_INFO("[FTS_NEW_SYSTEM] Generic Cache streaming mode initialized",
@@ -4284,7 +4284,14 @@
             }
             
             // ========== FTS_V3: 完成流式存储 ==========
-            if (g_fts_generic_cache.is_streaming_mode()) {
+            // 注意：is_streaming_mode() 可能在并行任务中返回 false，所以检查 size() > 0
+            const bool should_finish_persist = g_fts_generic_cache.is_streaming_mode() || 
+                                               g_fts_generic_cache.size() > 0;
+            LOG_INFO("[FTS_V3] Checking streaming mode", 
+                     "is_streaming_mode", g_fts_generic_cache.is_streaming_mode(),
+                     "size", g_fts_generic_cache.size(),
+                     "should_finish", should_finish_persist);
+            if (should_finish_persist) {
               // V3: 流式存储模式，完成写入并关闭文件
               int persist_ret = g_fts_generic_cache.finish_streaming_persist();
               if (OB_SUCCESS == persist_ret) {

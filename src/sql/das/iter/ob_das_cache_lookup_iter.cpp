@@ -374,16 +374,7 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         // ========== V3: 优先使用 KVCache 模式 ==========
         bool will_cache_hit = false;
         
-        // 先尝试加载持久化文件（如果尚未加载）
-        if (!g_fts_generic_cache.is_cache_file_opened()) {
-          int ensure_ret = g_fts_generic_cache.ensure_ready();
-          if (OB_SUCCESS == ensure_ret) {
-            // LOG_INFO("[FTS_LOOKUP] Cache loaded from disk via ensure_ready (KVCache Mode)");
-          } else if (OB_FILE_NOT_EXIST != ensure_ret && OB_ENTRY_NOT_EXIST != ensure_ret) {
-            LOG_WARN("[FTS_LOOKUP] Failed to ensure cache ready", K(ensure_ret));
-          }
-        }
-        
+        // 缓存已在 do_bm25s_search 入口处加载，这里直接使用状态
         // V3: 优先使用 KVCache 模式，内存模式作为备选
         const bool use_new_cache_kvcache = g_fts_generic_cache.is_cache_file_opened();
         const bool use_new_cache_memory = !use_new_cache_kvcache && 
