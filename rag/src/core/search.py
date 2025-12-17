@@ -61,8 +61,8 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-USE_BATCH_SUMMARIZE = _env_bool("USE_BATCH_SUMMARIZE", True)
-USE_SUMMARY_CACHE = _env_bool("USE_SUMMARY_CACHE", True)
+USE_BATCH_SUMMARIZE = _env_bool("USE_BATCH_SUMMARIZE", False)
+USE_SUMMARY_CACHE = _env_bool("USE_SUMMARY_CACHE", False)
 USE_REGEX_FACTS = _env_bool("USE_REGEX_FACTS", True)
 
 SUMMARY_CACHE_DIR = os.getenv("SUMMARY_CACHE_DIR", "./cache/summaries")
@@ -75,10 +75,7 @@ LLM_ANSWER_TEMPERATURE = _env_float("LLM_ANSWER_TEMPERATURE", 0.1)
 class SummaryCache:
     def __init__(self, cache_dir: str):
         self.cache_dir = cache_dir or "./cache/summaries"
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-        except Exception:
-            self.cache_dir = None
+        os.makedirs(self.cache_dir, exist_ok=True)
 
     def _make_key(self, filename: str, page: int, content: str) -> str:
         base = (filename or "").split("/")[-1]
@@ -86,8 +83,6 @@ class SummaryCache:
         return f"{base}__p{int(page or 0)}__{content_hash[:12]}.json"
 
     def get(self, filename: str, page: int, content: str):
-        if not self.cache_dir:
-            return None
         path = os.path.join(self.cache_dir, self._make_key(filename, page, content))
         if not os.path.exists(path):
             return None
@@ -98,8 +93,6 @@ class SummaryCache:
             return None
 
     def set(self, filename: str, page: int, content: str, payload: dict) -> None:
-        if not self.cache_dir:
-            return
         path = os.path.join(self.cache_dir, self._make_key(filename, page, content))
         try:
             data = dict(payload or {})
@@ -407,8 +400,6 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50, q
     q_amounts = list(
         dict.fromkeys(re.findall(r"\d+(?:\.\d+)?(?:亿元|万元|万|亿|元)", q_text))
     )
-    q_has_numbers = bool(q_years or q_pcts or q_amounts)
-    q_is_causal = bool(re.search(r"(原因|为何|为什么|驱动|因素|关键|带来|促使|推动)", q_text))
 
     def _question_match_score(r: dict) -> int:
         text = str(r.get("content_preview", "") or "")
@@ -424,40 +415,16 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50, q
                 s += 6
         return s
 
-    def _causal_phrase_score(r: dict) -> int:
-        text = str(r.get("content_preview", "") or "")
-        if not text:
-            return 0
-        s = 0
-        if "核心因素" in text:
-            s += 8
-        if "关键因素" in text:
-            s += 8
-        if "驱动因素" in text:
-            s += 6
-        if "主要原因" in text:
-            s += 6
-        if "原因在于" in text:
-            s += 6
-        if "关键在于" in text:
-            s += 5
-        if "原因" in text:
-            s += 2
-        return s
-
-    def _sort_key(r: dict) -> tuple:
-        base = (
+    top_results = sorted(
+        top_results,
+        key=lambda r: (
+            _question_match_score(r),
             float(r.get("score", 0.0) or 0.0),
             -int(r.get("best_rank", 10**9) or 10**9),
             int(r.get("chunk_count", 0) or 0),
-        )
-        if q_has_numbers:
-            return (_question_match_score(r),) + base
-        if q_is_causal:
-            return (_causal_phrase_score(r),) + base
-        return (0,) + base
-
-    top_results = sorted(top_results, key=_sort_key, reverse=True)
+        ),
+        reverse=True,
+    )
 #    相似度分数: {score:.3f} 
     summaries: dict[int, str] = {}
     if USE_BATCH_SUMMARIZE and SUMMARY_TOP_N > 0:
@@ -534,7 +501,7 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50, q
         best_rank = int(r.get("best_rank", 0) or 0)
         score = float(r.get("score", 0.0) or 0.0)
         content = r.get("content_preview", "")
-        key_facts = _extract_key_facts(content) if (USE_REGEX_FACTS and q_has_numbers) else ""
+        key_facts = _extract_key_facts(content) if USE_REGEX_FACTS else ""
         summary = summaries.get(idx, "")
         snippet = (content or "").replace("\n", " ").strip()[:200]
         chunk_cnt = int(r.get("chunk_count", 0) or 0)
@@ -545,28 +512,17 @@ def llm_rerank_select(question: str, retrieval_results: list, top_k: int = 50, q
     
     candidates_text = "\n".join(candidates)
     
-    if q_has_numbers:
-        principles = (
-            "1) 片段中包含与问题完全匹配的关键数字/年份/金额/百分比；\n"
-            "2) 片段能直接回答问题；\n"
-            "3) 如果多个片段都满足条件，选择信息最完整且更靠前的候选；"
-        )
-    else:
-        principles = (
-            "1) 片段能直接回答问题（优先选择出现‘核心因素/关键因素/驱动因素/主要原因/原因在于’等明确结论句的候选）；\n"
-            "2) 如果多个候选都相关，优先选择与问题主体/范围最一致且结论最明确的候选；\n"
-            "3) 如果问题未要求数字/年份/比例/金额，不要因为候选包含大量数字而优先选择不够直接的页面；"
-        )
-
     # Build LLM prompt
     prompt = f"""你是一个精确的文档选择专家。下面给出 {len(top_results)} 个候选页面（按 filename+page 聚合；每个候选包含该页的若干片段信息），请严格从中选择一个最能回答问题的候选。
 
 选择原则（优先级）：
-{principles}
+1) 片段中包含与问题完全匹配的关键数字/年份/金额/百分比；
+2) 片段能直接回答问题；
+3) 如果多个片段都满足条件，选择信息最完整且更靠前的候选；
 
 返回要求（严格）：
 - 只返回一个 JSON 对象，不要输出任何其他文字：
-{{"index": <候选序号>, "filename": "basename.pdf", "page": <页码>, "reason": "一句话说明依据（需引用候选中出现的短语或数字）"}}
+{{"index": <候选序号>, "filename": "basename.pdf", "page": <页码>, "reason": "一句话说明依据（需引用候选中出现的数字或短语）"}}
 
 候选列表：
 {candidates_text}
@@ -1098,7 +1054,7 @@ def search(question: str) -> Answer:
                     top3_files = [f[0] for f in sorted_files[:3]]  # Get top 3 file names
                     try:
                         top3_bases = [os.path.basename(str(x or "")) for x in top3_files]
-                        logger.debug("[qid=%s] Hybrid strategy top3_files=%s", qid, top3_bases)
+                        logger.info("[qid=%s] Hybrid strategy top3_files=%s", qid, top3_bases)
                     except Exception:
                         pass
                     
@@ -1119,7 +1075,7 @@ def search(question: str) -> Answer:
                                     answer.page = page_counter.most_common(1)[0][0]
 
                     if answer.filename:
-                        logger.debug(
+                        logger.info(
                             "[qid=%s] Hybrid strategy selected: %s page %s",
                             qid,
                             os.path.basename(str(answer.filename or "")),
