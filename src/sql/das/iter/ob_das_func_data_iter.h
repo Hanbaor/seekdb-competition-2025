@@ -83,9 +83,6 @@ public:
   {
     int ret = OB_SUCCESS;
     const uint64_t doc_id_val = doc_id.get_datum().get_uint64();
-    // if (doc_id_val > 1000) {
-    //   return ret;
-    // }
     int64_t idx = doc_ids_.count();
     ret = doc_ids_.push_back(std::make_pair(doc_id, idx));
     return ret;

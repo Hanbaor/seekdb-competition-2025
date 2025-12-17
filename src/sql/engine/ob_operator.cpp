@@ -20,7 +20,7 @@
 #include "ob_operator_factory.h"
 #include "observer/ob_server.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
-#include "sql/das/ob_das_fts_filter_ctx.h"  // FTS 过滤上下文
+#include "sql/das/ob_fts_generic_filter.h"  // FTS 通用过滤上下文
 
 namespace oceanbase
 {
@@ -1704,7 +1704,7 @@ int ObOperator::filter_rows(const ObExprPtrIArray &exprs,
                             bool &all_filtered,
                             bool &all_active)
 {
-  if (g_fts_filter_ctx.has_base_id_filter_ || g_fts_filter_ctx.has_id_filter_) {
+  if (g_fts_generic_filter_ctx.has_conditions()) {
     all_filtered = false;
     return OB_SUCCESS;
   }

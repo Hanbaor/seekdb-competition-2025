@@ -27,12 +27,8 @@
  #include "share/index_usage/ob_index_usage_info_mgr.h"
  #include "sql/engine/px/ob_granule_iterator_op.h"
  #include "sql/engine/expr/ob_expr_lob_utils.h"
- // FTS Scalar Cache: 在索引构建时填充 HashMap
  #include "sql/das/ob_fts_scalar_cache.h"
- // BM25S 索引：预计算 BM25 得分
  #include "sql/das/ob_fts_bm25s_index.h"
-#include "sql/das/ob_das_fts_filter_ctx.h"
-// 新系统：通用 FTS 缓存和过滤
 #include "sql/das/ob_fts_generic_cache.h"
 #include "sql/das/ob_fts_generic_filter.h"
 #include "common/object/ob_object.h"  // for ObDocId
@@ -1703,107 +1699,22 @@
     bool is_fts_query = (attach_ctdef != nullptr);
     
     if (is_fts_query) {
-      // ========== 旧系统：重置过滤上下文 ==========
-     g_fts_filter_ctx.reset();
-      
-      // ========== 新系统：重置通用过滤上下文 ==========
+      // 重置通用过滤上下文
       g_fts_generic_filter_ctx.reset();
       
-      // Filter Extraction
-     const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
-     for (int64_t i = 0; i < filters.count(); ++i) {
-       ObExpr *expr = filters.at(i);
-       if (OB_ISNULL(expr)) continue;
-       
-       // id < N (LE/LT)
-       if (expr->type_ == T_OP_LE || expr->type_ == T_OP_LT) {
-         // 安全检查：参数个数为2，且参数1是常量
-          if (expr->arg_cnt_ == 2 && OB_NOT_NULL(expr->args_[1]) && expr->args_[1]->is_const_expr()) {
-            // 类型检查：左值必须是整数（排除非 id 列），右值必须是整数
-            if (ob_is_integer_type(expr->args_[0]->datum_meta_.type_) && 
-                ob_is_integer_type(expr->args_[1]->datum_meta_.type_)) {
-               ObDatum &datum = expr->args_[1]->locate_expr_datum(eval_ctx_);
-               int64_t val = datum.get_int();
-              // 旧系统：设置 id 过滤
-               g_fts_filter_ctx.id_limit_ = val;
-               g_fts_filter_ctx.has_id_filter_ = true;
-                LOG_INFO("FTS optimizer: id limit extracted", K(val));
-            }
-         }
-       }
-       // base_id IN (...)
-       else if (expr->type_ == T_OP_IN) {
-         // 安全检查：参数大于1，且左值必须是字符串（排除非 base_id 列）
-          if (expr->arg_cnt_ > 1 && OB_NOT_NULL(expr->args_[0]) && ob_is_string_type(expr->args_[0]->datum_meta_.type_)) {
-           for (int64_t k = 1; k < expr->arg_cnt_; ++k) {
-              if (OB_ISNULL(expr->args_[k])) continue;
-             if (expr->args_[k]->type_ == T_OP_ROW) {
-               // Handle Row wrapper if present
-               ObExpr *row = expr->args_[k];
-               for (int64_t m = 0; m < row->arg_cnt_; ++m) {
-                  if (OB_NOT_NULL(row->args_[m]) && row->args_[m]->is_const_expr() && ob_is_string_type(row->args_[m]->datum_meta_.type_)) {
-                    // 字符串常量需要先 eval 计算值
-                    ObDatum *datum = nullptr;
-                    if (OB_SUCCESS == row->args_[m]->eval(eval_ctx_, datum) && OB_NOT_NULL(datum)) {
-                      LOG_INFO("FTS optimizer: add_base_id", K(datum->get_string()));
-                      g_fts_filter_ctx.add_base_id(datum->get_string());
-                    }
-                 }
-               }
-             } else if (expr->args_[k]->is_const_expr() && ob_is_string_type(expr->args_[k]->datum_meta_.type_)) {
-                // 字符串常量需要先 eval 计算值
-                ObDatum *datum = nullptr;
-                if (OB_SUCCESS == expr->args_[k]->eval(eval_ctx_, datum) && OB_NOT_NULL(datum)) {
-                  g_fts_filter_ctx.add_base_id(datum->get_string());
-                }
-             }
-           }
-           if (g_fts_filter_ctx.has_base_id_filter_) {
-              LOG_INFO("FTS optimizer: base_id filter extracted", "base_id_count", g_fts_filter_ctx.base_id_count());
-           }
-         }
-        }
-      }
+      // // 尝试加载缓存（如果尚未加载）
+      // if (!g_fts_generic_cache.is_cache_file_opened()) {
+      //   g_fts_generic_cache.ensure_ready();
+      // }
       
-      // ========== V3: 优先使用 KVCache 模式提取过滤条件 ==========
-      // 先尝试加载持久化文件（如果尚未加载）
-      if (!g_fts_generic_cache.is_cache_file_opened()) {
-        int ensure_ret = g_fts_generic_cache.ensure_ready();
-        if (OB_SUCCESS == ensure_ret) {
-          LOG_INFO("[FTS_NEW_SYSTEM] Cache loaded from disk for filter extraction (KVCache Mode)");
-        }
-      }
-      
-      // 检查缓存状态（优先 KVCache 模式）
-      const bool cache_kvcache_available = g_fts_generic_cache.is_cache_file_opened();
-      const bool cache_memory_available = !cache_kvcache_available && 
-                                          g_fts_generic_cache.is_inited();
-      const bool cache_available = cache_kvcache_available || cache_memory_available;
-      
+      // 从 SQL 过滤表达式提取条件
+      const bool cache_available = g_fts_generic_cache.is_cache_file_opened() || 
+                                   g_fts_generic_cache.is_inited();
       if (cache_available) {
-        int extract_ret = g_fts_generic_filter_ctx.extract_from_filters(
+        const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
+        g_fts_generic_filter_ctx.extract_from_filters(
             filters, MY_SPEC.output_, g_fts_generic_cache, eval_ctx_);
-        if (OB_SUCCESS == extract_ret) {
-          LOG_INFO("[FTS_NEW_SYSTEM] filter extraction SUCCESS",
-                   "condition_count", g_fts_generic_filter_ctx.condition_count(),
-                   "is_kvcache_mode", cache_kvcache_available,
-                   "is_memory_mode", cache_memory_available);
-        } else {
-          LOG_INFO("[FTS_NEW_SYSTEM] filter extraction FAILED, fallback to old system",
-                   K(extract_ret));
-        }
-      } else {
-        LOG_INFO("[FTS_NEW_SYSTEM] cache not available, filter extraction SKIPPED (will use old system)");
       }
-      
-      // 仅在提取到过滤条件时打印
-      if (g_fts_filter_ctx.has_id_filter_ || g_fts_filter_ctx.has_base_id_filter_) {
-        LOG_INFO("FTS filter context set (OLD SYSTEM)",
-                 "has_id_filter", g_fts_filter_ctx.has_id_filter_,
-                 "id_limit", g_fts_filter_ctx.id_limit_,
-                 "has_base_id_filter", g_fts_filter_ctx.has_base_id_filter_,
-                 "base_id_count", g_fts_filter_ctx.base_id_count());
-       }
      }
 
      if (MY_CTDEF.get_query_range_provider().is_fast_nlj_range()) {

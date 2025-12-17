@@ -325,6 +325,29 @@ public:
    */
   bool has_in_condition(int64_t column_idx) const;
 
+  int64_t get_min_upper_bound() const
+  {
+    int64_t min_bound = INT64_MAX;
+    for (int64_t i = 0; i < condition_count_; ++i) {
+      const ObFtsFilterCondition &cond = conditions_[i];
+      if (cond.op_type_ == FTS_OP_LT || cond.op_type_ == FTS_OP_LE) {
+        if (cond.values_.count() > 0) {
+          const ObFtsColumnValue &val = cond.values_.at(0);
+          int64_t bound = INT64_MAX;
+          if (val.type_ == ObFtsColumnValue::TYPE_INT64) {
+            bound = val.get_int();
+          } else if (val.type_ == ObFtsColumnValue::TYPE_UINT64) {
+            bound = static_cast<int64_t>(val.get_uint());
+          }
+          if (bound < min_bound) {
+            min_bound = bound;
+          }
+        }
+      }
+    }
+    return min_bound;
+  }
+
   // ========== LIMIT 条件 ==========
   void set_limit(int64_t limit) { limit_count_ = limit; has_limit_ = true; }
   bool has_limit() const { return has_limit_; }

@@ -20,10 +20,8 @@
  #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/engine/expr/ob_expr.h"
-#include "sql/das/ob_das_fts_filter_ctx.h"
 #include "sql/das/ob_fts_scalar_cache.h"
 #include "sql/das/ob_fts_bm25s_cache.h"
-// 新系统：通用 FTS 缓存和过滤
 #include "sql/das/ob_fts_generic_cache.h"
 #include "sql/das/ob_fts_generic_filter.h"
 #include <unistd.h>  // for usleep
@@ -33,9 +31,6 @@ namespace oceanbase
 {
 namespace sql
 {
-
-// 定义全局过滤上下文（POD 结构体，TLS 初始化极快）
-thread_local ObFtsFilterCtx g_fts_filter_ctx;
 
 ObDASTRMergeIter::ObDASTRMergeIter()
   : ObDASIter(ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE),
@@ -1163,10 +1158,11 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 确保 scores_array 容量足够
     int64_t required_capacity;
+    int64_t id_upper_bound = g_fts_generic_filter_ctx.get_min_upper_bound();
     
-    if (g_fts_filter_ctx.has_id_filter_ && g_fts_filter_ctx.id_limit_ < INT64_MAX) {
+    if (id_upper_bound < INT64_MAX) {
       // 有 id 过滤，用 id_limit 作为容量（更省内存）
-      required_capacity = g_fts_filter_ctx.id_limit_;
+      required_capacity = id_upper_bound;
     } else if (use_new_system) {
       // KVCache 模式：用文件头中的行数
       required_capacity = g_fts_generic_cache.get_file_header().row_count + 1;
@@ -1192,7 +1188,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     touched_docs.reuse();
     
     // 使用全局过滤上下文中的 id_limit
-    int64_t id_limit = g_fts_filter_ctx.has_id_filter_ ? g_fts_filter_ctx.id_limit_ : INT64_MAX;
+    int64_t id_limit = id_upper_bound;
     
     // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
     int64_t tokens_found = 0, tokens_not_found = 0;
