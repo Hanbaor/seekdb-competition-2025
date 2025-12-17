@@ -23,6 +23,8 @@
 #include "sql/das/iter/ob_das_spiv_scan_iter.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_match_iter.h"
+#include "sql/das/ob_fts_bm25s_index.h"
+#include "sql/das/ob_fts_generic_cache.h"
 
 namespace oceanbase
 {
@@ -1218,8 +1220,12 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
     }
     const bool has_sort = nullptr != sort_ctdef;
     const bool need_rewind = true;
-    if (!has_sort) {
-      // skip
+    // BM25S 优化：当 BM25S 索引已就绪时跳过排序，因为结果已按分数排序
+    const bool skip_sort_for_bm25s = g_bm25s_index.is_ready();
+    if (!has_sort || skip_sort_for_bm25s) {
+      if (skip_sort_for_bm25s && has_sort) {
+        LOG_INFO("[BM25S] Skip sort iterator creation - results already sorted by BM25S");
+      }
     } else if (OB_FAIL(create_sort_sub_tree(alloc, sort_ctdef, sort_rtdef, need_rewind, false/*need_distinct*/,text_retrieval_result, sort_result))) {
       LOG_WARN("failed to create sort sub tree", K(ret));
     } else {
