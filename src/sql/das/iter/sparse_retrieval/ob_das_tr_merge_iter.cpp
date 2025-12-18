@@ -1224,7 +1224,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       // handle 析构时自动释放 KVCache 引用
     }
     
-    const bool has_filter = use_new_system && g_fts_generic_filter_ctx.has_conditions();
     ObSEArray<ObFtsBM25SIndex::DocScore, 1024> results;
     for (int64_t i = 0; i < touched_docs.count(); i++) {
       uint32_t doc_id = touched_docs.at(i);
@@ -1291,21 +1290,28 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       } else {
         int64_t output_count = 0;
         const int64_t need_count = std::min(effective_topk, capacity);
+        const bool has_filter = use_new_system && g_fts_generic_filter_ctx.has_conditions();
+        
+        // 检查 top-k
         for (int64_t i = 0; i < k && output_count < need_count; ++i) {
           const auto &res = results.at(i);
+          uint32_t doc_id = res.doc_id;
           bool pass = true;
+          
           if (has_filter) {
-            pass = g_fts_generic_filter_ctx.check_row_fast(res.doc_id, g_fts_generic_cache);
+            pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
           }
+          
           if (pass) {
-            doc_id_datums[output_count].set_int(res.doc_id);
+            doc_id_datums[output_count].set_int(doc_id);
             score_datums[output_count].set_double(res.score);
             output_count++;
           }
         }
-      
-        // Fallback: 如果 topk 过滤后不足 need_count，对剩余部分排序并继续过滤
+        
+        // Fallback：如果 top-k 过滤后不足 need_count，继续检查剩余结果
         if (output_count < need_count && k < results.count()) {
+          // 对剩余部分排序
           std::sort(&results.at(k), 
                     &results.at(0) + results.count(),
                     [](const ObFtsBM25SIndex::DocScore &a, const ObFtsBM25SIndex::DocScore &b) {
@@ -1341,7 +1347,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
   int ObDASTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   {
     int ret = OB_SUCCESS;
-    // BM25S 模式：使用 TAAT 算法
     if (g_bm25s_index.is_ready() && query_tokens_.count() > 0) {
       return do_bm25s_search(count, capacity);
     }

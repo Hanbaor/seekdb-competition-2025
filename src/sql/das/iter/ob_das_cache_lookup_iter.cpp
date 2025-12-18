@@ -148,21 +148,18 @@ int ObDASCacheLookupIter::inner_init(ObDASIterParam &param)
 
   lookup_param.default_batch_row_count_  = use_simulate_batch_row_cnt ? simulate_batch_row_cnt : default_batch_row_count;
   LOG_DEBUG("simulate lookup row batch count", K(simulate_batch_row_cnt), K(default_batch_row_count));
-
+  const bool bm25s_fast_path = g_bm25s_index.is_ready();
   if (OB_FAIL(ObDASLocalLookupIter::inner_init(param))) {
     LOG_WARN("failed to init das lookup iter", K(ret));
-  } else if (lookup_param.index_scan_proj_exprs_.count() > 0 &&
+  } else if (!bm25s_fast_path && lookup_param.index_scan_proj_exprs_.count() > 0 &&
              OB_FAIL(index_proj_rows_.init(store_allocator_,
                                            lookup_param.index_scan_proj_exprs_, 
                                            lookup_param.eval_ctx_,
                                            lookup_param.default_batch_row_count_))) {
     LOG_WARN("failed to init index proj rows", K(ret));
-  } else {
-    cached_doc_ids_.set_allocator(&store_allocator_);
+  } else if (!bm25s_fast_path) {
     cached_results_.set_allocator(&store_allocator_);
-    if (OB_FAIL(cached_doc_ids_.init(lookup_param.default_batch_row_count_))) {
-      LOG_WARN("failed to init cached doc ids", K(ret));
-    } else if (OB_FAIL(cached_results_.init(lookup_param.default_batch_row_count_))) {
+    if (OB_FAIL(cached_results_.init(lookup_param.default_batch_row_count_))) {
       LOG_WARN("failed to init cached results", K(ret));
     }
   }
@@ -189,7 +186,7 @@ int ObDASCacheLookupIter::inner_release()
     LOG_WARN("failed to release das lookup iter", K(ret));
   } else {
     index_proj_rows_.reset();
-    cached_doc_ids_.destroy();
+    cached_doc_ids_.reset();  // ObSEArray 使用 reset
     cached_results_.destroy();
     store_allocator_.reset();
   }
@@ -200,13 +197,8 @@ void ObDASCacheLookupIter::reset_lookup_state()
 {
   ObDASLookupIter::reset_lookup_state();
   index_proj_rows_.reuse();
-  // 清空数据但保持已分配容量
   cached_doc_ids_.reuse();
   cached_results_.reuse();
-  // 预分配空间，避免循环中动态增长
-  if (cached_doc_ids_.count() == 0 && default_batch_row_count_ > 0) {
-    cached_doc_ids_.set_capacity(default_batch_row_count_);
-  }
 }
 
 int ObDASCacheLookupIter::add_rowkeys_and_collect(int64_t count)
@@ -477,10 +469,6 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
                 break;
               }
               
-              // 填充数据到 datum 数组
-              // 注意：必须使用 find_column_by_type 获取正确的列索引，
-              // 而不是简单地使用 int_col_order/str_col_order！
-              // KVCache 中的数据是按照原始列顺序存储的（0, 1, 2, 3...）
               int64_t int_col_order = 0;
               int64_t str_col_order = 0;
               
@@ -577,7 +565,7 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         }
         
         // 清理 doc_ids 缓存，准备下一批次
-        cached_doc_ids_.clear();
+        cached_doc_ids_.reuse();
         
         // === 状态转换 ===
         if (OB_SUCC(ret) && all_cache_hit && get_next_rows) {

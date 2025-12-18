@@ -40,7 +40,7 @@ public:
     return true;
   }
 
-  common::ObArray<ObExpr*> index_scan_proj_exprs_;
+  common::ObSEArray<ObExpr*, 4> index_scan_proj_exprs_; 
 };
 
 class ObDASScanCtDef;
@@ -93,7 +93,7 @@ public:
     : ObDASLocalLookupIter(type),
       store_allocator_("SqlCacheLookup", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID),
       index_proj_rows_(),
-      cached_doc_ids_(store_allocator_),
+      cached_doc_ids_(),  // ObSEArray 无需 allocator
       cached_results_(store_allocator_),
       bm25s_fast_path_done_(false),
       cache_verified_(false)
@@ -116,7 +116,7 @@ private:
   // for store rows
   common::ObArenaAllocator store_allocator_;
   IndexProjRowStore index_proj_rows_;
-  common::ObFixedArray<uint64_t, common::ObIAllocator> cached_doc_ids_;
+  common::ObSEArray<uint64_t, 1000> cached_doc_ids_;  // 使用 SEArray，对象在堆上，8KB 内存在对象内部
   common::ObFixedArray<ScalarFields, common::ObIAllocator> cached_results_;
   bool bm25s_fast_path_done_;  // BM25S 快速路径已完成标志
   bool cache_verified_;        // INDEX_SCAN 阶段已验证缓存命中

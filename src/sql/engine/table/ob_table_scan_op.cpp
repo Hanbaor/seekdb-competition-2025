@@ -1384,8 +1384,7 @@
    ObIAllocator &range_allocator = (table_rescan_allocator_ != nullptr ?
        *table_rescan_allocator_ : ctx_.get_allocator());
    bool is_same_type = true; // use for extract equal pre_query_range
-   const bool is_fts_query = (MY_CTDEF.attach_spec_.attach_ctdef_ != nullptr);
-   if (is_fts_query && g_bm25s_index.is_ready()) {
+   if (MY_CTDEF.attach_spec_.attach_ctdef_ != nullptr && g_bm25s_index.is_ready()) {
      ObNewRange whole_range;
      whole_range.set_whole_range();
      whole_range.table_id_ = MY_CTDEF.scan_ctdef_.ref_table_id_;
