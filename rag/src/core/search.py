@@ -62,7 +62,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 USE_BATCH_SUMMARIZE = _env_bool("USE_BATCH_SUMMARIZE", True)
-USE_SUMMARY_CACHE = _env_bool("USE_SUMMARY_CACHE", False)
+USE_SUMMARY_CACHE = _env_bool("USE_SUMMARY_CACHE", True)
 USE_REGEX_FACTS = _env_bool("USE_REGEX_FACTS", True)
 
 SUMMARY_CACHE_DIR = os.getenv("SUMMARY_CACHE_DIR", "./cache/summaries")
