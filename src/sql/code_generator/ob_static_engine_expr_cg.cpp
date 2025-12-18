@@ -175,12 +175,6 @@ int ObStaticEngineExprCG::detect_batch_size(const ObRawExprUniqueSet &exprs,
     // workload
     batch_size = min(OLTP_WORKLOAD_CARDINALITY, batch_size);
   }
-  
-  // 确保 batch_size 至少为 1024，以支持全文检索缓存命中路径
-  const int64_t FTS_MIN_BATCH_SIZE = 999;
-  // if (batch_size < FTS_MIN_BATCH_SIZE) {
-    batch_size = FTS_MIN_BATCH_SIZE;
-  // }
   return ret;
 }
 
