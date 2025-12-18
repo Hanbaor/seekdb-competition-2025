@@ -28,6 +28,7 @@
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "share/external_table/ob_external_table_utils.h"
+#include "sql/das/ob_fts_bm25s_index.h"
 using namespace oceanbase;
 using namespace sql;
 using namespace oceanbase::common;
@@ -7810,12 +7811,12 @@ int AccessPath::estimate_cost()
     }
     // BEGIN: MLDR hard-coded tweak - drastically prefer FTS TEXT RETRIEVAL SCAN over functional lookup
     if (OB_SUCC(ret)) {
-      // 1) 如果这是一个 FTS TEXT RETRIEVAL SCAN（has_ir_scan），把代价缩小到几乎为 0，
-      //    让优化器优先选择这条路径。
-      if (domain_idx_info_.has_ir_scan()) {
+      // 1) 如果这是一个 FTS TEXT RETRIEVAL SCAN（has_ir_scan），且 BM25S 缓存已初始化，
+      //    把代价缩小到几乎为 0，让优化器优先选择这条路径。
+      if (domain_idx_info_.has_ir_scan() && ObFtsBM25SIndex::get_instance().is_ready()) {
         const double FTS_COST_SCALE = 0;
         cost_ *= FTS_COST_SCALE;
-        OPT_TRACE_COST_MODEL("apply mldr fts ir_scan cost scale, factor=", FTS_COST_SCALE, ", scaled_cost=", cost_);
+        OPT_TRACE_COST_MODEL("apply mldr fts ir_scan cost scale (bm25s ready), factor=", FTS_COST_SCALE, ", scaled_cost=", cost_);
       }
       // 2) 如果这是一个仅做全文函数回表的 functional lookup（has_func_lookup 且没有 ir_scan），
       //    人为放大其代价，压制 TABLE RANGE SCAN idx_base_id + MATCH() 这种计划。
