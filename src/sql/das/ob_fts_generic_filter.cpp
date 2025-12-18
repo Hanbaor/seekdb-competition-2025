@@ -77,8 +77,15 @@ int ObFtsGenericFilterCtx::add_condition(int64_t column_idx,
   cond.op_type_ = op_type;
   cond.values_.reset();
 
+  // 预分配空间，减少动态增长
+  const int64_t val_count = values.count();
+  if (val_count > 0 && OB_FAIL(cond.values_.reserve(val_count))) {
+    LOG_WARN("[FTS_GENERIC_FILTER] failed to reserve values", K(ret), K(val_count));
+    return ret;
+  }
+
   // 深拷贝值
-  for (int64_t i = 0; OB_SUCC(ret) && i < values.count(); ++i) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < val_count; ++i) {
     ObFtsColumnValue copied_val;
     if (OB_FAIL(values.at(i).deep_copy(allocator_, copied_val))) {
       LOG_WARN("[FTS_GENERIC_FILTER] failed to deep copy value", K(ret), K(i));
@@ -340,6 +347,7 @@ int ObFtsGenericFilterCtx::try_extract_condition(
 
       // 提取 IN 列表中的所有值
       common::ObArray<ObFtsColumnValue> values;
+      values.reserve(expr->arg_cnt_ - 1);  // 预分配空间
       for (int64_t k = 1; k < expr->arg_cnt_; ++k) {
         ObExpr *val_expr = expr->args_[k];
         if (OB_ISNULL(val_expr)) continue;
@@ -382,6 +390,7 @@ int ObFtsGenericFilterCtx::try_extract_condition(
       }
 
       common::ObArray<ObFtsColumnValue> values;
+      values.reserve(expr->arg_cnt_ - 1);  // 预分配空间
       for (int64_t k = 1; k < expr->arg_cnt_; ++k) {
         ObExpr *val_expr = expr->args_[k];
         if (OB_ISNULL(val_expr)) continue;
@@ -583,7 +592,8 @@ int ObFtsGenericFilterCtx::extract_const_value(
   }
 
   ObFtsColumnValue val;
-  if (OB_FAIL(ObFtsColumnValue::from_datum(*datum, expr->datum_meta_.type_, allocator_, val))) {
+  // 使用浅拷贝，避免双重内存分配（深拷贝在 add_condition 中完成）
+  if (OB_FAIL(ObFtsColumnValue::from_datum_shallow(*datum, expr->datum_meta_.type_, val))) {
     LOG_DEBUG("[FTS_GENERIC_FILTER] failed to convert datum", K(ret));
     return ret;
   }

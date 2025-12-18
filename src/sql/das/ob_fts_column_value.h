@@ -329,6 +329,73 @@ struct ObFtsColumnValue
     return ret;
   }
 
+  // ========== 从 ObDatum 浅拷贝转换（字符串不分配内存）==========
+  static int from_datum_shallow(const ObDatum &datum,
+                                common::ObObjType obj_type,
+                                ObFtsColumnValue &out)
+  {
+    int ret = common::OB_SUCCESS;
+    if (datum.is_null()) {
+      out = make_null();
+      return ret;
+    }
+    switch (obj_type) {
+      case common::ObTinyIntType:
+      case common::ObSmallIntType:
+      case common::ObMediumIntType:
+      case common::ObInt32Type:
+      case common::ObIntType:
+        out = make_int(datum.get_int());
+        break;
+      case common::ObUTinyIntType:
+      case common::ObUSmallIntType:
+      case common::ObUMediumIntType:
+      case common::ObUInt32Type:
+      case common::ObUInt64Type:
+        out = make_uint(datum.get_uint64());
+        break;
+      case common::ObFloatType:
+      case common::ObUFloatType:
+        out = make_double(static_cast<double>(datum.get_float()));
+        break;
+      case common::ObDoubleType:
+      case common::ObUDoubleType:
+        out = make_double(datum.get_double());
+        break;
+      case common::ObVarcharType:
+      case common::ObCharType:
+      case common::ObTinyTextType:
+      case common::ObTextType:
+      case common::ObMediumTextType:
+      case common::ObLongTextType: {
+        common::ObString str = datum.get_string();
+        out = make_string_shallow(str.ptr(), str.length());  // 浅拷贝
+        break;
+      }
+      case common::ObDateTimeType:
+      case common::ObTimestampType:
+        out = make_datetime(datum.get_datetime());
+        break;
+      case common::ObDateType:
+        out = make_int(datum.get_date());
+        break;
+      case common::ObTimeType:
+        out = make_int(datum.get_time());
+        break;
+      default:
+        if (ob_is_integer_type(obj_type)) {
+          out = make_int(datum.get_int());
+        } else if (ob_is_string_type(obj_type)) {
+          common::ObString str = datum.get_string();
+          out = make_string_shallow(str.ptr(), str.length());
+        } else {
+          out = make_null();
+        }
+        break;
+    }
+    return ret;
+  }
+
   // ========== 深拷贝 ==========
   int deep_copy(common::ObIAllocator &alloc, ObFtsColumnValue &out) const
   {

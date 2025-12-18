@@ -1384,7 +1384,8 @@
    ObIAllocator &range_allocator = (table_rescan_allocator_ != nullptr ?
        *table_rescan_allocator_ : ctx_.get_allocator());
    bool is_same_type = true; // use for extract equal pre_query_range
-   if (g_bm25s_index.is_ready()) {
+   const bool is_fts_query = (MY_CTDEF.attach_spec_.attach_ctdef_ != nullptr);
+   if (is_fts_query && g_bm25s_index.is_ready()) {
      ObNewRange whole_range;
      whole_range.set_whole_range();
      whole_range.table_id_ = MY_CTDEF.scan_ctdef_.ref_table_id_;
@@ -1711,15 +1712,7 @@
     bool is_fts_query = (attach_ctdef != nullptr);
     
     if (is_fts_query) {
-      // 重置通用过滤上下文
       g_fts_generic_filter_ctx.reset();
-      
-      // // 尝试加载缓存（如果尚未加载）
-      // if (!g_fts_generic_cache.is_cache_file_opened()) {
-      //   g_fts_generic_cache.ensure_ready();
-      // }
-      
-      // 从 SQL 过滤表达式提取条件
       const bool cache_available = g_fts_generic_cache.is_cache_file_opened() || 
                                    g_fts_generic_cache.is_inited();
       if (cache_available) {
