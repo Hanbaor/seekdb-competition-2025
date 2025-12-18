@@ -28,10 +28,11 @@ llm = OpenAI(
 
 def generate_response(
     messages: List[Dict[str, str]],
-    model="qwen-plus",
+    model="qwen-max",  # Using qwen-max for best performance
     retry_interval: float = 2.0,  # delay between retry attempts
     timeout: float = 300.0,
     temperature: float = 0.0,
+    max_tokens: int | None = None,
 ) -> str:
     """
     Send chat messages to LLM and retrieve completion.
@@ -76,7 +77,31 @@ def generate_response(
                 logger.error(f"LLM API error (non-retryable): {e}")
                 raise
         except Exception as e:
-            # 其他未知错误：直接抛出
+            msg = str(e) if e is not None else ""
+            name = type(e).__name__
+            msg_l = msg.lower()
+            name_l = name.lower()
+            retryable = False
+            if (
+                "incomplete envelope" in msg_l
+                or "unexpected eof" in msg_l
+                or "protocol error" in msg_l
+                or "remoteprotocolerror" in msg_l
+                or name_l in {"remoteprotocolerror", "protocolerror", "readerror", "writeerror"}
+            ):
+                retryable = True
+
+            if retryable:
+                logger.warning(
+                    "LLM transport/protocol error (attempt %d): %s: %s. Retrying in %ss...",
+                    attempt,
+                    name,
+                    msg[:200],
+                    retry_interval,
+                )
+                time.sleep(retry_interval)
+                continue
+
             logger.error(f"LLM unexpected error: {type(e).__name__}: {e}")
             raise
 
