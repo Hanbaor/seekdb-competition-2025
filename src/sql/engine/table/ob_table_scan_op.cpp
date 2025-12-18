@@ -1384,6 +1384,18 @@
    ObIAllocator &range_allocator = (table_rescan_allocator_ != nullptr ?
        *table_rescan_allocator_ : ctx_.get_allocator());
    bool is_same_type = true; // use for extract equal pre_query_range
+   if (g_bm25s_index.is_ready()) {
+     ObNewRange whole_range;
+     whole_range.set_whole_range();
+     whole_range.table_id_ = MY_CTDEF.scan_ctdef_.ref_table_id_;
+     whole_range.group_idx_ = group_idx;
+     if (OB_FAIL(MY_INPUT.key_ranges_.push_back(whole_range))
+         || OB_FAIL(MY_INPUT.ss_key_ranges_.push_back(whole_range))) {
+       LOG_WARN("store key range in TSC input failed", K(ret));
+     }
+     return ret;
+   }
+
    if (OB_UNLIKELY(!need_extract_range())) {
      // virtual table, do nothing
    } else if (MY_CTDEF.get_query_range_provider().is_contain_geo_filters() &&
