@@ -184,7 +184,7 @@ public:
   
   typedef common::hash::ObHashSet<int64_t, common::hash::NoPthreadDefendMode> DocIdSet;
 
-  static const int64_t NUM_BUCKETS = 4096;  // 分桶数量（使用 TmpFile），减少 WBP 内存压力
+  static const int64_t NUM_BUCKETS = 1024;  // 分桶数量（使用 TmpFile），减少 WBP 内存压力
   
   // BM25 参数（与 ObExprBM25 保持一致）
   static constexpr double K1 = 1.2;
