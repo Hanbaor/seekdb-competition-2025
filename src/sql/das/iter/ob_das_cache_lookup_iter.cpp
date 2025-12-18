@@ -200,13 +200,12 @@ void ObDASCacheLookupIter::reset_lookup_state()
 {
   ObDASLookupIter::reset_lookup_state();
   index_proj_rows_.reuse();
-  // 不使用 reuse()，因为它会重置初始化状态
-  // 使用 clear() 清空数据但保持初始化状态
-  if (cached_doc_ids_.count() > 0) {
-    cached_doc_ids_.clear();
-  }
-  if (cached_results_.count() > 0) {
-    cached_results_.clear();
+  // 清空数据但保持已分配容量
+  cached_doc_ids_.reuse();
+  cached_results_.reuse();
+  // 预分配空间，避免循环中动态增长
+  if (cached_doc_ids_.count() == 0 && default_batch_row_count_ > 0) {
+    cached_doc_ids_.set_capacity(default_batch_row_count_);
   }
 }
 
