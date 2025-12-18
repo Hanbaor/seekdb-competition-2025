@@ -61,7 +61,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-USE_BATCH_SUMMARIZE = _env_bool("USE_BATCH_SUMMARIZE", False)
+USE_BATCH_SUMMARIZE = _env_bool("USE_BATCH_SUMMARIZE", True)
 USE_SUMMARY_CACHE = _env_bool("USE_SUMMARY_CACHE", False)
 USE_REGEX_FACTS = _env_bool("USE_REGEX_FACTS", True)
 
