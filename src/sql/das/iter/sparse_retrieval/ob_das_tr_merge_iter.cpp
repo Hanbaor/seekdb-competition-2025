@@ -1133,22 +1133,10 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     count = 0;
     if (bm25s_search_done_) {
       return OB_ITER_END;
-    }
-
-
-
-    // ========== TAAT 算法在存储层实现==========
-    
+    } 
     // ========== V3: 优先使用 KVCache 模式 ==========
     // 使用 KVCache 模式（缓存已在 create_text_retrieval_tree 入口处加载）
     const bool use_new_system = g_fts_generic_cache.is_cache_file_opened();
-    
-    // 生产环境注释掉以提升 QPS
-    // if (use_new_system) {
-    //   LOG_INFO("[FTS_FILTER] Using Generic Cache KVCache Mode",
-    //            "file_row_count", g_fts_generic_cache.get_file_header().row_count,
-    //            "filter_count", g_fts_generic_filter_ctx.condition_count());
-    // }
     
     // scores_array 需要按 doc_id 直接索引，手动管理
     // touched_docs 使用 ObArray 自动扩容
@@ -1222,7 +1210,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       const uint32_t *doc_ids = posting->get_doc_ids();
       const float *scores = posting->get_scores();
       
-      // 遍历有效的 posting（直接数组访问）
+      // 遍历有效的 posting
       for (int64_t i = 0; i < valid_count; i++) {
         uint32_t doc_id = doc_ids[i];
         float score = scores[i];
@@ -1236,20 +1224,11 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       // handle 析构时自动释放 KVCache 引用
     }
     
-    // ========== 诊断日志：token 查找结果 ==========
-    // 生产环境注释掉以提升 QPS
-    // LOG_INFO("BM25S search: token lookup summary",
-    //          K(tokens_found), K(tokens_not_found),
-    //          K(total_postings), K(filtered_by_base_id),
-    //          "touched_docs_count", touched_docs.count());
-    
-    // 2. 收集结果
+    const bool has_filter = use_new_system && g_fts_generic_filter_ctx.has_conditions();
     ObSEArray<ObFtsBM25SIndex::DocScore, 1024> results;
     for (int64_t i = 0; i < touched_docs.count(); i++) {
       uint32_t doc_id = touched_docs.at(i);
       double score = scores_array[doc_id];
-      
-      // 清理已使用的位置，为下次查询做准备
       scores_array[doc_id] = 0.0;
       
       if (score > 0.0) {
@@ -1263,7 +1242,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     }
     
     // 直接从 IR 层获取 LIMIT 值（进入 BM25S 模式时，topk 应该已下推）
-    int64_t effective_topk = topk_limit_;  // 优先使用已设置的值
+    int64_t effective_topk = topk_limit_;  
     bool limit_from_expr = false;
     if (effective_topk <= 0 && OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_) && OB_NOT_NULL(ir_rtdef_)) {
       // 直接计算 topk_limit_expr_
@@ -1296,8 +1275,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
                           return a.score > b.score;
                         });
     }
-  
-    // 3. 输出结果
     ObExpr *doc_id_expr = sr_iter_param_.id_proj_expr_; 
     ObExpr *score_expr = sr_iter_param_.relevance_proj_expr_;
     ObEvalCtx *eval_ctx = sr_iter_param_.eval_ctx_;
@@ -1313,21 +1290,39 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         ret = OB_ERR_UNEXPECTED;
       } else {
         int64_t output_count = 0;
-        for (int64_t i = 0; i < k && output_count < capacity; ++i) {
+        const int64_t need_count = std::min(effective_topk, capacity);
+        for (int64_t i = 0; i < k && output_count < need_count; ++i) {
           const auto &res = results.at(i);
-          uint32_t doc_id = res.doc_id;
           bool pass = true;
-          
-          if (use_new_system && g_fts_generic_filter_ctx.has_conditions()) {
-            pass = g_fts_generic_filter_ctx.check_row_fast(doc_id, g_fts_generic_cache);
+          if (has_filter) {
+            pass = g_fts_generic_filter_ctx.check_row_fast(res.doc_id, g_fts_generic_cache);
           }
-          
           if (pass) {
-            doc_id_datums[output_count].set_int(doc_id);
+            doc_id_datums[output_count].set_int(res.doc_id);
             score_datums[output_count].set_double(res.score);
             output_count++;
-          } else {
-            filtered_by_base_id++;
+          }
+        }
+      
+        // Fallback: 如果 topk 过滤后不足 need_count，对剩余部分排序并继续过滤
+        if (output_count < need_count && k < results.count()) {
+          std::sort(&results.at(k), 
+                    &results.at(0) + results.count(),
+                    [](const ObFtsBM25SIndex::DocScore &a, const ObFtsBM25SIndex::DocScore &b) {
+                      return a.score > b.score;
+                    });
+          
+          for (int64_t i = k; i < results.count() && output_count < need_count; ++i) {
+            const auto &res = results.at(i);
+            bool pass = true;
+            if (has_filter) {
+              pass = g_fts_generic_filter_ctx.check_row_fast(res.doc_id, g_fts_generic_cache);
+            }
+            if (pass) {
+              doc_id_datums[output_count].set_int(res.doc_id);
+              score_datums[output_count].set_double(res.score);
+              output_count++;
+            }
           }
         }
         
