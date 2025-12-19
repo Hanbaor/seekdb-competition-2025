@@ -51,7 +51,8 @@ int ObStopWordChecker::init()
   } else {
     ObObjMeta stop_meta;
     stop_meta.set_varchar();
-    stop_meta.set_collation_type(ObCollationType::CS_TYPE_UTF8MB4_GENERAL_CI);
+    // 使用 CS_TYPE_UTF8MB4_UNICODE_CI (224) 与查询 word 的 collation type 匹配
+    stop_meta.set_collation_type(ObCollationType::CS_TYPE_UTF8MB4_UNICODE_CI);
 
     stopword_type_.set_meta(stop_meta);
     const int64_t stopword_count = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
@@ -89,7 +90,6 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("word is empty", K(ret), K(word));
   } else {
-    // 优化：如果字符集相同，直接查找，跳过 charset_convert 和 allocator 创建
     const ObCollationType word_cs_type = word.get_collation_type();
     const ObCollationType stopword_cs_type = stopword_type_.get_collation_type();
     
@@ -109,7 +109,7 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
         LOG_WARN("fail to do exist", K(ret), K(word));
       }
     } else {
-      // 慢路径：字符集不同，需要转换（保持原有逻辑）
+      // 慢路径：字符集不同，需要转换
       uint64_t tenant_id = MTL_ID();
       if (OB_INVALID_TENANT_ID == tenant_id) {
         tenant_id = OB_SERVER_TENANT_ID;
