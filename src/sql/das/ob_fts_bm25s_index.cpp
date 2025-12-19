@@ -1621,13 +1621,8 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
     return ret;
   }
   
-  // 前过滤：如果 min_doc_id >= id_limit，直接跳过
-  int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
-  if (id_limit < INT64_MAX && min_doc_id >= static_cast<uint32_t>(id_limit)) {
-    // LOG_INFO("[BM25S_PREFILTER] token skipped (KVCache load)", K(token), K(min_doc_id), K(id_limit),
-    //          K(posting_count), "saved_bytes", posting_count * 8);
-    return OB_ENTRY_NOT_EXIST;
-  }
+  // 注意：不在加载时做前过滤，总是加载到缓存
+  // 前过滤在缓存命中后通过 doc_ids[0] 检查（避免重复读 vocab）
   
   if (posting_count == 0) {
     // 【负缓存】token 存在但没有 posting，缓存空 posting（热路径，移除日志）
@@ -1724,11 +1719,9 @@ int ObFtsBM25SIndex::get_posting_from_lru(const common::ObString &token,
       if (posting->count() == 0) {
         return common::OB_ENTRY_NOT_EXIST;
       }
-      // 缓存命中时也要做前过滤：doc_ids[0] 就是 min_doc_id
+      // 前过滤暂时禁用，测试性能影响
       int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
       if (id_limit < INT64_MAX && posting->get_doc_id(0) >= static_cast<uint32_t>(id_limit)) {
-        // LOG_INFO("[BM25S_PREFILTER] token skipped (LRU hit)", K(token), 
-        //          "min_doc_id", posting->get_doc_id(0), K(id_limit));
         return common::OB_ENTRY_NOT_EXIST;
       }
       return common::OB_SUCCESS;
@@ -1781,15 +1774,8 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
     }
   }
 
-  // 前过滤：如果 min_doc_id >= id_limit，直接跳过，不加载 posting
-  if (!disk_not_exist) {
-    int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
-    if (id_limit < INT64_MAX && min_doc_id >= static_cast<uint32_t>(id_limit)) {
-      // LOG_INFO("[BM25S_PREFILTER] token skipped (LRU load)", K(token), K(min_doc_id), K(id_limit),
-      //          K(posting_count), "saved_bytes", posting_count * 8);
-      return common::OB_ENTRY_NOT_EXIST;
-    }
-  }
+  // 注意：不在加载时做前过滤，总是加载到缓存
+  // 前过滤在缓存命中后通过 doc_ids[0] 检查（避免重复读 vocab）
 
   if (!disk_not_exist && posting_count > 0) {
     tmp_buf_size = posting_count * (sizeof(uint32_t) + sizeof(float));
@@ -1933,13 +1919,11 @@ int ObFtsBM25SIndex::get_posting_from_cache(const common::ObString &token,
       // 负缓存命中：token 不存在（热路径，移除日志）
       return OB_ENTRY_NOT_EXIST;
     }
-    // 缓存命中时也要做前过滤：doc_ids[0] 就是 min_doc_id
-    int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
-    if (id_limit < INT64_MAX && posting->get_doc_id(0) >= static_cast<uint32_t>(id_limit)) {
-      // LOG_INFO("[BM25S_PREFILTER] token skipped (KVCache hit)", 
-      //          "min_doc_id", posting->get_doc_id(0), K(id_limit));
-      return OB_ENTRY_NOT_EXIST;
-    }
+    // 前过滤暂时禁用，测试性能影响
+    // int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
+    // if (id_limit < INT64_MAX && posting->get_doc_id(0) >= static_cast<uint32_t>(id_limit)) {
+    //   return OB_ENTRY_NOT_EXIST;
+    // }
     return OB_SUCCESS;
   }
   
