@@ -423,8 +423,6 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         
         if (scan_cache_candidate) {
           cache_fill_count = std::min(total_doc_ids, capacity);
-          
-          // 预先获取所有输出列的 datum 数组
           ObDatum **col_datums = nullptr;
           int64_t *col_types = nullptr;
           if (output_col_count > 0) {
@@ -459,10 +457,9 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
                 break;
               }
               
-              // 从 KVCache 获取行数据
-              const ObFtsScalarCacheValue *row = nullptr;
-              common::ObKVCacheHandle handle;
-              int cache_ret = g_fts_generic_cache.get_row_from_kvcache(doc_id, row, handle);
+              // 从 LRU ObHashMap 获取行数据（LRU 淘汰策略，无 Hazard Pointer 开销）
+              const ObFtsRowData *row = nullptr;
+              int cache_ret = g_fts_generic_cache.get_row_from_lru(doc_id, row);
               if (OB_SUCCESS != cache_ret || OB_ISNULL(row)) {
                 // 缓存未命中，走正常回表流程
                 all_cache_hit = false;
@@ -511,7 +508,6 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
                   str_col_order++;
                 }
               }
-              // handle 析构时自动释放 KVCache 引用
             }
           }
           

@@ -230,37 +230,38 @@ public:
 
     // ========== 模式切换：取消注释其中一种模式 ==========
     
-    // ----- KVCache 模式 (当前启用) -----
-    const ObFtsScalarCacheValue *row = nullptr;
-    common::ObKVCacheHandle handle;
-    int ret = cache.get_row_from_kvcache(doc_id, row, handle);
-    if (common::OB_SUCCESS != ret || row == nullptr) {
-      return true;
-    }
-    for (int64_t i = 0; i < condition_count_; ++i) {
-      const ObFtsFilterCondition &cond = conditions_[i];
-      ObFtsColumnValue col_val;
-      if (common::OB_SUCCESS != row->get_column_value(cond.column_idx_, col_val)) {
-        continue;
-      }
-      if (!cond.check(col_val)) {
-        return false;
-      }
-    }
-    
-    // ----- HashMap 模式 (备用) -----
-    // const ObFtsRowData *row = nullptr;
-    // int ret = cache.get_row_from_hashmap(doc_id, row);
+    // ----- KVCache 模式 (备用) -----
+    // const ObFtsScalarCacheValue *row = nullptr;
+    // common::ObKVCacheHandle handle;
+    // int ret = cache.get_row_from_kvcache(doc_id, row, handle);
     // if (common::OB_SUCCESS != ret || row == nullptr) {
     //   return true;
     // }
     // for (int64_t i = 0; i < condition_count_; ++i) {
     //   const ObFtsFilterCondition &cond = conditions_[i];
-    //   const ObFtsColumnValue &col_val = row->get_column(cond.column_idx_);
+    //   ObFtsColumnValue col_val;
+    //   if (common::OB_SUCCESS != row->get_column_value(cond.column_idx_, col_val)) {
+    //     continue;
+    //   }
     //   if (!cond.check(col_val)) {
     //     return false;
     //   }
     // }
+    
+    // ----- LRU ObHashMap 模式 (当前启用) -----
+    // 使用 LRU 策略，自动淘汰最久未访问的条目，无 Hazard Pointer 开销
+    const ObFtsRowData *row = nullptr;
+    int ret = cache.get_row_from_lru(doc_id, row);
+    if (common::OB_SUCCESS != ret || row == nullptr) {
+      return true;
+    }
+    for (int64_t i = 0; i < condition_count_; ++i) {
+      const ObFtsFilterCondition &cond = conditions_[i];
+      const ObFtsColumnValue &col_val = row->get_column(cond.column_idx_);
+      if (!cond.check(col_val)) {
+        return false;
+      }
+    }
 
     return true;
   }

@@ -113,6 +113,38 @@ struct ObFtsRowData
     return null_val;
   }
 
+  // ========== 便捷访问方法（与 ObFtsScalarCacheValue 接口兼容）==========
+  
+  /**
+   * 快速获取整数列值
+   */
+  inline int64_t get_int_column_fast(int64_t col_idx) const
+  {
+    if (col_idx >= 0 && col_idx < column_count_ && OB_NOT_NULL(columns_)) {
+      const ObFtsColumnValue &val = columns_[col_idx];
+      if (val.type_ == ObFtsColumnValue::TYPE_INT64) {
+        return val.int_val_;
+      } else if (val.type_ == ObFtsColumnValue::TYPE_UINT64) {
+        return static_cast<int64_t>(val.uint_val_);
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 快速获取字符串列值
+   */
+  inline common::ObString get_string_column_fast(int64_t col_idx) const
+  {
+    if (col_idx >= 0 && col_idx < column_count_ && OB_NOT_NULL(columns_)) {
+      const ObFtsColumnValue &val = columns_[col_idx];
+      if (val.type_ == ObFtsColumnValue::TYPE_STRING) {
+        return common::ObString(val.str_val_.len_, val.str_val_.ptr_);
+      }
+    }
+    return common::ObString();
+  }
+
   void reset()
   {
     columns_ = nullptr;
@@ -371,14 +403,15 @@ public:
    */
   int ensure_ready();
 
-  // ========== V4: HashMap 缓存查询接口 ==========
+  // ========== V4: LRU HashMap 缓存查询接口 ==========
   
   /**
-   * 从 HashMap 获取行数据（轻量级缓存，读不加锁）
+   * 从 LRU HashMap 获取行数据
+   * - 无 Hazard Pointer 开销
    * @param doc_id 文档 ID
    * @param row_data 输出：行数据指针
    */
-  int get_row_from_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data);
+  int get_row_from_lru(uint64_t doc_id, const ObFtsRowData *&row_data);
 
 private:
   int ensure_capacity(uint64_t required);
@@ -400,9 +433,9 @@ private:
   int serialize_row_from_values(const ObFtsColumnValue *column_values, 
                                 char *buf, int64_t buf_len, int64_t &row_size);
 
-  // ========== V4: HashMap 缓存私有方法 ==========
-  int init_hashmap();
-  int load_row_to_hashmap(uint64_t doc_id, const ObFtsRowData *&row_data);
+  // ========== V4: LRU HashMap 缓存私有方法 ==========
+  int init_lru();
+  int load_row_to_lru(uint64_t doc_id, const ObFtsRowData *&row_data);
 
 private:
   bool is_inited_;
@@ -450,17 +483,45 @@ public:
   bool can_finalize() const { return ATOMIC_LOAD(&active_collectors_) == 0; }
 
 private:
-  // ========== V4: HashMap 缓存相关成员 ==========
-  typedef common::hash::ObHashMap<uint64_t, ObFtsRowData*, common::hash::NoPthreadDefendMode> RowHashMap;
-  RowHashMap row_hashmap_;                // doc_id -> ObFtsRowData* 的映射
-  common::ObArenaAllocator hashmap_allocator_;  // HashMap 数据的内存分配器
-  bool hashmap_inited_;                   // HashMap 是否已初始化
+  // ========== V4: LRU HashMap 缓存相关成员 ==========
+  
+  // LRU 节点结构
+  struct LRUNode {
+    uint64_t doc_id;
+    ObFtsRowData *row_data;
+    LRUNode *prev;
+    LRUNode *next;
+
+    LRUNode() : doc_id(0), row_data(nullptr), prev(nullptr), next(nullptr) {}
+    LRUNode(uint64_t id, ObFtsRowData *data) 
+        : doc_id(id), row_data(data), prev(nullptr), next(nullptr) {}
+  };
+  
+  typedef common::hash::ObHashMap<uint64_t, LRUNode*, common::hash::NoPthreadDefendMode> LRUHashMap;
+  LRUHashMap lru_map_;                    // doc_id -> LRUNode* 的映射
+  common::ObArenaAllocator lru_allocator_;  // LRU 数据的内存分配器
+  LRUNode lru_head_;                      // LRU 链表头哨兵（最新）
+  LRUNode lru_tail_;                      // LRU 链表尾哨兵（最旧）
+  int64_t lru_size_;                      // 当前缓存条目数
+  int64_t lru_capacity_;                  // LRU 容量上限
+  bool lru_inited_;                       // LRU 是否已初始化
   bool use_hashmap_;                      // 是否启用 HashMap 模式
-  mutable common::ObSpinLock hashmap_lock_;  // HashMap 写锁
+  mutable common::ObSpinLock lru_lock_;   // LRU 写锁
+  
+  static const int64_t DEFAULT_LRU_CAPACITY = 10000;  // 默认容量 1 万条
+  
+  // LRU 内部操作
+  void lru_move_to_head(LRUNode *node);   // 移动节点到头部
+  void lru_remove_node(LRUNode *node);    // 从链表中移除节点
+  void lru_add_to_head(LRUNode *node);    // 添加节点到头部
+  void lru_evict_oldest();                // 淘汰最旧节点
 
 public:
   void set_use_hashmap(bool v) { use_hashmap_ = v; }
   bool is_use_hashmap() const { return use_hashmap_; }
+  void set_lru_capacity(int64_t capacity) { lru_capacity_ = capacity; }
+  int64_t get_lru_capacity() const { return lru_capacity_; }
+  int64_t get_lru_size() const { return lru_size_; }
 };
 
 // 全局单例
