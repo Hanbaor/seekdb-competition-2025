@@ -181,6 +181,19 @@ public:
                     const common::ObIArray<ObFtsColumnValue> &values);
 
   /**
+   * 添加单值条件（快速路径，避免创建临时 ObArray）
+   * 适用于 id < 100, id = 5 等简单比较
+   */
+  int add_single_value_condition(int64_t column_idx,
+                                  ObFtsFilterOpType op_type,
+                                  const ObFtsColumnValue &value);
+
+  /**
+   * 添加无值条件（快速路径，用于 IS NULL / IS NOT NULL）
+   */
+  int add_no_value_condition(int64_t column_idx, ObFtsFilterOpType op_type);
+
+  /**
    * 便捷方法：添加 column < value 条件
    */
   int add_lt_condition(int64_t column_idx, const ObFtsColumnValue &value);

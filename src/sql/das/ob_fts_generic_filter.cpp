@@ -51,7 +51,7 @@ void ObFtsGenericFilterCtx::reset()
   
   allocator_.reset();
 
-  LOG_DEBUG("[FTS_GENERIC_FILTER] filter context reset");
+  //LOG_DEBUG("[FTS_GENERIC_FILTER] filter context reset");
 }
 
 int ObFtsGenericFilterCtx::add_condition(int64_t column_idx,
@@ -114,14 +114,85 @@ int ObFtsGenericFilterCtx::add_condition(int64_t column_idx,
   return ret;
 }
 
+// 单值条件快速路径：避免创建临时 ObArray，减少内存分配
+int ObFtsGenericFilterCtx::add_single_value_condition(
+    int64_t column_idx,
+    ObFtsFilterOpType op_type,
+    const ObFtsColumnValue &value)
+{
+  int ret = common::OB_SUCCESS;
+
+  if (condition_count_ >= MAX_CONDITIONS) {
+    ret = common::OB_SIZE_OVERFLOW;
+    LOG_WARN("[FTS_GENERIC_FILTER] too many conditions", K(ret), K_(condition_count));
+    return ret;
+  }
+
+  if (column_idx < 0 || op_type == FTS_OP_NONE) {
+    ret = common::OB_INVALID_ARGUMENT;
+    LOG_WARN("[FTS_GENERIC_FILTER] invalid condition", K(ret), K(column_idx), K(op_type));
+    return ret;
+  }
+
+  ObFtsFilterCondition &cond = conditions_[condition_count_];
+  cond.column_idx_ = column_idx;
+  cond.op_type_ = op_type;
+  cond.values_.reset();
+
+  // 对于非字符串类型，直接赋值（无需 deep_copy）
+  if (value.type_ != ObFtsColumnValue::TYPE_STRING) {
+    if (OB_FAIL(cond.values_.push_back(value))) {
+      LOG_WARN("[FTS_GENERIC_FILTER] failed to push back value", K(ret));
+    }
+  } else {
+    // 字符串类型需要深拷贝
+    ObFtsColumnValue copied_val;
+    if (OB_FAIL(value.deep_copy(allocator_, copied_val))) {
+      LOG_WARN("[FTS_GENERIC_FILTER] failed to deep copy value", K(ret));
+    } else if (OB_FAIL(cond.values_.push_back(copied_val))) {
+      LOG_WARN("[FTS_GENERIC_FILTER] failed to push back value", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    condition_count_++;
+    // 临时日志：确认快速路径被调用
+    /*LOG_INFO("[FTS_GENERIC_FILTER] add_single_value_condition called",
+             K(column_idx), "op", get_filter_op_name(op_type),
+             "value_type", value.type_, K_(condition_count));*/
+  }
+
+  return ret;
+}
+
+// 无值条件快速路径：用于 IS NULL / IS NOT NULL
+int ObFtsGenericFilterCtx::add_no_value_condition(int64_t column_idx, ObFtsFilterOpType op_type)
+{
+  int ret = common::OB_SUCCESS;
+
+  if (condition_count_ >= MAX_CONDITIONS) {
+    ret = common::OB_SIZE_OVERFLOW;
+    return ret;
+  }
+
+  if (column_idx < 0 || op_type == FTS_OP_NONE) {
+    ret = common::OB_INVALID_ARGUMENT;
+    return ret;
+  }
+
+  ObFtsFilterCondition &cond = conditions_[condition_count_];
+  cond.column_idx_ = column_idx;
+  cond.op_type_ = op_type;
+  cond.values_.reset();  // 无值条件，values_ 保持为空
+  condition_count_++;
+
+  return ret;
+}
+
 int ObFtsGenericFilterCtx::add_lt_condition(int64_t column_idx, const ObFtsColumnValue &value)
 {
-  common::ObArray<ObFtsColumnValue> values;
-  int ret = values.push_back(value);
-  if (OB_SUCC(ret)) {
-    ret = add_condition(column_idx, FTS_OP_LT, values);
-  }
-  return ret;
+  // 使用快速路径
+  return add_single_value_condition(column_idx, FTS_OP_LT, value);
 }
 
 int ObFtsGenericFilterCtx::add_in_condition(int64_t column_idx,
@@ -258,15 +329,15 @@ int ObFtsGenericFilterCtx::extract_from_filters(
                                                  output_exprs, cache, eval_ctx);
         if (common::OB_SUCCESS != extract_ret) {
           // 提取失败不是错误，只是该条件不能下推
-          LOG_DEBUG("[FTS_GENERIC_FILTER] cannot extract sub-condition",
-                    K(extract_ret), K(j));
+          /*LOG_DEBUG("[FTS_GENERIC_FILTER] cannot extract sub-condition",
+                    K(extract_ret), K(j));*/
         }
       }
     } else {
       int extract_ret = try_extract_condition(expr, output_exprs, cache, eval_ctx);
       if (common::OB_SUCCESS != extract_ret) {
-        LOG_DEBUG("[FTS_GENERIC_FILTER] cannot extract condition",
-                  K(extract_ret), K(i));
+        /*LOG_DEBUG("[FTS_GENERIC_FILTER] cannot extract condition",
+                  K(extract_ret), K(i));*/
       }
     }
   }
@@ -340,8 +411,8 @@ int ObFtsGenericFilterCtx::try_extract_condition(
 
       // 查找列索引
       if (OB_FAIL(find_column_index(column_expr, output_exprs, cache, column_idx))) {
-        LOG_DEBUG("[FTS_GENERIC_FILTER] cannot find column for IN",
-                  K(ret), K(column_expr->type_));
+        /*LOG_DEBUG("[FTS_GENERIC_FILTER] cannot find column for IN",
+                  K(ret), K(column_expr->type_));*/
         return ret;
       }
 
@@ -409,7 +480,7 @@ int ObFtsGenericFilterCtx::try_extract_condition(
       return common::OB_SUCCESS;
     }
 
-    // ===== IS NULL / IS NOT NULL =====
+    // ===== IS NULL / IS NOT NULL（使用无值快速路径）=====
     case T_OP_IS: {
       if (expr->arg_cnt_ >= 1 && expr->args_[0]->type_ == T_REF_COLUMN) {
         column_expr = expr->args_[0];
@@ -419,8 +490,8 @@ int ObFtsGenericFilterCtx::try_extract_condition(
           return ret;
         }
 
-        common::ObArray<ObFtsColumnValue> empty_values;
-        return add_condition(column_idx, op_type, empty_values);
+        // 快速路径：无值条件不需要创建 ObArray
+        return add_no_value_condition(column_idx, op_type);
       }
       return common::OB_NOT_SUPPORTED;
     }
@@ -434,8 +505,8 @@ int ObFtsGenericFilterCtx::try_extract_condition(
           return ret;
         }
 
-        common::ObArray<ObFtsColumnValue> empty_values;
-        return add_condition(column_idx, op_type, empty_values);
+        // 快速路径：无值条件不需要创建 ObArray
+        return add_no_value_condition(column_idx, op_type);
       }
       return common::OB_NOT_SUPPORTED;
     }
@@ -444,7 +515,7 @@ int ObFtsGenericFilterCtx::try_extract_condition(
       return common::OB_NOT_SUPPORTED;
   }
 
-  // 处理简单比较操作
+  // 处理简单比较操作（使用快速路径：避免创建临时 ObArray）
   if (OB_NOT_NULL(column_expr) && OB_NOT_NULL(value_expr) && op_type != FTS_OP_NONE) {
     if (OB_FAIL(find_column_index(column_expr, output_exprs, cache, column_idx))) {
       LOG_DEBUG("[FTS_GENERIC_FILTER] cannot find column for comparison",
@@ -452,18 +523,27 @@ int ObFtsGenericFilterCtx::try_extract_condition(
       return ret;
     }
 
-    common::ObArray<ObFtsColumnValue> values;
-    if (OB_FAIL(extract_const_value(value_expr, eval_ctx, values))) {
-      LOG_DEBUG("[FTS_GENERIC_FILTER] cannot extract const value",
-                K(ret), K(value_expr->type_));
+    // 快速路径：直接提取单个值，避免创建临时 ObArray
+    ObDatum *datum = nullptr;
+    if (OB_FAIL(value_expr->eval(eval_ctx, datum))) {
+      LOG_DEBUG("[FTS_GENERIC_FILTER] failed to eval const expr", K(ret));
       return ret;
     }
 
-    if (values.count() > 0) {
-      // LOG_INFO("[FTS_GENERIC_FILTER] extracted comparison condition",
-      //          K(column_idx), "op", get_filter_op_name(op_type), K(flip));
-      return add_condition(column_idx, op_type, values);
+    if (OB_ISNULL(datum) || datum->is_null()) {
+      return common::OB_SUCCESS;  // NULL 值，跳过
     }
+
+    ObFtsColumnValue val;
+    if (OB_FAIL(ObFtsColumnValue::from_datum_shallow(*datum, value_expr->datum_meta_.type_, val))) {
+      LOG_DEBUG("[FTS_GENERIC_FILTER] failed to convert datum", K(ret));
+      return ret;
+    }
+
+    // 使用单值快速路径添加条件
+    /*LOG_DEBUG("[FTS_GENERIC_FILTER] using single value fast path",
+              K(column_idx), "op", get_filter_op_name(op_type));*/
+    return add_single_value_condition(column_idx, op_type, val);
   }
 
   return common::OB_NOT_SUPPORTED;

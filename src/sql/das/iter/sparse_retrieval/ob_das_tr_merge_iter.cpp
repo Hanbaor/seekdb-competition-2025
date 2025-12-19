@@ -957,6 +957,15 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     if (IS_NOT_INIT) {
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
+    } else if (bm25s_skip_init_) {
+      // BM25S 模式：跳过传统迭代器的 reuse，只重置 BM25S 变量
+      bm25s_search_done_ = false;
+      bm25s_cursor_ = 0;
+      bm25s_results_.reset();
+      if (OB_NOT_NULL(mem_context_)) {
+        mem_context_->reset_remain_one_page();
+      }
+      return ret;
     } else if (OB_ISNULL(sparse_retrieval_iter_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("sparse retrieval iter is null", K(ret));
@@ -992,18 +1001,18 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         }
       }
     }
-  
+
     if (OB_SUCC(ret)) {
       sparse_retrieval_iter_->reuse(inv_idx_tablet_switched_);
       inv_idx_tablet_switched_ = false;
     }
-  
+
     if (OB_NOT_NULL(mem_context_)) {
       mem_context_->reset_remain_one_page();
     }
     check_rangekey_inited_ = false;
     
-    // 重置 BM25S 相关变量
+    // 重置 BM25S 相关变量（非 BM25S 模式也需要重置）
     bm25s_search_done_ = false;
     bm25s_cursor_ = 0;
     bm25s_results_.reset();
@@ -1017,6 +1026,12 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     if (IS_NOT_INIT) {
       ret = OB_NOT_INIT;
       LOG_WARN("not inited", K(ret));
+    } else if (bm25s_skip_init_) {
+      // BM25S 模式：跳过传统迭代器的 rescan
+      bm25s_search_done_ = false;
+      bm25s_cursor_ = 0;
+      bm25s_results_.reset();
+      return ret;
     } else if (OB_ISNULL(sparse_retrieval_iter_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("sparse retrieval iter is null", K(ret));
@@ -1039,6 +1054,38 @@ ObDASTRMergeIter::ObDASTRMergeIter()
   int ObDASTRMergeIter::inner_release()
   {
     int ret = OB_SUCCESS;
+    
+    // BM25S 快速路径：跳过未初始化的传统迭代器资源释放
+    if (bm25s_skip_init_) {
+      // BM25S 模式下只需要重置 BM25S 相关变量和基础资源
+      bm25s_search_done_ = false;
+      bm25s_cursor_ = 0;
+      bm25s_results_.reset();
+      bm25s_skip_init_ = false;
+      
+      // 仍需要释放的公共资源
+      if (OB_NOT_NULL(boolean_compute_node_)) {
+        boolean_compute_node_->release();
+        boolean_compute_node_ = nullptr;
+      }
+      if (nullptr != mem_context_) {
+        mem_context_->reset_remain_one_page();
+        DESTROY_CONTEXT(mem_context_);
+        mem_context_ = nullptr;
+      }
+      query_tokens_.reset();
+      dim_weights_.reset();
+      myself_allocator_.reset();
+      ir_ctdef_ = nullptr;
+      ir_rtdef_ = nullptr;
+      tx_desc_ = nullptr;
+      snapshot_ = nullptr;
+      topk_limit_ = 0;
+      is_inited_ = false;
+      return ret;
+    }
+    
+    // 传统模式：完整释放所有资源
     if (OB_NOT_NULL(total_doc_cnt_scan_param_)) {
       total_doc_cnt_scan_param_->destroy_schema_guard();
       total_doc_cnt_scan_param_->snapshot_.reset();
