@@ -1172,13 +1172,16 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       }
     }
     
-    // 清空 touched_docs（保留容量）
+    // 清空 touched_docs（保留容量），并预分配足够空间避免 push_back 时重新分配
     touched_docs.reuse();
+    if (touched_docs.get_capacity() < 4096) {
+      touched_docs.reserve(4096);
+    }
     
     // 使用全局过滤上下文中的 id_limit
     int64_t id_limit = id_upper_bound;
     
-    // 1. 遍历每个查询 token，从 KVCache 获取倒排链并累加分数
+    // 1. 遍历每个查询 token，从 LRU/kvcache 获取倒排链并累加分数
     int64_t tokens_found = 0, tokens_not_found = 0;
     int64_t total_postings = 0, filtered_by_base_id = 0;
     int64_t cache_hits = 0, cache_misses = 0;
@@ -1186,8 +1189,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     for (int64_t t = 0; t < query_tokens_.count(); t++) {
       const ObString &token = query_tokens_.at(t);
       
-      // ========== 从 KVCache 获取 posting（缓存未命中时从文件加载）==========
-      // 原调用：get_posting_from_cache(token, posting, handle)
       const ObBM25SPostingValue *posting = nullptr;
       int posting_ret = g_bm25s_index.get_posting_from_lru(token, posting);
       if (OB_ENTRY_NOT_EXIST == posting_ret) {
@@ -1201,16 +1202,20 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       
       tokens_found++;
       
-      // 使用二分查找获取有效的 posting 数量（doc_id < id_limit）
       int64_t valid_count = posting->get_valid_count(id_limit);
       total_postings += valid_count;
       
-      // 获取数组指针，避免循环中重复函数调用
       const uint32_t *doc_ids = posting->get_doc_ids();
       const float *scores = posting->get_scores();
       
-      // 遍历有效的 posting
+      // 遍历有效的 posting（带预取优化）
+      const int64_t PREFETCH_DIST = 32;
       for (int64_t i = 0; i < valid_count; i++) {
+        // 预取后续数据到 L1 缓存
+        if (i + PREFETCH_DIST < valid_count) {
+          __builtin_prefetch(&scores_array[doc_ids[i + PREFETCH_DIST]], 1, 3);
+        }
+        
         uint32_t doc_id = doc_ids[i];
         float score = scores[i];
         
@@ -1219,11 +1224,13 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         }
         scores_array[doc_id] += score;
       }
-      
-      // handle 析构时自动释放 KVCache 引用
     }
     
     ObSEArray<ObFtsBM25SIndex::DocScore, 1024> results;
+    // 预分配避免 push_back 时重新分配
+    if (touched_docs.count() > 1024) {
+      results.reserve(touched_docs.count());
+    }
     for (int64_t i = 0; i < touched_docs.count(); i++) {
       uint32_t doc_id = touched_docs.at(i);
       double score = scores_array[doc_id];
