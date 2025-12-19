@@ -16,6 +16,7 @@
 
 #include "storage/fts/ob_fts_parser_property.h"
 
+#include "lib/hash/ob_hashmap.h"
 #include "lib/json_type/ob_json_base.h"
 #include "lib/json_type/ob_json_parse.h"
 #include "lib/json_type/ob_json_tree.h"
@@ -34,7 +35,52 @@ namespace oceanbase
 {
 namespace storage
 {
+struct ParserPropCacheKey {
+  uint64_t hash;
+  int64_t len;
+  
+  ParserPropCacheKey() : hash(0), len(0) {}
+  ParserPropCacheKey(uint64_t h, int64_t l) : hash(h), len(l) {}
+  
+  bool operator==(const ParserPropCacheKey &other) const {
+    return hash == other.hash && len == other.len;
+  }
+  
+  uint64_t hash_val() const { return hash; }
+};
 
+struct ParserPropCacheValue {
+  int64_t min_token_size;
+  int64_t max_token_size;
+  
+  ParserPropCacheValue() : min_token_size(0), max_token_size(0) {}
+  ParserPropCacheValue(int64_t min_sz, int64_t max_sz) 
+    : min_token_size(min_sz), max_token_size(max_sz) {}
+};
+
+struct ParserPropCacheKeyHash {
+  int operator()(const ParserPropCacheKey &key, uint64_t &hash_val) const {
+    hash_val = key.hash_val();
+    return OB_SUCCESS;
+  }
+};
+
+static common::hash::ObHashMap<ParserPropCacheKey, ParserPropCacheValue, 
+                                common::hash::ReadWriteDefendMode,
+                                ParserPropCacheKeyHash> g_parser_prop_cache;
+static bool g_parser_prop_cache_inited = false;
+
+static int ensure_parser_prop_cache_init() {
+  int ret = OB_SUCCESS;
+  if (!g_parser_prop_cache_inited) {
+    if (OB_FAIL(g_parser_prop_cache.create(64, common::ObMemAttr(OB_SERVER_TENANT_ID, "FTParserCache")))) {
+      LOG_WARN("failed to create parser prop cache", K(ret));
+    } else {
+      g_parser_prop_cache_inited = true;
+    }
+  }
+  return ret;
+}
 
 int ObFTParserJsonProps::init()
 {
@@ -1151,6 +1197,46 @@ int ObFTParserJsonProps::show_parser_properties(const ObFTParserJsonProps &prope
 int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str)
 {
   int ret = OB_SUCCESS;
+  if (parser.is_space() || parser.is_beng()) {
+    if (OB_FAIL(ensure_parser_prop_cache_init())) {
+      LOG_WARN("failed to init parser prop cache", K(ret));
+      // 初始化失败时回退到直接解析
+    } else {
+      uint64_t hash_val = json_str.empty() ? 0 : common::murmurhash(json_str.ptr(), json_str.length(), 0);
+      ParserPropCacheKey cache_key(hash_val, json_str.length());
+      ParserPropCacheValue cache_val;
+      int get_ret = g_parser_prop_cache.get_refactored(cache_key, cache_val);
+      if (OB_SUCCESS == get_ret) {
+        min_token_size_ = cache_val.min_token_size;
+        max_token_size_ = cache_val.max_token_size;
+        return ret;
+      }
+    }
+    if (json_str.empty()) {
+      min_token_size_ = ObFTSLiteral::FT_DEFAULT_MIN_TOKEN_SIZE;
+      max_token_size_ = ObFTSLiteral::FT_DEFAULT_MAX_TOKEN_SIZE;
+    } else {
+      ObFTParserJsonProps props;
+      if (OB_FAIL(props.init())) {
+        LOG_WARN("fail to init props", K(ret));
+      } else if (OB_FAIL(props.parse_from_valid_str(json_str))) {
+        LOG_WARN("fail to parse from json str", K(ret), K(json_str));
+      } else if (OB_FAIL(props.config_get_min_token_size(min_token_size_))) {
+        LOG_WARN("fail to get min_token_size", K(ret));
+      } else if (OB_FAIL(props.config_get_max_token_size(max_token_size_))) {
+        LOG_WARN("fail to get max_token_size", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && g_parser_prop_cache_inited) {
+      uint64_t hash_val = json_str.empty() ? 0 : common::murmurhash(json_str.ptr(), json_str.length(), 0);
+      ParserPropCacheKey cache_key(hash_val, json_str.length());
+      ParserPropCacheValue cache_val(min_token_size_, max_token_size_);
+      g_parser_prop_cache.set_refactored(cache_key, cache_val);
+    }
+    return ret;
+  }
+  
+  // 其他 parser 类型，使用原始逻辑
   ObFTParserJsonProps props;
   if (OB_FAIL(props.init())) {
     LOG_WARN("fail to init props", K(ret));
@@ -1181,29 +1267,11 @@ int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const 
           LOG_WARN("invalid ik_smart", K(ret), K(ik_smart));
         }
       }
-    } else if (parser.is_space()) {
-      if (json_str.empty()) {
-        min_token_size_ = ObFTSLiteral::FT_DEFAULT_MIN_TOKEN_SIZE;
-        max_token_size_ = ObFTSLiteral::FT_DEFAULT_MAX_TOKEN_SIZE;
-      } else if (OB_FAIL(props.config_get_min_token_size(min_token_size_))) {
-        LOG_WARN("fail to get min_token_size", K(ret));
-      } else if (OB_FAIL(props.config_get_max_token_size(max_token_size_))) {
-        LOG_WARN("fail to get max_token_size", K(ret));
-      }
     } else if (parser.is_ngram()) {
       if (json_str.empty()) {
         ngram_token_size_ = ObFTSLiteral::FT_DEFAULT_NGRAM_TOKEN_SIZE;
       } else if (OB_FAIL(props.config_get_ngram_token_size(ngram_token_size_))) {
         LOG_WARN("fail to get ngram_token_size", K(ret));
-      }
-    } else if (parser.is_beng()) {
-      if (json_str.empty()) {
-        min_token_size_ = ObFTSLiteral::FT_DEFAULT_MIN_TOKEN_SIZE;
-        max_token_size_ = ObFTSLiteral::FT_DEFAULT_MAX_TOKEN_SIZE;
-      } else if (OB_FAIL(props.config_get_min_token_size(min_token_size_))) {
-        LOG_WARN("fail to get min_token_size", K(ret));
-      } else if (OB_FAIL(props.config_get_max_token_size(max_token_size_))) {
-        LOG_WARN("fail to get max_token_size", K(ret));
       }
     } else if (parser.is_ngram2()) {
       if (json_str.empty()) {

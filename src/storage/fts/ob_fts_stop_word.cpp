@@ -90,6 +90,13 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("word is empty", K(ret), K(word));
   } else {
+    // fast check for stopword length
+    const int64_t word_len = word.get_word().get_string().length();
+    if (word_len > 5 || word_len < 1) {
+      is_stopword = false;
+      return ret;
+    }
+
     const ObCollationType word_cs_type = word.get_collation_type();
     const ObCollationType stopword_cs_type = stopword_type_.get_collation_type();
     

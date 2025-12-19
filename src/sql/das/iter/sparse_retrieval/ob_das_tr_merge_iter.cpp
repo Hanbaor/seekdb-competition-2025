@@ -1233,7 +1233,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     int64_t total_postings = 0, filtered_by_base_id = 0;
     int64_t cache_hits = 0, cache_misses = 0;
     
-    for (int64_t t = 0; t < query_tokens_.count(); t++) {
+    const int64_t token_count = query_tokens_.count();
+    for (int64_t t = 0; t < token_count; t++) {
       const ObString &token = query_tokens_.at(t);
       
       const ObBM25SPostingValue *posting = nullptr;
@@ -1278,8 +1279,10 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     if (touched_docs.count() > 1024) {
       results.reserve(touched_docs.count());
     }
-    for (int64_t i = 0; i < touched_docs.count(); i++) {
-      uint32_t doc_id = touched_docs.at(i);
+    const int64_t touched_count = touched_docs.count();
+    const uint32_t *touched_ptr = touched_docs.get_data();
+    for (int64_t i = 0; i < touched_count; i++) {
+      uint32_t doc_id = touched_ptr[i];
       double score = scores_array[doc_id];
       scores_array[doc_id] = 0.0;
       
@@ -1428,7 +1431,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     char split_token_tag = ' ';
     char split_boost_tag = '^';
     hash::ObHashMap<ObString, double> token_map;
-    const int64_t ft_word_bkt_cnt = MAX(query_str.length() / 10, 2);
+    const int64_t ft_word_bkt_cnt = MAX(query_str.length(), 16);
     if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr(MTL_ID(), "FTWordMap")))) {
       LOG_WARN("failed to create token map", K(ret));
     }
@@ -1651,7 +1654,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         FtsNode *node = fts_parser->root_;
         ObFtsEvalNode *parant_node =nullptr;
         hash::ObHashMap<ObString, int32_t> tokens_map;
-        const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
+        const int64_t ft_word_bkt_cnt = MAX(search_text_string.length(), 16);
         if (OB_FAIL(tokens_map.create(ft_word_bkt_cnt, common::ObMemAttr(MTL_ID(), "FTWordMap")))) {
           LOG_WARN("failed to create token map", K(ret));
         } else if (OB_FAIL(ObFtsEvalNode::fts_boolean_node_create(parant_node, node, cs_type, alloc, query_tokens, tokens_map, has_duplicate_boolean_tokens))) {
@@ -1673,7 +1676,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       storage::ObFTParseHelper tokenize_helper;
       common::ObSEArray<ObFTWord, 16> tokens;
       hash::ObHashMap<ObFTWord, int64_t> token_map;
-      const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
+      const int64_t ft_word_bkt_cnt = MAX(search_text_string.length(), 16);
       if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
         LOG_WARN("failed to init tokenize helper", K(ret));
       } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr(MTL_ID(), "FTWordMap")))) {
