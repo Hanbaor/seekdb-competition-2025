@@ -57,13 +57,22 @@ ObFtsBM25SIndex::ObFtsBM25SIndex()
     persist_file_opened_(false),
     bucket_directory_(nullptr),
     cache_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "BM25SCache")),
+    posting_lru_allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "BM25SLRU")),
     unique_docs_(),
     total_doc_len_(0),
     raw_entry_count_(0),
     total_docs_(0),
     avg_doc_len_(0.0),
     allocator_(ObMemAttr(OB_SERVER_TENANT_ID, "BM25SIndex")),
-    lock_()
+    lock_(),
+    posting_lru_map_(),
+    posting_lru_head_(),
+    posting_lru_tail_(),
+    posting_lru_size_(0),
+    posting_lru_capacity_(DEFAULT_POSTING_LRU_CAPACITY),
+    posting_lru_inited_(false),
+    use_posting_hashmap_(true),
+    posting_lru_lock_(common::ObLatchIds::DEFAULT_SPIN_LOCK)
 {
   // 初始化 TmpFile 相关数组
   for (int64_t i = 0; i < NUM_BUCKETS; i++) {
@@ -71,6 +80,10 @@ ObFtsBM25SIndex::ObFtsBM25SIndex()
     bucket_write_offsets_[i] = 0;
     bucket_entry_counts_[i] = 0;
   }
+  posting_lru_head_.next = &posting_lru_tail_;
+  posting_lru_head_.prev = nullptr;
+  posting_lru_tail_.prev = &posting_lru_head_;
+  posting_lru_tail_.next = nullptr;
   // 初始化持久化相关
   memset(index_file_path_, 0, sizeof(index_file_path_));
   file_header_.reset();
@@ -547,6 +560,17 @@ void ObFtsBM25SIndex::reset()
     is_finalized_ = false;
     
     allocator_.reset();
+    {
+      common::SpinWLockGuard lru_guard(posting_lru_lock_);
+      posting_lru_map_.destroy();
+      posting_lru_allocator_.reset();
+      posting_lru_head_.next = &posting_lru_tail_;
+      posting_lru_head_.prev = nullptr;
+      posting_lru_tail_.prev = &posting_lru_head_;
+      posting_lru_tail_.next = nullptr;
+      posting_lru_size_ = 0;
+      posting_lru_inited_ = false;
+    }
     LOG_INFO("BM25S reset: reset completed");
   }
 }
@@ -567,6 +591,18 @@ void ObFtsBM25SIndex::destroy()
     is_inited_ = false;
     is_finalized_ = false;
     LOG_INFO("BM25S destroy: destroy completed");
+  }
+
+  {
+    common::SpinWLockGuard lru_guard(posting_lru_lock_);
+    posting_lru_map_.destroy();
+    posting_lru_allocator_.reset();
+    posting_lru_head_.next = &posting_lru_tail_;
+    posting_lru_head_.prev = nullptr;
+    posting_lru_tail_.prev = &posting_lru_head_;
+    posting_lru_tail_.next = nullptr;
+    posting_lru_size_ = 0;
+    posting_lru_inited_ = false;
   }
 }
 
@@ -1376,6 +1412,76 @@ ObBM25SPostingCache* get_bm25s_posting_cache()
 }
 
 // ========================================================================
+// V3: Posting LRU ObHashMap 实现
+// ========================================================================
+
+void ObFtsBM25SIndex::posting_lru_add_to_head(PostingLRUNode *node)
+{
+  if (OB_ISNULL(node)) {
+    return;
+  }
+  node->prev = &posting_lru_head_;
+  node->next = posting_lru_head_.next;
+  posting_lru_head_.next->prev = node;
+  posting_lru_head_.next = node;
+}
+
+void ObFtsBM25SIndex::posting_lru_remove_node(PostingLRUNode *node)
+{
+  if (OB_ISNULL(node) || OB_ISNULL(node->prev) || OB_ISNULL(node->next)) {
+    return;
+  }
+  node->prev->next = node->next;
+  node->next->prev = node->prev;
+  node->prev = nullptr;
+  node->next = nullptr;
+}
+
+void ObFtsBM25SIndex::posting_lru_evict_oldest()
+{
+  PostingLRUNode *oldest = posting_lru_tail_.prev;
+  if (oldest == &posting_lru_head_) {
+    return;
+  }
+  posting_lru_remove_node(oldest);
+  posting_lru_map_.erase_refactored(oldest->key);
+  posting_lru_size_--;
+  // 内存由 posting_lru_allocator_ 管理，延迟统一释放
+}
+
+int ObFtsBM25SIndex::init_posting_lru()
+{
+  int ret = OB_SUCCESS;
+  if (posting_lru_inited_) {
+    return OB_SUCCESS;
+  }
+
+  common::SpinWLockGuard guard(posting_lru_lock_);
+  if (posting_lru_inited_) {
+    return OB_SUCCESS;
+  }
+
+  int64_t bucket_cnt = posting_lru_capacity_ > 0 ? posting_lru_capacity_ * 2 : DEFAULT_POSTING_LRU_CAPACITY * 2;
+  if (bucket_cnt <= 0) {
+    bucket_cnt = DEFAULT_POSTING_LRU_CAPACITY * 2;
+  }
+
+  if (OB_FAIL(posting_lru_map_.create(bucket_cnt, "BM25SLRU", "BM25SLRU"))) {
+    LOG_WARN("BM25S posting LRU: fail to create hashmap", K(ret), K(bucket_cnt));
+  } else {
+    posting_lru_head_.next = &posting_lru_tail_;
+    posting_lru_head_.prev = nullptr;
+    posting_lru_tail_.prev = &posting_lru_head_;
+    posting_lru_tail_.next = nullptr;
+    posting_lru_size_ = 0;
+    posting_lru_inited_ = true;
+    LOG_INFO("BM25S posting LRU: initialized", K(bucket_cnt), K_(posting_lru_capacity));
+  }
+
+  return ret;
+}
+
+// ========================================================================
 // Phase 3: KVCache 查询实现
 // ========================================================================
 
@@ -1542,11 +1648,196 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
   return ret;
 }
 
+int ObFtsBM25SIndex::get_posting_from_lru(const common::ObString &token,
+                                           const ObBM25SPostingValue *&posting)
+{
+  int ret = OB_SUCCESS;
+  posting = nullptr;
+
+  if (!use_posting_hashmap_) {
+    common::ObKVCacheHandle handle;
+    return get_posting_from_cache(token, posting, handle);
+  }
+
+  if (!persist_file_opened_) {
+    if (OB_FAIL(ensure_ready())) {
+      return ret;
+    }
+  }
+
+  if (!persist_file_opened_) {
+    return common::OB_NOT_INIT;
+  }
+
+  if (!posting_lru_inited_) {
+    if (OB_FAIL(init_posting_lru())) {
+      return ret;
+    }
+  }
+
+  uint64_t token_hash = token.hash();
+  PostingHashKey lookup_key(token_hash, static_cast<int32_t>(token.length()), token.ptr());
+
+  {
+    common::SpinRLockGuard guard(posting_lru_lock_);
+    PostingLRUNode *node = nullptr;
+    ret = posting_lru_map_.get_refactored(lookup_key, node);
+    if (common::OB_SUCCESS == ret && OB_NOT_NULL(node)) {
+      posting = node->posting;
+      if (OB_ISNULL(posting)) {
+        return common::OB_ERR_UNEXPECTED;
+      }
+      return posting->count() == 0 ? common::OB_ENTRY_NOT_EXIST : common::OB_SUCCESS;
+    } else if (common::OB_HASH_NOT_EXIST != ret) {
+      return ret;
+    }
+  }
+
+  ret = load_posting_to_lru(token, posting, token_hash);
+  return ret;
+}
+
+int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
+                                          const ObBM25SPostingValue *&posting,
+                                          uint64_t token_hash)
+{
+  int ret = OB_SUCCESS;
+  posting = nullptr;
+
+  if (!persist_file_opened_) {
+    if (OB_FAIL(ensure_ready())) {
+      return ret;
+    }
+  }
+
+  if (!posting_lru_inited_) {
+    if (OB_FAIL(init_posting_lru())) {
+      return ret;
+    }
+  }
+
+  if (token_hash == 0) {
+    token_hash = token.hash();
+  }
+
+  bool disk_not_exist = false;
+  int64_t posting_offset = 0;
+  int64_t posting_count = 0;
+  char *tmp_buf = nullptr;
+  int64_t tmp_buf_size = 0;
+
+  if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count))) {
+    if (common::OB_ENTRY_NOT_EXIST == ret) {
+      disk_not_exist = true;
+      ret = OB_SUCCESS;
+    } else {
+      return ret;
+    }
+  }
+
+  if (!disk_not_exist && posting_count > 0) {
+    tmp_buf_size = posting_count * (sizeof(uint32_t) + sizeof(float));
+    tmp_buf = static_cast<char*>(ob_malloc(tmp_buf_size, "BM25SLRUTmp"));
+    if (OB_ISNULL(tmp_buf)) {
+      LOG_WARN("BM25S posting LRU: fail to alloc temp buffer", K(tmp_buf_size));
+      return common::OB_ALLOCATE_MEMORY_FAILED;
+    }
+    int64_t read_size = 0;
+    int64_t file_offset = file_header_.posting_data_offset + posting_offset;
+    if (OB_FAIL(share::ObIODeviceLocalFileOp::pread_impl(
+            persist_fd_.second_id_, tmp_buf, tmp_buf_size, file_offset, read_size))) {
+      LOG_WARN("BM25S posting LRU: fail to read posting data", K(ret), K(token), K(file_offset), K(tmp_buf_size));
+      ob_free(tmp_buf);
+      return ret;
+    }
+  }
+
+  PostingHashKey lookup_key(token_hash, static_cast<int32_t>(token.length()), token.ptr());
+
+  common::SpinWLockGuard guard(posting_lru_lock_);
+  PostingLRUNode *existing_node = nullptr;
+  int map_ret = posting_lru_map_.get_refactored(lookup_key, existing_node);
+  if (common::OB_SUCCESS == map_ret && OB_NOT_NULL(existing_node)) {
+    posting = existing_node->posting;
+    ob_free(tmp_buf);
+    return posting->count() == 0 ? common::OB_ENTRY_NOT_EXIST : common::OB_SUCCESS;
+  } else if (common::OB_SUCCESS != map_ret && common::OB_HASH_NOT_EXIST != map_ret) {
+    ob_free(tmp_buf);
+    return map_ret;
+  }
+
+  while (posting_lru_size_ >= posting_lru_capacity_) {
+    posting_lru_evict_oldest();
+  }
+
+  PostingLRUNode *new_node = static_cast<PostingLRUNode*>(
+      posting_lru_allocator_.alloc(sizeof(PostingLRUNode)));
+  ObBM25SPostingValue *new_posting = static_cast<ObBM25SPostingValue*>(
+      posting_lru_allocator_.alloc(sizeof(ObBM25SPostingValue)));
+  char *token_buf = nullptr;
+  if (token.length() > 0) {
+    token_buf = static_cast<char*>(posting_lru_allocator_.alloc(token.length()));
+  }
+
+  if (OB_ISNULL(new_node) || OB_ISNULL(new_posting) || (token.length() > 0 && OB_ISNULL(token_buf))) {
+    LOG_WARN("BM25S posting LRU: alloc node/posting/token failed", K(token.length()));
+    ob_free(tmp_buf);
+    return common::OB_ALLOCATE_MEMORY_FAILED;
+  }
+
+  MEMCPY(token_buf, token.ptr(), token.length());
+  new (new_node) PostingLRUNode();
+  new (new_posting) ObBM25SPostingValue();
+  new_node->token.assign_ptr(token_buf, token.length());
+  new_node->key = PostingHashKey(token_hash, static_cast<int32_t>(token.length()), token_buf);
+
+  if (!disk_not_exist && posting_count > 0) {
+    int64_t doc_ids_size = posting_count * sizeof(uint32_t);
+    int64_t scores_size = posting_count * sizeof(float);
+    uint32_t *doc_ids_buf = reinterpret_cast<uint32_t*>(posting_lru_allocator_.alloc(doc_ids_size));
+    float *scores_buf = reinterpret_cast<float*>(posting_lru_allocator_.alloc(scores_size));
+    if (OB_ISNULL(doc_ids_buf) || OB_ISNULL(scores_buf)) {
+      LOG_WARN("BM25S posting LRU: alloc posting data buffer failed", K(doc_ids_size), K(scores_size));
+      ob_free(tmp_buf);
+      return common::OB_ALLOCATE_MEMORY_FAILED;
+    }
+    MEMCPY(doc_ids_buf, tmp_buf, doc_ids_size);
+    MEMCPY(scores_buf, tmp_buf + doc_ids_size, scores_size);
+    new_posting->set(posting_count, doc_ids_buf, scores_buf);
+  } else {
+    new_posting->set(0, nullptr, nullptr);
+  }
+
+  new_node->posting = new_posting;
+
+  if (OB_FAIL(posting_lru_map_.set_refactored(new_node->key, new_node))) {
+    if (common::OB_HASH_EXIST == ret) {
+      if (OB_SUCC(posting_lru_map_.get_refactored(lookup_key, existing_node))) {
+        posting = existing_node->posting;
+        ret = posting->count() == 0 ? common::OB_ENTRY_NOT_EXIST : common::OB_SUCCESS;
+      }
+    } else {
+      LOG_WARN("BM25S posting LRU: fail to insert hashmap", K(ret), K(token));
+    }
+  } else {
+    posting_lru_add_to_head(new_node);
+    posting_lru_size_++;
+    posting = new_posting;
+    ret = (!disk_not_exist && posting_count > 0) ? common::OB_SUCCESS : common::OB_ENTRY_NOT_EXIST;
+  }
+
+  ob_free(tmp_buf);
+  return ret;
+}
+
 int ObFtsBM25SIndex::get_posting_from_cache(const common::ObString &token,
                                              const ObBM25SPostingValue *&posting,
                                              common::ObKVCacheHandle &handle)
 {
   int ret = OB_SUCCESS;
+  if (use_posting_hashmap_) {
+    return get_posting_from_lru(token, posting);
+  }
   
   // 确保索引文件已打开（如果未打开，尝试从磁盘加载）
   if (!persist_file_opened_) {

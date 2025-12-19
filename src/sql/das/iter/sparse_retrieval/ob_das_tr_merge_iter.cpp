@@ -1187,10 +1187,9 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       const ObString &token = query_tokens_.at(t);
       
       // ========== 从 KVCache 获取 posting（缓存未命中时从文件加载）==========
+      // 原调用：get_posting_from_cache(token, posting, handle)
       const ObBM25SPostingValue *posting = nullptr;
-      common::ObKVCacheHandle handle;
-      
-      int posting_ret = g_bm25s_index.get_posting_from_cache(token, posting, handle);
+      int posting_ret = g_bm25s_index.get_posting_from_lru(token, posting);
       if (OB_ENTRY_NOT_EXIST == posting_ret) {
         tokens_not_found++;
         continue;

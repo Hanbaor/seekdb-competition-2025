@@ -187,6 +187,7 @@ public:
 
   static const int64_t DEFAULT_BUCKET_COUNT = 100000;
   static const int64_t NUM_BUCKETS = 1024;  // 分桶数量（使用 TmpFile），减少 WBP 内存压力
+  static const int64_t DEFAULT_POSTING_LRU_CAPACITY = 20000;  // Posting LRU 默认容量
   
   // BM25 参数（与 ObExprBM25 保持一致）
   static constexpr double K1 = 1.2;
@@ -297,6 +298,8 @@ public:
   int get_posting_from_cache(const common::ObString &token,
                              const ObBM25SPostingValue *&posting,
                              common::ObKVCacheHandle &handle);
+  int get_posting_from_lru(const common::ObString &token,
+                           const ObBM25SPostingValue *&posting);
   
   /**
    * @brief 打印缓存统计信息
@@ -318,6 +321,12 @@ public:
    * @return OB_SUCCESS 如果索引已就绪或成功加载
    */
   int ensure_ready();
+
+  void set_use_posting_hashmap(bool v) { use_posting_hashmap_ = v; }
+  bool is_use_posting_hashmap() const { return use_posting_hashmap_; }
+  void set_posting_lru_capacity(int64_t capacity) { posting_lru_capacity_ = capacity; }
+  int64_t get_posting_lru_capacity() const { return posting_lru_capacity_; }
+  int64_t get_posting_lru_size() const { return posting_lru_size_; }
 
 private:
   ObFtsBM25SIndex();
@@ -382,6 +391,10 @@ private:
   int load_posting_to_cache(const common::ObString &token,
                             const ObBM25SPostingValue *&posting,
                             common::ObKVCacheHandle &handle);
+  int load_posting_to_lru(const common::ObString &token,
+                          const ObBM25SPostingValue *&posting,
+                          uint64_t token_hash = 0);
+  int init_posting_lru();
   
   /**
    * @brief 从文件查找 Token 的 posting 信息
@@ -392,6 +405,40 @@ private:
   int find_token_in_file(const common::ObString &token,
                          int64_t &posting_offset,
                          int64_t &posting_count);
+
+  // ========== V3: LRU ObHashMap 缓存结构 ==========
+  struct PostingHashKey
+  {
+    PostingHashKey() : hash_(0), len_(0), ptr_(nullptr) {}
+    PostingHashKey(uint64_t hash, int32_t len, const char *ptr)
+        : hash_(hash), len_(len), ptr_(ptr) {}
+    uint64_t hash() const { return hash_; }
+    int hash(uint64_t &hash_val) const { hash_val = hash_; return common::OB_SUCCESS; }
+    bool operator==(const PostingHashKey &other) const
+    {
+      return hash_ == other.hash_
+             && len_ == other.len_
+             && (len_ == 0 || (nullptr != ptr_ && nullptr != other.ptr_ && 0 == MEMCMP(ptr_, other.ptr_, len_)));
+    }
+    uint64_t hash_;
+    int32_t len_;
+    const char *ptr_;
+  };
+
+  struct PostingLRUNode {
+    PostingHashKey key;
+    common::ObString token;
+    const ObBM25SPostingValue *posting;
+    PostingLRUNode *prev;
+    PostingLRUNode *next;
+
+    PostingLRUNode() : key(), token(), posting(nullptr), prev(nullptr), next(nullptr) {}
+  };
+  typedef common::hash::ObHashMap<PostingHashKey, PostingLRUNode*, common::hash::NoPthreadDefendMode> PostingLRUMap;
+
+  void posting_lru_add_to_head(PostingLRUNode *node);
+  void posting_lru_remove_node(PostingLRUNode *node);
+  void posting_lru_evict_oldest();
 
 private:
   bool is_inited_;
@@ -411,8 +458,9 @@ private:
   BM25SIndexFileHeader file_header_;                // 文件头
   BucketDirectoryEntry *bucket_directory_;          // 桶目录
   
-  // ========== Phase 3: KVCache 查询相关 ==========
+  // ========== Phase 3: KVCache / LRU 查询相关 ==========
   common::ObArenaAllocator cache_allocator_;        // KVCache 查询时的临时内存分配器
+  common::ObArenaAllocator posting_lru_allocator_;  // Posting LRU 使用的持久内存
   
   // ========== 收集阶段数据（分桶文件流式）==========
   volatile int64_t bucket_entry_counts_[NUM_BUCKETS]; // 每个桶的条目计数（原子）
@@ -433,6 +481,14 @@ private:
   
   // ========== 并发控制 ==========
   mutable common::SpinRWLock lock_;
+  PostingLRUMap posting_lru_map_;
+  PostingLRUNode posting_lru_head_;
+  PostingLRUNode posting_lru_tail_;
+  int64_t posting_lru_size_;
+  int64_t posting_lru_capacity_;
+  bool posting_lru_inited_;
+  bool use_posting_hashmap_;
+  mutable common::SpinRWLock posting_lru_lock_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFtsBM25SIndex);
 };
