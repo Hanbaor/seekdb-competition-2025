@@ -40,6 +40,17 @@ int ObFTWord::hash(uint64_t &hash_val) const
 }
 bool ObFTWord::operator==(const ObFTWord &other) const
 {
+  // 快速失败：长度不同直接返回 false
+  if (word_.len_ != other.word_.len_) {
+    return false;
+  }
+  
+  // 快速路径：同 collation 且长度相同时直接 memcmp
+  if (meta_.get_collation_type() == other.meta_.get_collation_type()) {
+    return 0 == MEMCMP(word_.ptr_, other.word_.ptr_, word_.len_);
+  }
+  
+  // 慢路径：不同 collation 需要转换比较
   bool is_equal = false;
   int ret = OB_SUCCESS;
   int cmp_ret = 0;
