@@ -80,11 +80,8 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  uint64_t tenant_id = MTL_ID();
-  if (OB_INVALID_TENANT_ID == tenant_id) {
-    tenant_id = OB_SERVER_TENANT_ID;
-  }
-  common::ObArenaAllocator allocator(lib::ObMemAttr(tenant_id, "ChkStopWord"));
+  is_stopword = false;
+  
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObStopWordChecker hasn't been initialized", K(ret), K(inited_));
@@ -92,18 +89,13 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("word is empty", K(ret), K(word));
   } else {
-    common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
-    if (OB_FAIL(common::ObCharset::charset_convert(
-                                       allocator,
-                                       word.get_word().get_string(),
-                                       word.get_collation_type(),
-                                       stopword_type_.get_collation_type(),
-                                       cmp_str))) {
-      LOG_WARN("fail to convert charset", K(ret), K(word), K(stopword_type_));
-    } else {
-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-      ret = stopword_set_.exist_refactored(converted);
+    // 优化：如果字符集相同，直接查找，跳过 charset_convert 和 allocator 创建
+    const ObCollationType word_cs_type = word.get_collation_type();
+    const ObCollationType stopword_cs_type = stopword_type_.get_collation_type();
+    
+    if (word_cs_type == stopword_cs_type) {
+      // 快速路径：字符集相同，直接查找，无需 allocator 和 charset_convert
+      ret = stopword_set_.exist_refactored(word);
       if (OB_HASH_NOT_EXIST == ret) {
         is_stopword = false;
         ret = OB_SUCCESS;
@@ -112,9 +104,41 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
         ret = OB_SUCCESS;
       } else if (OB_SUCC(ret)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("the exist of hastset shouldn't return success", K(ret), K(word), K(converted));
+        LOG_WARN("the exist of hashset shouldn't return success", K(ret), K(word));
       } else {
-        LOG_WARN("fail to do exist", K(ret), K(word), K(converted));
+        LOG_WARN("fail to do exist", K(ret), K(word));
+      }
+    } else {
+      // 慢路径：字符集不同，需要转换（保持原有逻辑）
+      uint64_t tenant_id = MTL_ID();
+      if (OB_INVALID_TENANT_ID == tenant_id) {
+        tenant_id = OB_SERVER_TENANT_ID;
+      }
+      common::ObArenaAllocator allocator(lib::ObMemAttr(tenant_id, "ChkStopWord"));
+      
+      common::ObString cmp_str;
+      if (OB_FAIL(common::ObCharset::charset_convert(
+                                         allocator,
+                                         word.get_word().get_string(),
+                                         word_cs_type,
+                                         stopword_cs_type,
+                                         cmp_str))) {
+        LOG_WARN("fail to convert charset", K(ret), K(word), K(stopword_type_));
+      } else {
+        ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+        ret = stopword_set_.exist_refactored(converted);
+        if (OB_HASH_NOT_EXIST == ret) {
+          is_stopword = false;
+          ret = OB_SUCCESS;
+        } else if (OB_HASH_EXIST == ret) {
+          is_stopword = true;
+          ret = OB_SUCCESS;
+        } else if (OB_SUCC(ret)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("the exist of hashset shouldn't return success", K(ret), K(word), K(converted));
+        } else {
+          LOG_WARN("fail to do exist", K(ret), K(word), K(converted));
+        }
       }
     }
   }
@@ -220,27 +244,36 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
   return ret;
 }
 
+// 词频累加回调函数，用于 set_or_update
+struct WordCountUpdater
+{
+  int64_t word_freq_;
+  explicit WordCountUpdater(int64_t freq) : word_freq_(freq) {}
+  
+  void operator()(common::hash::HashMapPair<ObFTWord, int64_t> &entry)
+  {
+    entry.second += word_freq_;
+  }
+};
+
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(word), K(word_freq));
   } else if (!flag_.groupby_word()) {
+    // 不需要聚合，直接插入
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
       LOG_WARN("fail to set fulltext word and count", K(ret), K(word));
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
-    LOG_WARN("fail to get fulltext word", K(ret), K(word));
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
-      LOG_WARN("fail to set fulltext word and count", K(ret), K(word), K(word_count));
+    // 优化：使用 set_or_update 替代 get + set，只需一次 hash 查找
+    // - 如果 word 不存在：插入 (word, 1)
+    // - 如果 word 已存在：调用 WordCountUpdater 累加 word_freq
+    WordCountUpdater updater(word_freq);
+    if (OB_FAIL(word_map_.set_or_update(word, 1/*initial count*/, updater))) {
+      LOG_WARN("fail to set or update fulltext word count", K(ret), K(word), K(word_freq));
     }
   }
   return ret;
