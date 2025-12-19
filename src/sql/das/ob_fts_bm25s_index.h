@@ -122,14 +122,18 @@ struct BucketDirectoryEntry {
 /**
  * @brief Vocab Entry 内存结构（用于写入）
  * V2 设计：移除了 token_id 字段
+ * V3 设计：添加 min_doc_id 用于 token 前过滤
+ * V4 设计：添加 max_doc_id 用于通用性（预留）
  */
 struct VocabEntryMem {
   uint64_t token_hash;
   common::ObString token;
   int64_t posting_offset;
   int32_t posting_count;
+  uint32_t min_doc_id;      // token 对应的最小文档 ID（用于前过滤）
+  uint32_t max_doc_id;      // token 对应的最大文档 ID（预留）
   
-  TO_STRING_KV(K(token_hash), K(token), K(posting_offset), K(posting_count));
+  TO_STRING_KV(K(token_hash), K(token), K(posting_offset), K(posting_count), K(min_doc_id), K(max_doc_id));
 };
 
 /**
@@ -401,10 +405,14 @@ private:
    * @param token 查询词
    * @param posting_offset 输出：posting 在文件中的偏移
    * @param posting_count 输出：posting 数量
+   * @param min_doc_id 输出：token 的最小文档 ID（用于前过滤）
+   * @param max_doc_id 输出：token 的最大文档 ID（预留）
    */
   int find_token_in_file(const common::ObString &token,
                          int64_t &posting_offset,
-                         int64_t &posting_count);
+                         int64_t &posting_count,
+                         uint32_t &min_doc_id,
+                         uint32_t &max_doc_id);
 
   // ========== V3: LRU ObHashMap 缓存结构 ==========
   struct PostingHashKey

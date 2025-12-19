@@ -18,6 +18,7 @@
 
 #include "sql/das/ob_fts_bm25s_index.h"
 #include "sql/das/ob_fts_bm25s_cache.h"
+#include "sql/das/ob_fts_generic_filter.h"  // g_fts_generic_filter_ctx
 #include "lib/ob_define.h"
 #include "lib/utility/ob_print_utils.h"
 #include "share/rc/ob_tenant_base.h"       // MTL, MTL_ID
@@ -858,10 +859,11 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
     }
     
     // 计算桶内 vocab 字节数
+    // 格式: [hash:8][len:2][token:N][offset:8][count:4][min_doc_id:4][max_doc_id:4] = 30 + N bytes
     int64_t bucket_vocab_size = bucket_df_map.size();
     int64_t vocab_bytes = 0;
     for (TokenDfMap::iterator it = bucket_df_map.begin(); it != bucket_df_map.end(); ++it) {
-      vocab_bytes += 22 + it->first.length();  // V2: 22 + N
+      vocab_bytes += 30 + it->first.length();  // 30 + N (包含 min_doc_id 和 max_doc_id)
     }
     
     bucket_vocab_sizes.at(bucket_id) = bucket_vocab_size;
@@ -978,15 +980,29 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
         }
       }
       
-      // 构建 VocabEntry 列表
+      // 构建 VocabEntry 列表：排序 + 取首尾获得 min/max_doc_id（合并为一个循环）
       ObArray<VocabEntryMem> entries;
       
       for (TokenPostingMap::iterator it = token_postings.begin(); it != token_postings.end(); ++it) {
+        ObArray<TmpRecord> *pl = it->second;
+        if (OB_ISNULL(pl) || pl->count() == 0) {
+          continue;  // 跳过空的 posting list
+        }
+        
+        // 先排序（只有 count > 1 才需要排序）
+        if (pl->count() > 1) {
+          std::sort(&pl->at(0), &pl->at(0) + pl->count(),
+              [](const TmpRecord &a, const TmpRecord &b) { return a.doc_id < b.doc_id; });
+        }
+        
         VocabEntryMem entry;
         entry.token_hash = it->first.hash();
         entry.token = it->first;
         entry.posting_offset = 0;
-        entry.posting_count = it->second->count();
+        entry.posting_count = pl->count();
+        // posting_list 已排序，直接取首尾获得 min/max_doc_id（O(1)）
+        entry.min_doc_id = static_cast<uint32_t>(pl->at(0).doc_id);
+        entry.max_doc_id = static_cast<uint32_t>(pl->at(pl->count() - 1).doc_id);
         entries.push_back(entry);
       }
       
@@ -1025,6 +1041,8 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
         memcpy(p, e.token.ptr(), token_len); p += token_len;
         memcpy(p, &e.posting_offset, 8); p += 8;
         memcpy(p, &e.posting_count, 4); p += 4;
+        memcpy(p, &e.min_doc_id, 4); p += 4;  // 写入 min_doc_id
+        memcpy(p, &e.max_doc_id, 4); p += 4;  // 写入 max_doc_id
       }
       
       int64_t write_size = 0;
@@ -1046,9 +1064,7 @@ int ObFtsBM25SIndex::finalize_and_persist(const char *index_path)
           continue;
         }
         
-        std::sort(&posting_list->at(0), &posting_list->at(0) + posting_list->count(),
-            [](const TmpRecord &a, const TmpRecord &b) { return a.doc_id < b.doc_id; });
-        
+        // posting_list 已在构建 VocabEntry 前排序，无需再排
         int64_t df = posting_list->count();
         int64_t posting_buf_size = df * 8;
         char *posting_buf = static_cast<char*>(ob_malloc(posting_buf_size, "BM25SPosting"));
@@ -1487,9 +1503,13 @@ int ObFtsBM25SIndex::init_posting_lru()
 
 int ObFtsBM25SIndex::find_token_in_file(const common::ObString &token,
                                          int64_t &posting_offset,
-                                         int64_t &posting_count)
+                                         int64_t &posting_count,
+                                         uint32_t &min_doc_id,
+                                         uint32_t &max_doc_id)
 {
   int ret = OB_SUCCESS;
+  min_doc_id = UINT32_MAX;
+  max_doc_id = 0;
   
   if (!persist_file_opened_) {
     ret = OB_NOT_INIT;
@@ -1531,7 +1551,7 @@ int ObFtsBM25SIndex::find_token_in_file(const common::ObString &token,
   }
   
   // 3. 遍历桶内 Entry 查找 token
-  // V2 格式: [hash:8][len:2][token:N][offset:8][count:4] = 22+N bytes
+  // 格式: [hash:8][len:2][token:N][offset:8][count:4][min_doc_id:4][max_doc_id:4] = 30+N bytes
   ret = OB_ENTRY_NOT_EXIST;
   char *p = bucket_data;
   char *end = bucket_data + bucket.size;
@@ -1542,6 +1562,8 @@ int ObFtsBM25SIndex::find_token_in_file(const common::ObString &token,
     const char *entry_token_data = p; p += entry_token_len;
     int64_t entry_posting_offset = *reinterpret_cast<int64_t*>(p); p += 8;
     int32_t entry_posting_count = *reinterpret_cast<int32_t*>(p); p += 4;
+    uint32_t entry_min_doc_id = *reinterpret_cast<uint32_t*>(p); p += 4;  // 读取 min_doc_id
+    uint32_t entry_max_doc_id = *reinterpret_cast<uint32_t*>(p); p += 4;  // 读取 max_doc_id
     
     // 比较 token（先比 hash，再比内容）
     if (entry_hash == token_hash &&
@@ -1549,9 +1571,11 @@ int ObFtsBM25SIndex::find_token_in_file(const common::ObString &token,
         0 == MEMCMP(entry_token_data, token.ptr(), token.length())) {
       posting_offset = entry_posting_offset;
       posting_count = entry_posting_count;
+      min_doc_id = entry_min_doc_id;
+      max_doc_id = entry_max_doc_id;
       ret = OB_SUCCESS;
       LOG_DEBUG("BM25S find_token_in_file: token found", 
-                K(token), K(bucket_id), K(posting_offset), K(posting_count));
+                K(token), K(bucket_id), K(posting_offset), K(posting_count), K(min_doc_id), K(max_doc_id));
       break;
     }
     
@@ -1580,8 +1604,10 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
   // 1. 从文件查找 token 的 posting 信息
   int64_t posting_offset = 0;
   int64_t posting_count = 0;
+  uint32_t min_doc_id = UINT32_MAX;
+  uint32_t max_doc_id = 0;  // 预留，暂不使用
   
-  if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count))) {
+  if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count, min_doc_id, max_doc_id))) {
     if (OB_ENTRY_NOT_EXIST == ret) {
       // 【负缓存】token 在磁盘索引中不存在，缓存空 posting（热路径，移除日志）
       ObBM25SPostingValue empty_value;
@@ -1593,6 +1619,14 @@ int ObFtsBM25SIndex::load_posting_to_cache(const common::ObString &token,
       LOG_WARN("BM25S load_posting_to_cache: fail to find token in file", K(ret), K(token));
     }
     return ret;
+  }
+  
+  // 前过滤：如果 min_doc_id >= id_limit，直接跳过
+  int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
+  if (id_limit < INT64_MAX && min_doc_id >= static_cast<uint32_t>(id_limit)) {
+    // LOG_INFO("[BM25S_PREFILTER] token skipped (KVCache load)", K(token), K(min_doc_id), K(id_limit),
+    //          K(posting_count), "saved_bytes", posting_count * 8);
+    return OB_ENTRY_NOT_EXIST;
   }
   
   if (posting_count == 0) {
@@ -1687,7 +1721,17 @@ int ObFtsBM25SIndex::get_posting_from_lru(const common::ObString &token,
       if (OB_ISNULL(posting)) {
         return common::OB_ERR_UNEXPECTED;
       }
-      return posting->count() == 0 ? common::OB_ENTRY_NOT_EXIST : common::OB_SUCCESS;
+      if (posting->count() == 0) {
+        return common::OB_ENTRY_NOT_EXIST;
+      }
+      // 缓存命中时也要做前过滤：doc_ids[0] 就是 min_doc_id
+      int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
+      if (id_limit < INT64_MAX && posting->get_doc_id(0) >= static_cast<uint32_t>(id_limit)) {
+        // LOG_INFO("[BM25S_PREFILTER] token skipped (LRU hit)", K(token), 
+        //          "min_doc_id", posting->get_doc_id(0), K(id_limit));
+        return common::OB_ENTRY_NOT_EXIST;
+      }
+      return common::OB_SUCCESS;
     } else if (common::OB_HASH_NOT_EXIST != ret) {
       return ret;
     }
@@ -1723,15 +1767,27 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
   bool disk_not_exist = false;
   int64_t posting_offset = 0;
   int64_t posting_count = 0;
+  uint32_t min_doc_id = UINT32_MAX;
+  uint32_t max_doc_id = 0;  // 预留，暂不使用
   char *tmp_buf = nullptr;
   int64_t tmp_buf_size = 0;
 
-  if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count))) {
+  if (OB_FAIL(find_token_in_file(token, posting_offset, posting_count, min_doc_id, max_doc_id))) {
     if (common::OB_ENTRY_NOT_EXIST == ret) {
       disk_not_exist = true;
       ret = OB_SUCCESS;
     } else {
       return ret;
+    }
+  }
+
+  // 前过滤：如果 min_doc_id >= id_limit，直接跳过，不加载 posting
+  if (!disk_not_exist) {
+    int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
+    if (id_limit < INT64_MAX && min_doc_id >= static_cast<uint32_t>(id_limit)) {
+      // LOG_INFO("[BM25S_PREFILTER] token skipped (LRU load)", K(token), K(min_doc_id), K(id_limit),
+      //          K(posting_count), "saved_bytes", posting_count * 8);
+      return common::OB_ENTRY_NOT_EXIST;
     }
   }
 
@@ -1877,7 +1933,13 @@ int ObFtsBM25SIndex::get_posting_from_cache(const common::ObString &token,
       // 负缓存命中：token 不存在（热路径，移除日志）
       return OB_ENTRY_NOT_EXIST;
     }
-    // 热路径，移除日志
+    // 缓存命中时也要做前过滤：doc_ids[0] 就是 min_doc_id
+    int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
+    if (id_limit < INT64_MAX && posting->get_doc_id(0) >= static_cast<uint32_t>(id_limit)) {
+      // LOG_INFO("[BM25S_PREFILTER] token skipped (KVCache hit)", 
+      //          "min_doc_id", posting->get_doc_id(0), K(id_limit));
+      return OB_ENTRY_NOT_EXIST;
+    }
     return OB_SUCCESS;
   }
   
