@@ -1712,13 +1712,12 @@
     
     if (is_fts_query) {
       g_fts_generic_filter_ctx.reset();
-      const bool cache_available = g_fts_generic_cache.is_cache_file_opened() || 
-                                   g_fts_generic_cache.is_inited();
-      if (cache_available) {
-        const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
-        g_fts_generic_filter_ctx.extract_from_filters(
-            filters, MY_SPEC.output_, g_fts_generic_cache, eval_ctx_);
-      }
+      // 确保缓存已初始化（extract_from_filters 需要用缓存来匹配列）
+      g_fts_generic_cache.ensure_ready();
+      // 总是尝试提取 filter
+      const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
+      g_fts_generic_filter_ctx.extract_from_filters(
+          filters, MY_SPEC.output_, g_fts_generic_cache, eval_ctx_);
      }
 
      if (MY_CTDEF.get_query_range_provider().is_fast_nlj_range()) {
