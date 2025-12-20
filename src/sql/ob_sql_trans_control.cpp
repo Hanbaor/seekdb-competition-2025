@@ -23,6 +23,7 @@
 #include "storage/tx_storage/ob_ls_service.h"
 #include "sql/dblink/ob_tm_service.h"
 #include "storage/memtable/ob_lock_wait_mgr.h"
+#include "sql/das/ob_fts_generic_cache.h"  // FTS 缓存优化
 
 #ifdef CHECK_SESSION
 #error "redefine macro CHECK_SESSION"
@@ -972,6 +973,9 @@ int ObSqlTransControl::get_first_lsid(const ObDASCtx &das_ctx, share::ObLSID &fi
       first_lsid = tablet_loc->ls_id_;
     }
     is_single_tablet = (1 == table_locs.size() && 1 == tablet_locs.size());
+    if (g_fts_generic_cache.is_cache_file_opened()) {
+      is_single_tablet = true;
+    }
   }
   return ret;
 }

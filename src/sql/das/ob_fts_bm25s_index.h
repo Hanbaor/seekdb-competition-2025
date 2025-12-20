@@ -157,10 +157,10 @@ public:
   struct DocScore
   {
     int64_t doc_id;
-    double score;
+    float score;
     
-    DocScore() : doc_id(0), score(0.0) {}
-    DocScore(int64_t d, double s) : doc_id(d), score(s) {}
+    DocScore() : doc_id(0), score(0.0f) {}
+    DocScore(int64_t d, float s) : doc_id(d), score(s) {}
     
     bool operator>(const DocScore &other) const { return score > other.score; }
     

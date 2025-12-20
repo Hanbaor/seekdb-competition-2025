@@ -1273,7 +1273,7 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       scores_array[doc_id] = 0.0f;
       
       if (score > 0.0f) {
-        results.push_back(ObFtsBM25SIndex::DocScore(doc_id, static_cast<double>(score)));
+        results.push_back(ObFtsBM25SIndex::DocScore(doc_id, score));
       }
     }
     
@@ -1656,17 +1656,26 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       const ObString &search_text_string = search_text_datum->get_string();
       const ObString &parser_name = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_name();
       const ObString &parser_properties = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_property();
-  
       const ObObjMeta &meta = search_text->obj_meta_;
       int64_t doc_length = 0;
       storage::ObFTParseHelper tokenize_helper;
       common::ObSEArray<ObFTWord, 16> tokens;
-      hash::ObHashMap<ObFTWord, int64_t> token_map;
-      const int64_t ft_word_bkt_cnt = MAX(search_text_string.length(), 16);
-      if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
+      static thread_local hash::ObHashMap<ObFTWord, int64_t> token_map;
+      static thread_local bool token_map_inited = false;
+      if (!token_map_inited) {
+        const int64_t init_bkt_cnt = 128;  
+        if (OB_FAIL(token_map.create(init_bkt_cnt, common::ObMemAttr(OB_SERVER_TENANT_ID, "FTWordMapTL")))) {
+          LOG_WARN("failed to create token map", K(ret));
+        } else {
+          token_map_inited = true;
+        }
+      } else {
+        token_map.reuse();
+      }
+      
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
         LOG_WARN("failed to init tokenize helper", K(ret));
-      } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr(MTL_ID(), "FTWordMap")))) {
-        LOG_WARN("failed to create token map", K(ret));
       } else if (OB_FAIL(tokenize_helper.segment(
                              meta,
                              search_text_string.ptr(),
