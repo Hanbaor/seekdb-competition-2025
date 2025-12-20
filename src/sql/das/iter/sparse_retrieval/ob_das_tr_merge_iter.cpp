@@ -1660,20 +1660,9 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       int64_t doc_length = 0;
       storage::ObFTParseHelper tokenize_helper;
       common::ObSEArray<ObFTWord, 16> tokens;
-      static thread_local hash::ObHashMap<ObFTWord, int64_t> token_map;
-      static thread_local bool token_map_inited = false;
-      if (!token_map_inited) {
-        const int64_t init_bkt_cnt = 128;  
-        if (OB_FAIL(token_map.create(init_bkt_cnt, common::ObMemAttr(OB_SERVER_TENANT_ID, "FTWordMapTL")))) {
-          LOG_WARN("failed to create token map", K(ret));
-        } else {
-          token_map_inited = true;
-        }
-      } else {
-        token_map.reuse();
-      }
-      
-      if (OB_FAIL(ret)) {
+      hash::ObHashMap<ObFTWord, int64_t> token_map;
+      if (OB_FAIL(token_map.create(128, common::ObMemAttr(OB_SERVER_TENANT_ID, "FTWordMap")))) {
+        LOG_WARN("failed to create token map", K(ret));
       } else if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
         LOG_WARN("failed to init tokenize helper", K(ret));
       } else if (OB_FAIL(tokenize_helper.segment(
