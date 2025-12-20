@@ -1267,6 +1267,10 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 收集阶段：遍历 touched_docs
     ObSEArray<ObFtsBM25SIndex::DocScore, 1024> results;
+    // 预分配避免 push_back 时重新分配
+    if (touched_count > 1024) {
+      results.reserve(touched_count);
+    }
     for (int64_t i = 0; i < touched_count; i++) {
       uint32_t doc_id = touched_ptr[i];
       float score = scores_array[doc_id];
