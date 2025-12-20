@@ -1250,7 +1250,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       
       tokens_found++;
       
-      int64_t valid_count = posting->get_valid_count(id_limit);
+      // V4 优化：posting 已在 LRU 层按 id_limit 过滤，直接用 count()
+      int64_t valid_count = posting->count();
       total_postings += valid_count;
       
       const uint32_t *doc_ids = posting->get_doc_ids();

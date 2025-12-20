@@ -1704,8 +1704,13 @@ int ObFtsBM25SIndex::get_posting_from_lru(const common::ObString &token,
     }
   }
 
+  // ========== V4: 获取当前的过滤条件，作为 Key 的一部分 ==========
+  int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
+  
   uint64_t token_hash = token.hash();
-  PostingHashKey lookup_key(token_hash, static_cast<int32_t>(token.length()), token.ptr());
+  // 用 (token, id_limit) 作为查找 Key
+  PostingHashKey lookup_key(token_hash, static_cast<int32_t>(token.length()), 
+                            token.ptr(), id_limit);
 
   {
     common::SpinRLockGuard guard(posting_lru_lock_);
@@ -1716,27 +1721,26 @@ int ObFtsBM25SIndex::get_posting_from_lru(const common::ObString &token,
       if (OB_ISNULL(posting)) {
         return common::OB_ERR_UNEXPECTED;
       }
+      // 负缓存：count == 0 表示在当前过滤条件下无有效数据
       if (posting->count() == 0) {
         return common::OB_ENTRY_NOT_EXIST;
       }
-      // 前过滤暂时禁用，测试性能影响
-      int64_t id_limit = g_fts_generic_filter_ctx.get_min_upper_bound();
-      if (id_limit < INT64_MAX && posting->get_doc_id(0) >= static_cast<uint32_t>(id_limit)) {
-        return common::OB_ENTRY_NOT_EXIST;
-      }
+      // V4: 数据已经是过滤后的，无需再检查 doc_id
       return common::OB_SUCCESS;
     } else if (common::OB_HASH_NOT_EXIST != ret) {
       return ret;
     }
   }
 
-  ret = load_posting_to_lru(token, posting, token_hash);
+  // 缓存未命中，加载并过滤
+  ret = load_posting_to_lru(token, posting, token_hash, id_limit);
   return ret;
 }
 
 int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
                                           const ObBM25SPostingValue *&posting,
-                                          uint64_t token_hash)
+                                          uint64_t token_hash,
+                                          int64_t id_limit)
 {
   int ret = OB_SUCCESS;
   posting = nullptr;
@@ -1757,11 +1761,12 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
     token_hash = token.hash();
   }
 
+  // ========== 第一步：从磁盘读取完整 posting ==========
   bool disk_not_exist = false;
   int64_t posting_offset = 0;
   int64_t posting_count = 0;
   uint32_t min_doc_id = UINT32_MAX;
-  uint32_t max_doc_id = 0;  // 预留，暂不使用
+  uint32_t max_doc_id = 0;
   char *tmp_buf = nullptr;
   int64_t tmp_buf_size = 0;
 
@@ -1774,10 +1779,20 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
     }
   }
 
-  // 注意：不在加载时做前过滤，总是加载到缓存
-  // 前过滤在缓存命中后通过 doc_ids[0] 检查（避免重复读 vocab）
+  // ========== 第二步：前过滤优化 ==========
+  // 如果 min_doc_id >= id_limit，说明所有数据都不满足条件，直接存负缓存
+  bool all_filtered_out = false;
+  if (!disk_not_exist && id_limit < INT64_MAX) {
+    if (min_doc_id >= static_cast<uint32_t>(id_limit)) {
+      all_filtered_out = true;
+      // 不需要读取磁盘数据，直接存负缓存
+    }
+  }
 
-  if (!disk_not_exist && posting_count > 0) {
+  // ========== 第三步：读取磁盘数据（如果需要）==========
+  int64_t valid_count = 0;
+  
+  if (!disk_not_exist && !all_filtered_out && posting_count > 0) {
     tmp_buf_size = posting_count * (sizeof(uint32_t) + sizeof(float));
     tmp_buf = static_cast<char*>(ob_malloc(tmp_buf_size, "BM25SLRUTmp"));
     if (OB_ISNULL(tmp_buf)) {
@@ -1792,11 +1807,35 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
       ob_free(tmp_buf);
       return ret;
     }
+    
+    // ========== 第四步：计算过滤后的有效数量 ==========
+    uint32_t *full_doc_ids = reinterpret_cast<uint32_t*>(tmp_buf);
+    
+    if (id_limit < INT64_MAX) {
+      // 二分查找：找到第一个 >= id_limit 的位置
+      int64_t lo = 0, hi = posting_count;
+      while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (full_doc_ids[mid] < static_cast<uint32_t>(id_limit)) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      valid_count = lo;  // 只有 [0, lo) 是有效的
+    } else {
+      valid_count = posting_count;  // 无过滤，全部有效
+    }
   }
 
-  PostingHashKey lookup_key(token_hash, static_cast<int32_t>(token.length()), token.ptr());
+  // ========== 第五步：创建 LRU 节点并存储过滤后的数据 ==========
+  // 用 (token, id_limit) 作为 Key
+  PostingHashKey lookup_key(token_hash, static_cast<int32_t>(token.length()), 
+                            token.ptr(), id_limit);
 
   common::SpinWLockGuard guard(posting_lru_lock_);
+  
+  // 再次检查是否已存在（可能其他线程已插入）
   PostingLRUNode *existing_node = nullptr;
   int map_ret = posting_lru_map_.get_refactored(lookup_key, existing_node);
   if (common::OB_SUCCESS == map_ret && OB_NOT_NULL(existing_node)) {
@@ -1808,10 +1847,12 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
     return map_ret;
   }
 
+  // 淘汰旧条目
   while (posting_lru_size_ >= posting_lru_capacity_) {
     posting_lru_evict_oldest();
   }
 
+  // 分配节点
   PostingLRUNode *new_node = static_cast<PostingLRUNode*>(
       posting_lru_allocator_.alloc(sizeof(PostingLRUNode)));
   ObBM25SPostingValue *new_posting = static_cast<ObBM25SPostingValue*>(
@@ -1831,29 +1872,46 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
   new (new_node) PostingLRUNode();
   new (new_posting) ObBM25SPostingValue();
   new_node->token.assign_ptr(token_buf, token.length());
-  new_node->key = PostingHashKey(token_hash, static_cast<int32_t>(token.length()), token_buf);
+  new_node->id_limit = id_limit;  // V4: 记录过滤条件
+  new_node->key = PostingHashKey(token_hash, static_cast<int32_t>(token.length()), 
+                                  token_buf, id_limit);
 
-  if (!disk_not_exist && posting_count > 0) {
-    int64_t doc_ids_size = posting_count * sizeof(uint32_t);
-    int64_t scores_size = posting_count * sizeof(float);
-    uint32_t *doc_ids_buf = reinterpret_cast<uint32_t*>(posting_lru_allocator_.alloc(doc_ids_size));
-    float *scores_buf = reinterpret_cast<float*>(posting_lru_allocator_.alloc(scores_size));
+  // ========== V4 关键：只存储过滤后的数据 ==========
+  if (!disk_not_exist && !all_filtered_out && valid_count > 0) {
+    // 只分配过滤后的大小
+    int64_t filtered_doc_ids_size = valid_count * sizeof(uint32_t);
+    int64_t filtered_scores_size = valid_count * sizeof(float);
+    
+    uint32_t *doc_ids_buf = reinterpret_cast<uint32_t*>(
+        posting_lru_allocator_.alloc(filtered_doc_ids_size));
+    float *scores_buf = reinterpret_cast<float*>(
+        posting_lru_allocator_.alloc(filtered_scores_size));
+    
     if (OB_ISNULL(doc_ids_buf) || OB_ISNULL(scores_buf)) {
-      LOG_WARN("BM25S posting LRU: alloc posting data buffer failed", K(doc_ids_size), K(scores_size));
+      LOG_WARN("BM25S posting LRU: alloc filtered buffer failed");
       ob_free(tmp_buf);
       return common::OB_ALLOCATE_MEMORY_FAILED;
     }
-    MEMCPY(doc_ids_buf, tmp_buf, doc_ids_size);
-    MEMCPY(scores_buf, tmp_buf + doc_ids_size, scores_size);
-    new_posting->set(posting_count, doc_ids_buf, scores_buf);
+    
+    // 只复制 valid_count 条数据
+    uint32_t *full_doc_ids = reinterpret_cast<uint32_t*>(tmp_buf);
+    float *full_scores = reinterpret_cast<float*>(tmp_buf + posting_count * sizeof(uint32_t));
+    
+    MEMCPY(doc_ids_buf, full_doc_ids, filtered_doc_ids_size);
+    MEMCPY(scores_buf, full_scores, filtered_scores_size);
+    
+    new_posting->set(valid_count, doc_ids_buf, scores_buf);
   } else {
+    // 负缓存：disk_not_exist 或 all_filtered_out 或 valid_count == 0
     new_posting->set(0, nullptr, nullptr);
   }
 
   new_node->posting = new_posting;
 
+  // 插入 HashMap
   if (OB_FAIL(posting_lru_map_.set_refactored(new_node->key, new_node))) {
     if (common::OB_HASH_EXIST == ret) {
+      // 竞争条件，使用已存在的
       if (OB_SUCC(posting_lru_map_.get_refactored(lookup_key, existing_node))) {
         posting = existing_node->posting;
         ret = posting->count() == 0 ? common::OB_ENTRY_NOT_EXIST : common::OB_SUCCESS;
@@ -1865,7 +1923,10 @@ int ObFtsBM25SIndex::load_posting_to_lru(const common::ObString &token,
     posting_lru_add_to_head(new_node);
     posting_lru_size_++;
     posting = new_posting;
-    ret = (!disk_not_exist && posting_count > 0) ? common::OB_SUCCESS : common::OB_ENTRY_NOT_EXIST;
+    
+    // 返回结果
+    bool has_valid_data = !disk_not_exist && !all_filtered_out && valid_count > 0;
+    ret = has_valid_data ? common::OB_SUCCESS : common::OB_ENTRY_NOT_EXIST;
   }
 
   ob_free(tmp_buf);

@@ -395,9 +395,17 @@ private:
   int load_posting_to_cache(const common::ObString &token,
                             const ObBM25SPostingValue *&posting,
                             common::ObKVCacheHandle &handle);
+  /**
+   * @brief V4: 加载 posting 到 LRU 并按条件过滤
+   * @param token 查询词
+   * @param posting 输出：过滤后的 posting 数据指针
+   * @param token_hash token 的 hash 值（可选，0 表示内部计算）
+   * @param id_limit 主键过滤上界（INT64_MAX 表示无过滤）
+   */
   int load_posting_to_lru(const common::ObString &token,
                           const ObBM25SPostingValue *&posting,
-                          uint64_t token_hash = 0);
+                          uint64_t token_hash = 0,
+                          int64_t id_limit = INT64_MAX);
   int init_posting_lru();
   
   /**
@@ -414,33 +422,48 @@ private:
                          uint32_t &min_doc_id,
                          uint32_t &max_doc_id);
 
-  // ========== V3: LRU ObHashMap 缓存结构 ==========
+  // ========== V4: 带过滤条件的 LRU ObHashMap 缓存结构 ==========
+  // Key 包含 (token, id_limit)，相同过滤条件时可复用已过滤的 posting
   struct PostingHashKey
   {
-    PostingHashKey() : hash_(0), len_(0), ptr_(nullptr) {}
-    PostingHashKey(uint64_t hash, int32_t len, const char *ptr)
-        : hash_(hash), len_(len), ptr_(ptr) {}
-    uint64_t hash() const { return hash_; }
-    int hash(uint64_t &hash_val) const { hash_val = hash_; return common::OB_SUCCESS; }
+    PostingHashKey() : hash_(0), len_(0), ptr_(nullptr), id_limit_(INT64_MAX) {}
+    PostingHashKey(uint64_t hash, int32_t len, const char *ptr, int64_t id_limit = INT64_MAX)
+        : hash_(hash), len_(len), ptr_(ptr), id_limit_(id_limit) {}
+    
+    // Hash 函数：将 id_limit 也纳入计算
+    uint64_t hash() const 
+    { 
+      // 将 id_limit 混入 hash，使用 golden ratio 常量
+      uint64_t limit_hash = (id_limit_ == INT64_MAX) ? 0 : 
+                            static_cast<uint64_t>(id_limit_) * 0x9e3779b97f4a7c15ULL;
+      return hash_ ^ limit_hash;
+    }
+    int hash(uint64_t &hash_val) const { hash_val = hash(); return common::OB_SUCCESS; }
+    
     bool operator==(const PostingHashKey &other) const
     {
+      // 必须 token 和 id_limit 都相同才匹配
       return hash_ == other.hash_
              && len_ == other.len_
+             && id_limit_ == other.id_limit_
              && (len_ == 0 || (nullptr != ptr_ && nullptr != other.ptr_ && 0 == MEMCMP(ptr_, other.ptr_, len_)));
     }
-    uint64_t hash_;
-    int32_t len_;
-    const char *ptr_;
+    
+    uint64_t hash_;       // token 的原始 hash
+    int32_t len_;         // token 长度
+    const char *ptr_;     // token 数据指针
+    int64_t id_limit_;    // 主键过滤上界 (INT64_MAX 表示无过滤)
   };
 
   struct PostingLRUNode {
     PostingHashKey key;
     common::ObString token;
-    const ObBM25SPostingValue *posting;
+    int64_t id_limit;                     // 缓存时的过滤条件
+    const ObBM25SPostingValue *posting;   // 过滤后的 posting (可能是负缓存)
     PostingLRUNode *prev;
     PostingLRUNode *next;
 
-    PostingLRUNode() : key(), token(), posting(nullptr), prev(nullptr), next(nullptr) {}
+    PostingLRUNode() : key(), token(), id_limit(INT64_MAX), posting(nullptr), prev(nullptr), next(nullptr) {}
   };
   typedef common::hash::ObHashMap<PostingHashKey, PostingLRUNode*, common::hash::NoPthreadDefendMode> PostingLRUMap;
 
