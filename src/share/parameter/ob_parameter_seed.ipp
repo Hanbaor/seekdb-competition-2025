@@ -648,7 +648,7 @@ DEF_BOOL(enable_ddl, OB_CLUSTER_PARAMETER, "True", "specifies whether DDL operat
 DEF_BOOL(_enable_parallel_table_creation, OB_CLUSTER_PARAMETER, "True", "specifies whether create table parallelly. "
          "Value:  True: create table parallelly;  False: create table serially",
          ObParameterAttr(Section::ROOT_SERVICE, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_BOOL(enable_major_freeze, OB_CLUSTER_PARAMETER, "True", "specifies whether major_freeze function is turned on. "
+DEF_BOOL(enable_major_freeze, OB_CLUSTER_PARAMETER, "False", "specifies whether major_freeze function is turned on. "
          "Value:  True:turned on;  False: turned off",
          ObParameterAttr(Section::ROOT_SERVICE, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_TIME(ob_event_history_recycle_interval, OB_CLUSTER_PARAMETER, "7d", "[1d, 180d]",
@@ -1090,7 +1090,7 @@ DEF_BOOL(_enable_parallel_minor_merge, OB_CLUSTER_PARAMETER, "True",
          "specifies whether enable parallel minor merge. "
          "Value: True:turned on;  False: turned off",
          ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_BOOL(_enable_adaptive_compaction, OB_CLUSTER_PARAMETER, "True",
+DEF_BOOL(_enable_adaptive_compaction, OB_CLUSTER_PARAMETER, "False",
          "specifies whether allow adaptive compaction schedule and information collection",
          ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_INT(compaction_dag_cnt_limit, OB_CLUSTER_PARAMETER, "50000", "[10000,500000]",
@@ -1120,7 +1120,7 @@ DEF_INT(ha_low_thread_score, OB_CLUSTER_PARAMETER, "0", "[0,100]",
 DEF_INT(ddl_thread_score, OB_CLUSTER_PARAMETER, "0", "[0,100]",
         "the current work thread score of ddl thread. Range: [0,100] in integer. Especially, 0 means default value",
         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_INT(minor_compact_trigger, OB_CLUSTER_PARAMETER, "2", "[0,16]",
+DEF_INT(minor_compact_trigger, OB_CLUSTER_PARAMETER, "16", "[0,16]",
         "minor_compact_trigger, Range: [0,16] in integer",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_BOOL(_enable_compaction_diagnose, OB_CLUSTER_PARAMETER, "False",
@@ -1151,7 +1151,7 @@ DEF_INT(major_compact_trigger, OB_CLUSTER_PARAMETER, "0", "[0,65535]",
 DEF_INT(_minor_merge_write_amplification_threshold, OB_CLUSTER_PARAMETER, "2000000", "[0,)",
          "The write amplification threshold about minor compaction. The larger the value, the smaller the write amplicification",
          ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_TIME(ob_compaction_schedule_interval, OB_CLUSTER_PARAMETER, "120s", "[3s,5m]",
+DEF_TIME(ob_compaction_schedule_interval, OB_CLUSTER_PARAMETER, "5m", "[3s,5m]",
          "the time interval to schedule compaction, Range: [3s,5m]"
          "Range: [3s, 5m]",
          ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
@@ -2116,7 +2116,7 @@ DEF_STR_WITH_CHECKER(kv_ttl_duty_duration, OB_CLUSTER_PARAMETER, "", common::ObT
     "ttl background task working time duration"
     "begin_time or end_time in Range, e.g., [23:00:00, 24:00:00]",
     ObParameterAttr(Section::ROOT_SERVICE, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_STR_WITH_CHECKER(vector_index_optimize_duty_time, OB_CLUSTER_PARAMETER, "[00:00:00, 24:00:00]", common::ObVecIndexOptDutyTimeChecker,
+DEF_STR_WITH_CHECKER(vector_index_optimize_duty_time, OB_CLUSTER_PARAMETER, "[06:00:00, 07:00:00]", common::ObVecIndexOptDutyTimeChecker,
     "A runtime range bounded by start time and end time for vector index background task, e.g., [23:00:00, 24:00:00]",
     ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_TIME(kv_ttl_history_recycle_interval, OB_CLUSTER_PARAMETER, "7d", "[1d, 180d]",
