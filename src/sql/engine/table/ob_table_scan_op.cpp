@@ -1718,7 +1718,7 @@
       const ObIArray<ObExpr*> &filters = MY_SPEC.filters_;
       g_fts_generic_filter_ctx.extract_from_filters(
           filters, MY_SPEC.output_, g_fts_generic_cache, eval_ctx_);
-     }
+    }
 
      if (MY_CTDEF.get_query_range_provider().is_fast_nlj_range()) {
        int64_t column_count = MY_CTDEF.get_query_range_provider().get_column_count();

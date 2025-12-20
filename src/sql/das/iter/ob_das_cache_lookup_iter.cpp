@@ -208,6 +208,8 @@ int ObDASCacheLookupIter::add_rowkeys_and_collect(int64_t count)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr", K_(eval_ctx));
   } else {
+    const bool use_cache = g_fts_generic_cache.is_cache_file_opened();
+    
     ObEvalCtx::BatchInfoScopeGuard batch_info_guard(*eval_ctx_);
     batch_info_guard.set_batch_size(count);
     for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
@@ -222,8 +224,7 @@ int ObDASCacheLookupIter::add_rowkeys_and_collect(int64_t count)
         }
       }
       
-      // 调用父类的 add_rowkey
-      if (OB_SUCC(ret) && OB_FAIL(ObDASLocalLookupIter::add_rowkey())) {
+      if (OB_SUCC(ret) && !use_cache && OB_FAIL(ObDASLocalLookupIter::add_rowkey())) {
         LOG_WARN("failed to add rowkey", K(ret), K(i));
       }
     }

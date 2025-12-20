@@ -1189,12 +1189,15 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     static thread_local float *scores_array = nullptr;
     static thread_local int64_t scores_capacity = 0;
     
+    // 裸指针优化：跳过 push_back 的函数调用开销
+    static thread_local common::ObArray<uint32_t> touched_docs;
+    
     // 确保 scores_array 容量足够
     int64_t required_capacity;
     int64_t id_upper_bound = g_fts_generic_filter_ctx.get_min_upper_bound();
     
     if (id_upper_bound < INT64_MAX) {
-      // 有 id 过滤，用 id_upper_bound 作为容量（更省内存）
+      // 有 id 过滤，用 id_limit 作为容量（更省内存）
       required_capacity = id_upper_bound;
     } else if (use_new_system) {
       // KVCache 模式：用文件头中的行数
@@ -1217,8 +1220,6 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       }
     }
     
-    // 裸指针优化：跳过 push_back 的函数调用开销
-    static thread_local common::ObArray<uint32_t> touched_docs;
     touched_docs.reuse();
     if (touched_docs.get_capacity() < 4096) {
       touched_docs.reserve(4096);
@@ -1226,7 +1227,9 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     uint32_t *touched_ptr = touched_docs.get_data();
     int64_t touched_count = 0;
     
-    // 遍历每个查询 token，从 LRU 获取倒排链并累加分数
+    // 无 V4 缓存键，需要在查询时用 id_limit 过滤
+    int64_t id_limit = id_upper_bound;
+    
     const int64_t token_count = query_tokens_.count();
     for (int64_t t = 0; t < token_count; t++) {
       const ObString &token = query_tokens_.at(t);
@@ -1237,7 +1240,8 @@ ObDASTRMergeIter::ObDASTRMergeIter()
         continue;  // token 不在索引中，跳过
       }
       
-      const int64_t valid_count = posting->count();
+      // posting 是完整数据，用 get_valid_count 过滤
+      const int64_t valid_count = posting->get_valid_count(id_limit);
       
       const uint32_t *doc_ids = posting->get_doc_ids();
       const float *scores = posting->get_scores();
@@ -1263,13 +1267,17 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     
     // 收集阶段：遍历 touched_docs
     ObSEArray<ObFtsBM25SIndex::DocScore, 1024> results;
+    // 预分配避免 push_back 时重新分配
+    if (touched_count > 1024) {
+      results.reserve(touched_count);
+    }
     for (int64_t i = 0; i < touched_count; i++) {
       uint32_t doc_id = touched_ptr[i];
       float score = scores_array[doc_id];
       scores_array[doc_id] = 0.0f;
       
       if (score > 0.0f) {
-        results.push_back(ObFtsBM25SIndex::DocScore(doc_id, static_cast<double>(score)));
+        results.push_back(ObFtsBM25SIndex::DocScore(doc_id, score));
       }
     }
     
@@ -1278,30 +1286,39 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       return ret;
     }
     
-    // 获取 effective_topk
-    int64_t effective_topk = topk_limit_;
+    // 直接从 IR 层获取 LIMIT 值（进入 BM25S 模式时，topk 应该已下推）
+    int64_t effective_topk = topk_limit_;  
+    bool limit_from_expr = false;
     if (effective_topk <= 0 && OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_ctdef_->topk_limit_expr_) && OB_NOT_NULL(ir_rtdef_)) {
+      // 直接计算 topk_limit_expr_
       ObDatum *limit_datum = nullptr;
       if (OB_SUCCESS == ir_ctdef_->topk_limit_expr_->eval(*ir_rtdef_->eval_ctx_, limit_datum) && 
           OB_NOT_NULL(limit_datum) && !limit_datum->is_null() && limit_datum->get_int() > 0) {
         effective_topk = limit_datum->get_int();
+        limit_from_expr = true;
+        // 如果有 offset，也要加上
         if (OB_NOT_NULL(ir_ctdef_->topk_offset_expr_)) {
           ObDatum *offset_datum = nullptr;
           if (OB_SUCCESS == ir_ctdef_->topk_offset_expr_->eval(*ir_rtdef_->eval_ctx_, offset_datum) &&
-              OB_NOT_NULL(offset_datum) && !offset_datum->is_null()) {
+              OB_NOT_NULL(offset_datum) && !offset_datum->is_null() && offset_datum->get_int() > 0) {
             effective_topk += offset_datum->get_int();
           }
         }
       }
     }
-    if (effective_topk <= 0) effective_topk = results.count();
+    if (effective_topk <= 0) {
+      effective_topk = results.count();
+    }
     
-    // Top-K 排序
-    const int64_t result_count = results.count();
-    int64_t k = std::min({effective_topk, result_count, capacity});
-    if (result_count > 1) {
-      std::partial_sort(&results.at(0), &results.at(0) + k, &results.at(0) + result_count,
-                        [](const auto &a, const auto &b) { return a.score > b.score; });
+    int64_t k = std::min(effective_topk, (int64_t)results.count());
+    k = std::min(k, capacity);
+    if (results.count() > 1) {
+      std::partial_sort(&results.at(0), 
+                        &results.at(0) + k,
+                        &results.at(0) + results.count(),
+                        [](const ObFtsBM25SIndex::DocScore &a, const ObFtsBM25SIndex::DocScore &b) {
+                          return a.score > b.score;
+                        });
     }
     ObExpr *doc_id_expr = sr_iter_param_.id_proj_expr_; 
     ObExpr *score_expr = sr_iter_param_.relevance_proj_expr_;
@@ -1643,17 +1660,15 @@ ObDASTRMergeIter::ObDASTRMergeIter()
       const ObString &search_text_string = search_text_datum->get_string();
       const ObString &parser_name = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_name();
       const ObString &parser_properties = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_property();
-  
       const ObObjMeta &meta = search_text->obj_meta_;
       int64_t doc_length = 0;
       storage::ObFTParseHelper tokenize_helper;
       common::ObSEArray<ObFTWord, 16> tokens;
       hash::ObHashMap<ObFTWord, int64_t> token_map;
-      const int64_t ft_word_bkt_cnt = MAX(search_text_string.length(), 16);
-      if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
-        LOG_WARN("failed to init tokenize helper", K(ret));
-      } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr(MTL_ID(), "FTWordMap")))) {
+      if (OB_FAIL(token_map.create(128, common::ObMemAttr(OB_SERVER_TENANT_ID, "FTWordMap")))) {
         LOG_WARN("failed to create token map", K(ret));
+      } else if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
+        LOG_WARN("failed to init tokenize helper", K(ret));
       } else if (OB_FAIL(tokenize_helper.segment(
                              meta,
                              search_text_string.ptr(),
