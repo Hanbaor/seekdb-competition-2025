@@ -298,33 +298,46 @@ public:
   int get_posting_from_lru(const common::ObString &token,
                            const ObBM25SPostingValue *&posting);
   
-  // ========== LRU 类型定义（前置声明以支持内联函数）==========
+  // ========== V4: 带过滤条件的 LRU ObHashMap 缓存结构 ==========
+  // Key 包含 (token, id_limit)，相同过滤条件时可复用已过滤的 posting
   struct PostingHashKey
   {
-    PostingHashKey() : hash_(0), len_(0), ptr_(nullptr) {}
-    PostingHashKey(uint64_t hash, int32_t len, const char *ptr)
-        : hash_(hash), len_(len), ptr_(ptr) {}
-    uint64_t hash() const { return hash_; }
-    int hash(uint64_t &hash_val) const { hash_val = hash_; return common::OB_SUCCESS; }
+    PostingHashKey() : hash_(0), len_(0), ptr_(nullptr), id_limit_(INT64_MAX) {}
+    PostingHashKey(uint64_t hash, int32_t len, const char *ptr, int64_t id_limit = INT64_MAX)
+        : hash_(hash), len_(len), ptr_(ptr), id_limit_(id_limit) {}
+    
+    // Hash 函数：将 id_limit 也纳入计算
+    uint64_t hash() const 
+    { 
+      uint64_t limit_hash = (id_limit_ == INT64_MAX) ? 0 : 
+                            static_cast<uint64_t>(id_limit_) * 0x9e3779b97f4a7c15ULL;
+      return hash_ ^ limit_hash;
+    }
+    int hash(uint64_t &hash_val) const { hash_val = hash(); return common::OB_SUCCESS; }
+    
     bool operator==(const PostingHashKey &other) const
     {
       return hash_ == other.hash_
              && len_ == other.len_
+             && id_limit_ == other.id_limit_
              && (len_ == 0 || (nullptr != ptr_ && nullptr != other.ptr_ && 0 == MEMCMP(ptr_, other.ptr_, len_)));
     }
+    
     uint64_t hash_;
     int32_t len_;
     const char *ptr_;
+    int64_t id_limit_;
   };
 
   struct PostingLRUNode {
     PostingHashKey key;
     common::ObString token;
+    int64_t id_limit;
     const ObBM25SPostingValue *posting;
     PostingLRUNode *prev;
     PostingLRUNode *next;
 
-    PostingLRUNode() : key(), token(), posting(nullptr), prev(nullptr), next(nullptr) {}
+    PostingLRUNode() : key(), token(), id_limit(INT64_MAX), posting(nullptr), prev(nullptr), next(nullptr) {}
   };
   typedef common::hash::ObHashMap<PostingHashKey, PostingLRUNode*, common::hash::NoPthreadDefendMode> PostingLRUMap;
 
