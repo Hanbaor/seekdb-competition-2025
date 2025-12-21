@@ -95,9 +95,9 @@ struct ObFtsFilterCondition
   }
 
   /**
-   * 检查单个值是否满足条件（内联以减少函数调用开销）
+   * 检查单个值是否满足条件（强制内联以减少函数调用开销）
    */
-  inline bool check(const ObFtsColumnValue &col_value) const
+  OB_INLINE bool check(const ObFtsColumnValue &col_value) const
   {
     const int64_t val_count = values_.count();
     if (op_type_ == FTS_OP_NONE) {
@@ -224,9 +224,9 @@ public:
 
   /**
    * 快速检查（支持内存模式和 KVCache 模式）
-   * 内联实现以减少函数调用开销
+   * 强制内联实现以减少函数调用开销
    */
-  inline bool check_row_fast(uint64_t doc_id, ObFtsGenericCache &cache) const
+  OB_INLINE bool check_row_fast(uint64_t doc_id, ObFtsGenericCache &cache) const
   {
     if (condition_count_ == 0) {
       return true;
@@ -263,8 +263,9 @@ public:
     
     // ----- LRU ObHashMap 模式 (当前启用) -----
     // 使用 LRU 策略，自动淘汰最久未访问的条目，无 Hazard Pointer 开销
+    // 使用内联快速路径，缓存命中时无函数调用开销
     const ObFtsRowData *row = nullptr;
-    int ret = cache.get_row_from_lru(doc_id, row);
+    int ret = cache.get_row_from_lru_fast(doc_id, row);
     if (common::OB_SUCCESS != ret || row == nullptr) {
       return true;
     }

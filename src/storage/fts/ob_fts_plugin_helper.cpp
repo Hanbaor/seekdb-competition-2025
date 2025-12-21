@@ -375,7 +375,10 @@ int ObFTParseHelper::segment(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, charset info is nullptr", K(ret), K(type));
   } else {
-    words.reuse();
+    // 优化：仅当 map 非空时才 reuse，避免空 map 的 wrlock 开销
+    if (words.size() > 0) {
+      words.reuse();
+    }
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
     if (OB_FAIL(segment(
                     parser_property_,
