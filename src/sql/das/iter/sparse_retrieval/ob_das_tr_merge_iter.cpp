@@ -1266,10 +1266,13 @@ ObDASTRMergeIter::ObDASTRMergeIter()
     }
     
     // 收集阶段：遍历 touched_docs
-    ObSEArray<ObFtsBM25SIndex::DocScore, 1024> results;
-    // 预分配避免 push_back 时重新分配
-    if (touched_count > 1024) {
-      results.reserve(touched_count);
+    // 使用 thread_local 预分配数组，避免栈上分配和重复内存分配
+    static thread_local common::ObArray<ObFtsBM25SIndex::DocScore> results;
+    results.reuse();
+    // 预分配容量，避免 push_back 时重新分配
+    int64_t reserve_count = touched_count > 2048 ? touched_count : 2048;
+    if (results.get_capacity() < reserve_count) {
+      results.reserve(reserve_count);
     }
     for (int64_t i = 0; i < touched_count; i++) {
       uint32_t doc_id = touched_ptr[i];

@@ -36,14 +36,7 @@
 #include <fstream>
 #include <cstdio>
 #include <fcntl.h>
-
-// 前向声明
-namespace oceanbase {
-namespace sql {
-class ObBM25SPostingValue;
-class ObBM25SPostingKey;
-} // namespace sql
-} // namespace oceanbase
+#include "sql/das/ob_fts_bm25s_cache.h"  // ObBM25SPostingValue 完整定义
 
 namespace oceanbase
 {
@@ -305,6 +298,64 @@ public:
   int get_posting_from_lru(const common::ObString &token,
                            const ObBM25SPostingValue *&posting);
   
+  // ========== LRU 类型定义（前置声明以支持内联函数）==========
+  struct PostingHashKey
+  {
+    PostingHashKey() : hash_(0), len_(0), ptr_(nullptr) {}
+    PostingHashKey(uint64_t hash, int32_t len, const char *ptr)
+        : hash_(hash), len_(len), ptr_(ptr) {}
+    uint64_t hash() const { return hash_; }
+    int hash(uint64_t &hash_val) const { hash_val = hash_; return common::OB_SUCCESS; }
+    bool operator==(const PostingHashKey &other) const
+    {
+      return hash_ == other.hash_
+             && len_ == other.len_
+             && (len_ == 0 || (nullptr != ptr_ && nullptr != other.ptr_ && 0 == MEMCMP(ptr_, other.ptr_, len_)));
+    }
+    uint64_t hash_;
+    int32_t len_;
+    const char *ptr_;
+  };
+
+  struct PostingLRUNode {
+    PostingHashKey key;
+    common::ObString token;
+    const ObBM25SPostingValue *posting;
+    PostingLRUNode *prev;
+    PostingLRUNode *next;
+
+    PostingLRUNode() : key(), token(), posting(nullptr), prev(nullptr), next(nullptr) {}
+  };
+  typedef common::hash::ObHashMap<PostingHashKey, PostingLRUNode*, common::hash::NoPthreadDefendMode> PostingLRUMap;
+
+  /**
+   * @brief 从 LRU 获取 posting（内联快速路径）
+   * 缓存命中时无函数调用开销
+   */
+  OB_INLINE int get_posting_from_lru_fast(const common::ObString &token,
+                                           const ObBM25SPostingValue *&posting)
+  {
+    // 快速路径：LRU 已初始化且缓存命中
+    // 注：查询阶段只读，无需加锁；写入在 DDL 阶段完成
+    if (OB_LIKELY(posting_lru_inited_)) {
+      uint64_t token_hash = token.hash();
+      PostingHashKey lookup_key(token_hash, static_cast<int32_t>(token.length()), token.ptr());
+      
+      // 无锁读取：ObHashMap NoPthreadDefendMode + 查询阶段只读
+      PostingLRUNode *node = nullptr;
+      int ret = posting_lru_map_.get_refactored(lookup_key, node);
+      if (OB_LIKELY(common::OB_SUCCESS == ret && OB_NOT_NULL(node) && OB_NOT_NULL(node->posting))) {
+        posting = node->posting;
+        if (posting->count() == 0) {
+          return common::OB_ENTRY_NOT_EXIST;
+        }
+        return common::OB_SUCCESS;
+      }
+    }
+    // 慢路径：初始化或缓存未命中
+    return get_posting_from_lru(token, posting);
+  }
+  
   /**
    * @brief 打印缓存统计信息
    */
@@ -414,36 +465,7 @@ private:
                          uint32_t &min_doc_id,
                          uint32_t &max_doc_id);
 
-  // ========== V3: LRU ObHashMap 缓存结构 ==========
-  struct PostingHashKey
-  {
-    PostingHashKey() : hash_(0), len_(0), ptr_(nullptr) {}
-    PostingHashKey(uint64_t hash, int32_t len, const char *ptr)
-        : hash_(hash), len_(len), ptr_(ptr) {}
-    uint64_t hash() const { return hash_; }
-    int hash(uint64_t &hash_val) const { hash_val = hash_; return common::OB_SUCCESS; }
-    bool operator==(const PostingHashKey &other) const
-    {
-      return hash_ == other.hash_
-             && len_ == other.len_
-             && (len_ == 0 || (nullptr != ptr_ && nullptr != other.ptr_ && 0 == MEMCMP(ptr_, other.ptr_, len_)));
-    }
-    uint64_t hash_;
-    int32_t len_;
-    const char *ptr_;
-  };
-
-  struct PostingLRUNode {
-    PostingHashKey key;
-    common::ObString token;
-    const ObBM25SPostingValue *posting;
-    PostingLRUNode *prev;
-    PostingLRUNode *next;
-
-    PostingLRUNode() : key(), token(), posting(nullptr), prev(nullptr), next(nullptr) {}
-  };
-  typedef common::hash::ObHashMap<PostingHashKey, PostingLRUNode*, common::hash::NoPthreadDefendMode> PostingLRUMap;
-
+  // ========== V3: LRU ObHashMap 缓存操作 ==========
   void posting_lru_add_to_head(PostingLRUNode *node);
   void posting_lru_remove_node(PostingLRUNode *node);
   void posting_lru_evict_oldest();

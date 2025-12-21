@@ -405,13 +405,48 @@ public:
 
   // ========== V4: LRU HashMap 缓存查询接口 ==========
   
+  // LRU 节点结构（前置声明以支持内联函数）
+  struct LRUNode {
+    uint64_t doc_id;
+    ObFtsRowData *row_data;
+    LRUNode *prev;
+    LRUNode *next;
+
+    LRUNode() : doc_id(0), row_data(nullptr), prev(nullptr), next(nullptr) {}
+    LRUNode(uint64_t id, ObFtsRowData *data) 
+        : doc_id(id), row_data(data), prev(nullptr), next(nullptr) {}
+  };
+  
+  typedef common::hash::ObHashMap<uint64_t, LRUNode*, common::hash::NoPthreadDefendMode> LRUHashMap;
+  
   /**
-   * 从 LRU HashMap 获取行数据
-   * - 无 Hazard Pointer 开销
+   * 从 LRU HashMap 获取行数据（慢路径，处理初始化和缓存未命中）
    * @param doc_id 文档 ID
    * @param row_data 输出：行数据指针
    */
   int get_row_from_lru(uint64_t doc_id, const ObFtsRowData *&row_data);
+  
+  /**
+   * 从 LRU HashMap 获取行数据（快速内联路径）
+   * - 无 Hazard Pointer 开销
+   * - 热路径内联，缓存命中时无函数调用开销
+   * @param doc_id 文档 ID
+   * @param row_data 输出：行数据指针
+   */
+  OB_INLINE int get_row_from_lru_fast(uint64_t doc_id, const ObFtsRowData *&row_data)
+  {
+    // 快速路径：LRU 已初始化且缓存命中
+    if (OB_LIKELY(lru_inited_)) {
+      LRUNode *node = nullptr;
+      int ret = lru_map_.get_refactored(doc_id, node);
+      if (OB_LIKELY(common::OB_SUCCESS == ret && OB_NOT_NULL(node))) {
+        row_data = node->row_data;
+        return common::OB_SUCCESS;
+      }
+    }
+    // 慢路径：初始化或缓存未命中
+    return get_row_from_lru(doc_id, row_data);
+  }
 
 private:
   int ensure_capacity(uint64_t required);
@@ -484,20 +519,6 @@ public:
 
 private:
   // ========== V4: LRU HashMap 缓存相关成员 ==========
-  
-  // LRU 节点结构
-  struct LRUNode {
-    uint64_t doc_id;
-    ObFtsRowData *row_data;
-    LRUNode *prev;
-    LRUNode *next;
-
-    LRUNode() : doc_id(0), row_data(nullptr), prev(nullptr), next(nullptr) {}
-    LRUNode(uint64_t id, ObFtsRowData *data) 
-        : doc_id(id), row_data(data), prev(nullptr), next(nullptr) {}
-  };
-  
-  typedef common::hash::ObHashMap<uint64_t, LRUNode*, common::hash::NoPthreadDefendMode> LRUHashMap;
   LRUHashMap lru_map_;                    // doc_id -> LRUNode* 的映射
   common::ObArenaAllocator lru_allocator_;  // LRU 数据的内存分配器
   LRUNode lru_head_;                      // LRU 链表头哨兵（最新）
